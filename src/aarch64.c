@@ -466,7 +466,7 @@ static void va_arg_instruction(Emitter *e, Inst *in)
         fputs("\tadd x10, x10, #15\n\tand x10, x10, #-16\n", out);
     fprintf(out, "\tadds w11, w10, #%u\n\tstr w11, [x9, #%u]\n\tb.gt .Lvstack%u_%u\n"
                  "\tldr x11, [x9, #%u]\n\tadd x10, x11, x10\n",
-            increment, reg_offset, e->number, idx, fp ? 16 : 8);
+            increment, reg_offset, e->number, idx, fp ? 16u : 8u);
     if (fp && aggregate(t)) {
         slot_load(e, 9, in->dest);
         char width = model.element == 4 ? 's' : model.element == 8 ? 'd' : 'q';

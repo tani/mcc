@@ -62,30 +62,139 @@ bool scalar(Type *t)
     return integer_type(t) || (t && (t->kind == TY_PTR || t->kind == TY_FLOAT));
 }
 
-bool same_type(Type *a, Type *b)
+static bool promoted_parameter(Type *t)
+{
+    return (integer_type(t) && t->rank < 3) || (t->kind == TY_FLOAT && t->size == 4);
+}
+
+static bool compatible(Type *a, Type *b, bool check_qualifiers)
 {
     if (a == b)
         return true;
-    if (!a || !b || a->kind != b->kind)
+    if (!a || !b || a->kind != b->kind ||
+        (check_qualifiers && a->qualifiers != b->qualifiers))
         return false;
+    if (a->enumeration && b->enumeration)
+        return a->base == b->base;
     switch (a->kind) {
-    case TY_PTR: return same_type(a->base, b->base);
+    case TY_PTR: return compatible(a->base, b->base, true);
     case TY_ARRAY: return (!a->complete || !b->complete || a->length == b->length) &&
-                          same_type(a->base, b->base);
+                          compatible(a->base, b->base, true);
     case TY_FUNC:
-        if (!same_type(a->base, b->base))
+        if (!compatible(a->base, b->base, true))
             return false;
-        if (!a->prototype || !b->prototype)
+        if (!a->prototype && !b->prototype)
             return true;
+        if (!a->prototype || !b->prototype) {
+            Type *prototype = a->prototype ? a : b;
+            if (prototype->variadic)
+                return false;
+            for (size_t i = 0; i < prototype->members.len; i++)
+                if (promoted_parameter(prototype->members.data[i].type))
+                    return false;
+            return true;
+        }
         if (a->variadic != b->variadic || a->members.len != b->members.len)
             return false;
         for (size_t i = 0; i < a->members.len; i++)
-            if (!same_type(a->members.data[i].type, b->members.data[i].type))
+            if (!compatible(a->members.data[i].type, b->members.data[i].type, false))
                 return false;
         return true;
     case TY_STRUCT: case TY_UNION: return a->base && a->base == b->base;
     default: return a->size == b->size && a->uns == b->uns && a->rank == b->rank &&
                     a->plain_char == b->plain_char;
+    }
+}
+
+bool same_type(Type *a, Type *b)
+{
+    return compatible(a, b, false);
+}
+
+static Type *qualified(Context *c, Type *t, unsigned qualifiers)
+{
+    if (t->kind == TY_ARRAY && qualifiers) {
+        Type *array_type = alloc(c, sizeof *array_type);
+        *array_type = *t;
+        array_type->base = qualified(c, t->base, t->base->qualifiers | qualifiers);
+        return array_type;
+    }
+    if (t->qualifiers == qualifiers)
+        return t;
+    if (t->kind == TY_STRUCT || t->kind == TY_UNION || t->enumeration) {
+        Type *definition = t->base;
+        for (Type *version = definition; version; version = version->qualified_next)
+            if (version->qualifiers == qualifiers)
+                return version;
+        Type *result = alloc(c, sizeof *result);
+        *result = *definition;
+        result->qualifiers = qualifiers;
+        definition->qualified_next = result;
+        return result;
+    }
+    Type *result = alloc(c, sizeof *result);
+    *result = *t;
+    result->qualifiers = qualifiers;
+    return result;
+}
+
+static void update_qualified_types(Type *definition)
+{
+    for (Type *t = definition->qualified_next; t; t = t->qualified_next) {
+        Type *next = t->qualified_next;
+        unsigned qualifiers = t->qualifiers;
+        *t = *definition;
+        t->qualifiers = qualifiers;
+        t->qualified_next = next;
+    }
+}
+
+static void check_restrict(Context *c, Type *t, unsigned qualifiers, Loc loc)
+{
+    if ((qualifiers & S_RESTRICT) && (t->kind != TY_PTR || t->base->kind == TY_FUNC))
+        error(c, loc, "restrict requires a pointer to an object or incomplete type");
+}
+
+static Type *composite_type(Context *c, Type *a, Type *b)
+{
+    if (a == b)
+        return a;
+    switch (a->kind) {
+    case TY_PTR: {
+        Type *base = composite_type(c, a->base, b->base);
+        if (a->base == base)
+            return a;
+        Type *result = pointer(c, base);
+        result->qualifiers = a->qualifiers;
+        return result;
+    }
+    case TY_ARRAY: {
+        Type *shape = a->complete ? a : b;
+        Type *base = composite_type(c, a->base, b->base);
+        if (shape->base == base)
+            return shape;
+        Type *result = alloc(c, sizeof *result);
+        *result = *shape;
+        result->base = base;
+        return result;
+    }
+    case TY_FUNC: {
+        Type *signature = a->prototype ? a : b;
+        Type *result = alloc(c, sizeof *result);
+        *result = *signature;
+        result->base = composite_type(c, a->base, b->base);
+        if (a->prototype && b->prototype) {
+            result->members = (Members){0};
+            for (size_t i = 0; i < a->members.len; i++) {
+                Member parameter = a->members.data[i];
+                parameter.type = composite_type(c, parameter.type, b->members.data[i].type);
+                PUSH(c, result->members, parameter);
+            }
+        }
+        return result;
+    }
+    default:
+        return a;
     }
 }
 
@@ -124,7 +233,7 @@ Type *spec_type(Context *c, Specs s, Loc loc)
             bad |= f != S_FLOAT && f != S_DOUBLE && f != (S_LONG | S_DOUBLE);
             t = type(c, TY_FLOAT, width, width);
         } else if (f & S_CHAR) {
-            bad |= (f & ~(S_CHAR | S_SIGNED | S_UNSIGNED)) != 0;
+            bad |= (f & ~(unsigned)(S_CHAR | S_SIGNED | S_UNSIGNED)) != 0;
             t = type_int(c, 1, uns || (!(f & S_SIGNED) && c->target->char_unsigned));
             t->plain_char = !(f & (S_SIGNED | S_UNSIGNED));
         } else if (f & S_SHORT) {
@@ -138,13 +247,9 @@ Type *spec_type(Context *c, Specs s, Loc loc)
     }
     if (s.flags & S_PACKED)
         pack_record(c, t, loc);
-    if (s.flags & S_CONST) {
-        Type *qualified = alloc(c, sizeof *qualified);
-        *qualified = *t;
-        qualified->qualified_const = true;
-        t = qualified;
-    }
-    return t;
+    unsigned qualifiers = s.flags & S_QUALIFIERS;
+    check_restrict(c, t, qualifiers, loc);
+    return qualified(c, t, t->qualifiers | qualifiers);
 }
 
 Decl *decl(Context *c, DeclKind kind, Decl *inner, Loc loc)
@@ -172,7 +277,8 @@ Type *apply_decl(Context *c, Type *base, Decl *d)
         if (base->variable_bound)
             error(c, d->loc, "declarators for pointers to variable-length arrays are not supported");
         t = pointer(c, base);
-        t->qualified_const = d->is_const;
+        t->qualifiers = d->qualifiers;
+        check_restrict(c, t, t->qualifiers, d->loc);
         break;
     case D_ARRAY: {
         uint64_t count = 0;
@@ -189,7 +295,7 @@ Type *apply_decl(Context *c, Type *base, Decl *d)
         t = array(c, base, (size_t)count, d->bound != NULL, d->loc);
         if (variable)
             t->variable_bound = d->bound;
-        t->qualified_const = d->is_const;
+        t->qualifiers = d->qualifiers;
         break;
     }
     case D_FUNCTION:
@@ -208,7 +314,7 @@ Type *apply_decl(Context *c, Type *base, Decl *d)
             if (p->type->kind == TY_ARRAY) {
                 Type *array_type = p->type;
                 p->type = pointer(c, array_type->base);
-                p->type->qualified_const = array_type->qualified_const;
+                p->type->qualifiers = array_type->qualifiers;
             }
             else if (p->type->kind == TY_FUNC)
                 p->type = pointer(c, p->type);
@@ -283,6 +389,7 @@ Type *enum_type(Context *c, const char *name, bool definition, Loc loc)
     if (!t) {
         t = type_int(c, 3, true);
         t->enumeration = true;
+        t->base = t;
         t->complete = false;
         if (name) {
             Tag item = {name, t};
@@ -292,6 +399,7 @@ Type *enum_type(Context *c, const char *name, bool definition, Loc loc)
     if (definition) {
         t->complete = true;
         t->uns = !c->enum_negative;
+        update_qualified_types(t);
     }
     return t;
 }
@@ -339,8 +447,10 @@ Type *record_type(Context *c, bool is_union, const char *tag, Members *members, 
         bool flexible = m->type->kind == TY_ARRAY && !m->type->complete && !is_union && i &&
                         i + 1 == members->len;
         if (m->type->kind == TY_VOID || m->type->kind == TY_FUNC ||
-            (!m->type->complete && !flexible))
+            (!m->type->complete && !flexible)) {
             error(c, loc, "member '%s' has an incomplete or invalid type", m->name);
+            return t;
+        }
         if ((!m->bit_field || m->name) && m->type->align > alignment)
             alignment = m->type->align;
         if (m->bit_field) {
@@ -377,6 +487,7 @@ Type *record_type(Context *c, bool is_union, const char *tag, Members *members, 
     t->align = (unsigned)alignment;
     t->members = *members;
     t->complete = true;
+    update_qualified_types(t);
     return t;
 }
 
@@ -386,6 +497,7 @@ void pack_record(Context *c, Type *t, Loc loc)
         error(c, loc, "packed attribute requires a complete aggregate definition");
         return;
     }
+    t = t->base;
     size_t size = 0;
     for (size_t i = 0; i < t->members.len; i++) {
         Member *m = &t->members.data[i];
@@ -402,6 +514,7 @@ void pack_record(Context *c, Type *t, Loc loc)
     }
     t->align = 1;
     t->size = (unsigned)size;
+    update_qualified_types(t);
 }
 
 void add_member(Context *c, Members *list, Specs s, Decl *d, Loc loc)
@@ -726,8 +839,22 @@ Node *reference(Context *c, const char *name, Loc loc)
 
 static bool lvalue(Node *n)
 {
-    return n->kind == N_SYMBOL || n->kind == N_DEREF || n->kind == N_MEMBER ||
-           n->kind == N_COMPOUND;
+    if (n->kind == N_MEMBER)
+        return lvalue(n->left);
+    return n->kind == N_SYMBOL || n->kind == N_DEREF || n->kind == N_COMPOUND;
+}
+
+static bool const_subobject(Type *t)
+{
+    if (t->qualifiers & S_CONST)
+        return true;
+    if (t->kind == TY_ARRAY)
+        return const_subobject(t->base);
+    if (t->kind == TY_STRUCT || t->kind == TY_UNION)
+        for (size_t i = 0; i < t->members.len; i++)
+            if (const_subobject(t->members.data[i].type))
+                return true;
+    return false;
 }
 
 static Node *address(Context *c, Node *n, Type *t, Loc loc)
@@ -749,7 +876,7 @@ Node *decay(Context *c, Node *n)
 Node *convert(Context *c, Node *n, Type *to, Loc loc)
 {
     n = decay(c, n);
-    if (same_type(n->type, to))
+    if (compatible(n->type, to, true) || (aggregate(to) && same_type(n->type, to)))
         return n;
     if (to->kind != TY_VOID && (!scalar(n->type) || !scalar(to) ||
         (n->type->kind == TY_FLOAT && to->kind == TY_PTR) ||
@@ -760,6 +887,26 @@ Node *convert(Context *c, Node *n, Type *to, Loc loc)
     Node *cast = node(c, N_CAST, loc, n, NULL);
     cast->type = to;
     return cast;
+}
+
+static bool object_type(Type *t)
+{
+    return t->kind != TY_VOID && t->kind != TY_FUNC;
+}
+
+Node *cast_expression(Context *c, Node *n, Type *to, Loc loc)
+{
+    n = decay(c, n);
+    if (n->type->kind == TY_PTR && to->kind == TY_PTR &&
+        (n->type->base->kind == TY_FUNC) != (to->base->kind == TY_FUNC))
+        extension(c, loc, "cast between function and object or void pointers");
+    to = qualified(c, to, 0);
+    Node *value = convert(c, n, to, loc);
+    if (value == n && lvalue(n)) {
+        value = node(c, N_CAST, loc, n, NULL);
+        value->type = to;
+    }
+    return value;
 }
 
 static Node *promote(Context *c, Node *n)
@@ -782,23 +929,96 @@ static Type *common_type(Context *c, Type *a, Type *b)
     return type_int(c, a->rank, uns);
 }
 
+static bool integer_constant_operands(Node *n)
+{
+    if (!integer_type(n->type))
+        return false;
+    switch (n->kind) {
+    case N_INT:
+        return true;
+    case N_CAST:
+        return n->left->kind == N_FLOAT || integer_constant_operands(n->left);
+    case N_UNARY:
+        return integer_constant_operands(n->left);
+    case N_BINARY:
+        return integer_constant_operands(n->left) && integer_constant_operands(n->right);
+    case N_COND:
+        return integer_constant_operands(n->left) && integer_constant_operands(n->right) &&
+               integer_constant_operands(n->third);
+    default:
+        return false;
+    }
+}
+
+static bool null_pointer_constant(Context *c, Node *n)
+{
+    if (n->kind == N_CAST && n->type->kind == TY_PTR &&
+        n->type->base->kind == TY_VOID && !n->type->base->qualifiers)
+        n = n->left;
+    uint64_t value;
+    return integer_constant_operands(n) && constant_int(c, n, &value) && value == 0;
+}
+
+static bool void_object_pair(Type *a, Type *b)
+{
+    return (a->kind == TY_VOID && object_type(b)) ||
+           (b->kind == TY_VOID && object_type(a));
+}
+
+static bool void_function_pair(Type *a, Type *b)
+{
+    return (a->kind == TY_VOID && b->kind == TY_FUNC) ||
+           (b->kind == TY_VOID && a->kind == TY_FUNC);
+}
+
 static Node *implicitly(Context *c, Node *n, Type *to, Loc loc)
 {
     n = decay(c, n);
-    if (to->kind == TY_PTR) {
-        uint64_t v;
+    if (to->kind == TY_PTR && !null_pointer_constant(c, n)) {
         if (n->type->kind == TY_PTR) {
-            Type *a = to->base, *b = n->type->base;
-            if ((!same_type(a,b) && a->kind != TY_VOID && b->kind != TY_VOID) ||
-                (b->qualified_const && !a->qualified_const && (!c->gnu || c->pedantic)))
+            Type *dest = to->base, *source = n->type->base;
+            if (void_function_pair(dest, source))
+                extension(c, loc, "conversion between function and void pointers");
+            else if (!same_type(dest, source) && !void_object_pair(dest, source))
                 error(c, loc, "incompatible pointer conversion");
-        } else if (!integer_type(n->type) || !constant_int(c, n, &v) || v) {
+            else if ((source->qualifiers & ~dest->qualifiers) && (!c->gnu || c->pedantic))
+                error(c, loc, "pointer conversion discards qualifiers");
+        } else {
             error(c, loc, "expected a compatible pointer or null pointer constant");
         }
     } else if (integer_type(to) && to->kind != TY_BOOL && n->type->kind == TY_PTR) {
         error(c, loc, "implicit conversion from pointer to integer");
     }
     return convert(c, n, to, loc);
+}
+
+static Type *common_pointer(Context *c, Node *a, Node *b, bool allow_null_void, Loc loc)
+{
+    Type *left = a->type, *right = b->type;
+    if (allow_null_void) {
+        if (left->kind == TY_PTR && null_pointer_constant(c, b))
+            return qualified(c, left, 0);
+        if (right->kind == TY_PTR && null_pointer_constant(c, a))
+            return qualified(c, right, 0);
+    }
+    if (left->kind != TY_PTR || right->kind != TY_PTR) {
+        error(c, loc, "invalid pointer operands");
+        return NULL;
+    }
+    Type *x = left->base, *y = right->base, *base;
+    if (same_type(x, y)) {
+        if (!allow_null_void && !object_type(x))
+            extension(c, loc, "ordered comparison of void or function pointers");
+        base = composite_type(c, x, y);
+    } else if (void_object_pair(x, y) || (allow_null_void && void_function_pair(x, y))) {
+        if (!allow_null_void || void_function_pair(x, y))
+            extension(c, loc, "comparison or conditional with incompatible pointer types");
+        base = x->kind == TY_VOID ? x : y;
+    } else {
+        error(c, loc, "incompatible pointer operands");
+        return NULL;
+    }
+    return pointer(c, qualified(c, base, x->qualifiers | y->qualifiers));
 }
 
 Node *unary(Context *c, int op, Node *n, Loc loc)
@@ -871,13 +1091,13 @@ Node *binary(Context *c, int op, Node *a, Node *b, Loc loc)
             Node *tmp = a; a = b; b = tmp;
         }
         if (comparison) {
-            if (a->type->kind != TY_PTR)
-                a = implicitly(c, a, b->type, loc);
-            else
-                b = implicitly(c, b, a->type, loc);
-            return operation(c, op, a, b, i, loc);
+            Type *common = common_pointer(c, a, b, op == EQ || op == NE, loc);
+            if (!common)
+                return integer(c, loc, 0, i);
+            return operation(c, op, convert(c, a, common, loc), convert(c, b, common, loc),
+                             i, loc);
         }
-        Type *base = a->type->base;
+        Type *base = a->type->kind == TY_PTR ? a->type->base : NULL;
         if (base && (base->kind == TY_VOID || base->kind == TY_FUNC))
             extension(c, loc, "arithmetic on void or function pointers");
         else if (base && !base->complete)
@@ -885,14 +1105,14 @@ Node *binary(Context *c, int op, Node *a, Node *b, Loc loc)
         Node *scale = base && base->variable_bound ? convert(c, vla_size(c, base, loc), wide, loc) :
                       integer(c, loc, base && base->size ? base->size : 1, wide);
         if (a->type->kind == TY_PTR && b->type->kind == TY_PTR && op == '-' &&
-            same_type(a->type, b->type)) {
+            same_type(base, b->type->base) && b->type->base->complete) {
             Node *difference = operation(c, '-', convert(c, a, wide, loc),
                                         convert(c, b, wide, loc), wide, loc);
             return operation(c, '/', difference, scale, wide, loc);
         }
         if (a->type->kind == TY_PTR && integer_type(b->type) && (op == '+' || op == '-')) {
             b = operation(c, '*', convert(c, b, wide, loc), scale, wide, loc);
-            return operation(c, op, a, b, a->type, loc);
+            return operation(c, op, a, b, qualified(c, a->type, 0), loc);
         }
         error(c, loc, "invalid pointer operands");
         return integer(c, loc, 0, i);
@@ -909,13 +1129,13 @@ Node *binary(Context *c, int op, Node *a, Node *b, Loc loc)
 
 Node *assign(Context *c, int op, Node *lhs, Node *rhs, bool postfix, Loc loc)
 {
-    if (!lvalue(lhs) || lhs->type->qualified_const || lhs->type->kind == TY_ARRAY ||
+    if (!lvalue(lhs) || const_subobject(lhs->type) || lhs->type->kind == TY_ARRAY ||
         lhs->type->kind == TY_FUNC || lhs->type->kind == TY_VOID)
         error(c, loc, "assignment requires a modifiable lvalue");
     if (op != '=')
         rhs = binary(c, op, lhs, rhs, loc);
     Node *n = node(c, op == '=' ? N_ASSIGN : N_UPDATE, loc, lhs, implicitly(c, rhs, lhs->type, loc));
-    n->type = lhs->type;
+    n->type = qualified(c, lhs->type, 0);
     n->postfix = postfix;
     return n;
 }
@@ -927,25 +1147,25 @@ Node *conditional(Context *c, Node *test, Node *yes, Node *no, Loc loc)
         error(c, loc, "condition must have scalar type");
     Node *a = yes ? decay(c, yes) : test;
     no = decay(c, no);
-    Type *t = a->type;
-    if (t->kind == TY_VOID || no->type->kind == TY_VOID) {
-        if (t->kind != no->type->kind)
+    Type *t;
+    if (a->type->kind == TY_VOID || no->type->kind == TY_VOID) {
+        if (a->type->kind != no->type->kind)
             extension(c, loc, "conditional expression mixing void and nonvoid arms");
         t = type(c, TY_VOID, 0, 1);
-    } else if (!same_type(t, no->type)) {
-        if (t->kind == TY_PTR)
-            no = implicitly(c, no, t, loc);
-        else if (no->type->kind == TY_PTR)
-            t = no->type;
-        else if (scalar(t) && scalar(no->type))
-            t = common_type(c, promote(c, a)->type, promote(c, no)->type);
-        else
-            error(c, loc, "incompatible conditional operands");
-    } else if (integer_type(t) && t->rank < 3) {
-        t = type_int(c, 3, false);
+    } else if (a->type->kind == TY_PTR || no->type->kind == TY_PTR) {
+        t = common_pointer(c, a, no, true, loc);
+        if (!t)
+            return integer(c, loc, 0, type_int(c, 3, false));
+    } else if (scalar(a->type) && scalar(no->type)) {
+        t = qualified(c, common_type(c, promote(c, a)->type, promote(c, no)->type), 0);
+    } else if (same_type(a->type, no->type)) {
+        t = qualified(c, composite_type(c, a->type, no->type), 0);
+    } else {
+        error(c, loc, "incompatible conditional operands");
+        return integer(c, loc, 0, type_int(c, 3, false));
     }
-    Node *n = node(c, N_COND, loc, test, implicitly(c, a, t, loc));
-    n->third = implicitly(c, no, t, loc);
+    Node *n = node(c, N_COND, loc, test, convert(c, a, t, loc));
+    n->third = convert(c, no, t, loc);
     n->type = t;
     n->postfix = !yes;
     return n;
@@ -1073,7 +1293,8 @@ Node *field(Context *c, Node *n, const char *name, bool indirect, Loc loc)
         field_node->integer = m.offset;
         field_node->bit = m.bit;
         field_node->width = m.width;
-        field_node->type = n->type->qualified_const ? spec_type(c, (Specs){S_CONST, m.type}, loc) : m.type;
+        field_node->type = qualified(c, m.type, m.type->qualifiers |
+                                     (n->type->qualifiers & (S_CONST | S_VOLATILE)));
         return field_node;
     }
     error(c, loc, "no member named '%s'", name);
@@ -1146,6 +1367,20 @@ bool constant_int(Context *c, Node *n, uint64_t *value)
         if (n->left->type->kind == TY_PTR) {
             if (!constant_pointer(c, n->left, &result))
                 return false;
+        } else if (n->left->kind == N_FLOAT) {
+            long double real = n->left->real;
+            if (n->type->kind == TY_BOOL) {
+                result = real != 0;
+            } else {
+                unsigned bits = n->type->size * CHAR_BIT;
+                unsigned exponent = bits - !n->type->uns;
+                long double upper = exponent == 64 ? 0x1p64L :
+                                    (long double)(UINT64_C(1) << exponent);
+                long double lower = n->type->uns ? -1 : -upper - 1;
+                if (!(real > lower && real < upper))
+                    return false;
+                result = n->type->uns ? (uint64_t)real : (uint64_t)(int64_t)real;
+            }
         } else if (!constant_int(c, n->left, &result)) {
             return false;
         }
@@ -1230,7 +1465,7 @@ static Symbol *global(Context *c, const char *name, Type *t, unsigned flags, Loc
         s->thread_local_storage = (flags & S_THREAD) != 0;
         PUSH(c, outer->names, s);
         PUSH(c, c->globals, s);
-    } else if (s->is_typedef || s->enum_constant || !same_type(s->type, t) ||
+    } else if (s->is_typedef || s->enum_constant || !compatible(s->type, t, true) ||
                s->thread_local_storage != ((flags & S_THREAD) != 0)) {
         error(c, loc, "conflicting declaration of '%s'", name);
     } else if (t->complete && (t->kind != TY_FUNC || t->prototype)) {
@@ -1261,7 +1496,7 @@ Node *declare(Context *c, Specs specs, Decl *d, Node *init, Loc loc)
         error(c, loc, "variable-length array requires automatic storage");
     if (is_typedef || local) {
         Symbol *prior = find_in(c->scope, id);
-        if (prior && !(is_typedef && prior->is_typedef && same_type(prior->type, t)))
+        if (prior && !(is_typedef && prior->is_typedef && compatible(prior->type, t, true)))
             error(c, loc, "redeclaration of '%s'", id);
         s = symbol(c, id, t, loc);
         s->is_typedef = is_typedef;
@@ -1308,8 +1543,11 @@ static Type *subobject(Type *t, size_t index)
 
 static size_t elements(Type *t)
 {
-    return t->kind == TY_ARRAY ? (t->complete ? t->length : SIZE_MAX) :
-           t->kind == TY_UNION ? (t->members.len != 0) : t->members.len;
+    if (t->kind == TY_ARRAY)
+        return t->complete ? t->length : SIZE_MAX;
+    if (t->kind == TY_UNION)
+        return t->members.len ? 1 : 0;
+    return t->members.len;
 }
 
 static Node *initializer(Context *, Type **, Node *);
@@ -1532,19 +1770,10 @@ Node *compound_literal(Context *c, Type *t, Nodes entries, Loc loc)
     return n;
 }
 
-static bool compatible_qualifiers(Type *a, Type *b)
-{
-    if (!same_type(a, b) || a->qualified_const != b->qualified_const)
-        return false;
-    if (a->kind == TY_PTR || a->kind == TY_ARRAY)
-        return compatible_qualifiers(a->base, b->base);
-    return true;
-}
-
 Node *generic_selection(Context *c, Node *control, Nodes entries, Loc loc)
 {
     Type type = *decay(c, control)->type;
-    type.qualified_const = false;
+    type.qualifiers = 0;
     Node *selected = NULL, *fallback = NULL;
     for (size_t i = 0; i < entries.len; i++) {
         Node *entry = entries.data[i];
@@ -1555,9 +1784,9 @@ Node *generic_selection(Context *c, Node *control, Nodes entries, Loc loc)
             continue;
         }
         for (size_t j = 0; j < i; j++)
-            if (entries.data[j]->type && compatible_qualifiers(entry->type, entries.data[j]->type))
+            if (entries.data[j]->type && compatible(entry->type, entries.data[j]->type, true))
                 error(c, entry->loc, "duplicate compatible generic association");
-        if (compatible_qualifiers(&type, entry->type))
+        if (compatible(&type, entry->type, true))
             selected = entry->left;
     }
     if (selected || fallback)

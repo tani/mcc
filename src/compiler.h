@@ -60,11 +60,12 @@ typedef VECTOR(Member) Members;
 
 struct Type {
     TypeKind kind;
-    unsigned size, align, rank;
-    bool uns, variadic, prototype, complete, qualified_const;
+    unsigned size, align, rank, qualifiers;
+    bool uns, variadic, prototype, complete;
     bool plain_char;
     bool enumeration;
     Type *base;
+    Type *qualified_next;
     Node *variable_bound;
     Symbol *runtime_size;
     size_t length;
@@ -89,7 +90,7 @@ struct Decl {
     Node *bit_width;
     Members params;
     bool variadic, prototype;
-    bool is_const;
+    unsigned qualifiers;
 };
 
 enum {
@@ -98,7 +99,8 @@ enum {
     S_DOUBLE = 1u << 8, S_SIGNED = 1u << 9, S_UNSIGNED = 1u << 10,
     S_CONST = 1u << 11, S_TYPEDEF = 1u << 12, S_EXTERN = 1u << 13,
     S_STATIC = 1u << 14, S_AUTO = 1u << 15, S_REGISTER = 1u << 16, S_THREAD = 1u << 17,
-    S_PACKED = 1u << 18
+    S_PACKED = 1u << 18, S_VOLATILE = 1u << 19, S_RESTRICT = 1u << 20,
+    S_QUALIFIERS = S_CONST | S_VOLATILE | S_RESTRICT
 };
 
 typedef struct { unsigned flags; Type *type; } Specs;
@@ -166,9 +168,15 @@ struct Context {
 
 void *alloc(Context *, size_t);
 void *grow(Context *, const void *, size_t *, size_t);
-const char *copy(Context *, const char *, size_t);
-const char *format(Context *, const char *, ...);
+char *copy(Context *, const char *, size_t);
+#if defined(__GNUC__)
+__attribute__((__format__(__printf__, 2, 3)))
+#endif
+char *format(Context *, const char *, ...);
 void release(Context *);
+#if defined(__GNUC__)
+__attribute__((__format__(__printf__, 3, 4)))
+#endif
 void error(Context *, Loc, const char *, ...);
 void extension(Context *, Loc, const char *);
 size_t align_to(size_t, size_t);
@@ -198,6 +206,7 @@ Node *unary(Context *, int, Node *, Loc);
 Node *binary(Context *, int, Node *, Node *, Loc);
 Node *assign(Context *, int, Node *, Node *, bool, Loc);
 Node *convert(Context *, Node *, Type *, Loc);
+Node *cast_expression(Context *, Node *, Type *, Loc);
 Node *conditional(Context *, Node *, Node *, Node *, Loc);
 Node *call(Context *, Node *, Nodes, Loc);
 Node *field(Context *, Node *, const char *, bool, Loc);

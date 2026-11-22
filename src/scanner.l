@@ -16,7 +16,7 @@ typedef struct {
 } Scanner;
 
 static void matched(Scanner *, size_t);
-static void token(Scanner *, TokenKind, const char *, size_t);
+static void token(Scanner *, TokenKind, const char *, int);
 #define YY_USER_ACTION matched(yyextra, (size_t)yyleng);
 }
 
@@ -56,9 +56,9 @@ static void matched(Scanner *s, size_t len)
     s->offset += len;
 }
 
-static void token(Scanner *s, TokenKind kind, const char *text, size_t len)
+static void token(Scanner *s, TokenKind kind, const char *text, int len)
 {
-    Token value = {kind, copy(s->context, text, len), s->loc, s->space, NULL};
+    Token value = {kind, copy(s->context, text, (size_t)len), s->loc, s->space, NULL};
     if (kind == PUNCT) {
         static const char *const from[] = {"<:", ":>", "<%", "%>", "%:", "%:%:"};
         static const char *const to[] = {"[", "]", "{", "}", "#", "##"};

@@ -20,6 +20,8 @@
         default = mkShell pkgs;
         musl = (mkShell muslPkgs).overrideAttrs (_: {
           MCC_TOOLCHAIN = "${muslPkgs.gccStdenv.cc}/bin/${muslPkgs.gccStdenv.cc.targetPrefix}gcc";
+          MCC_GCC_HOST = "${pkgs.gccStdenv.cc}/bin/gcc";
+          MCC_COMPILER_INCLUDE = "${./include}";
           MCC_SYSTEM_INCLUDE = "${nixpkgs.lib.getDev muslPkgs.musl}/include";
         });
       });

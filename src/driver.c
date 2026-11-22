@@ -28,7 +28,7 @@ static void usage(FILE *out)
     fputs("Usage: mcc [-std=c11|-std=gnu11] [-E|-fsyntax-only|-S|-c] [-o FILE] INPUT...\n"
           "       -I DIR, -isystem DIR, -D MACRO[=VALUE], -U MACRO\n"
           "       -static, -shared, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
-          "       MCC_TOOLCHAIN and MCC_SYSTEM_INCLUDE select the AArch64 musl SDK.\n", out);
+          "       MCC_TOOLCHAIN, MCC_COMPILER_INCLUDE, and MCC_SYSTEM_INCLUDE select the AArch64 musl SDK.\n", out);
 }
 
 static bool starts(const char *argument, const char *prefix)
@@ -113,7 +113,9 @@ static void parse_options(Driver *d, int argc, char **argv)
 static int invoke(Driver *d, Strings args, int stdout_fd)
 {
     Context *c = &d->options;
-    PUSH(c, args, NULL);
+    char **argv = alloc(c, (args.len + 1) * sizeof *argv);
+    for (size_t i = 0; i < args.len; i++)
+        argv[i] = copy(c, args.data[i], strlen(args.data[i]));
     posix_spawn_file_actions_t actions;
     int status = posix_spawn_file_actions_init(&actions);
     bool initialized = status == 0;
@@ -121,8 +123,7 @@ static int invoke(Driver *d, Strings args, int stdout_fd)
         status = posix_spawn_file_actions_adddup2(&actions, stdout_fd, STDOUT_FILENO);
     pid_t child;
     if (!status)
-        status = posix_spawnp(&child, args.data[0], &actions, NULL,
-                             (char *const *)args.data, environ);
+        status = posix_spawnp(&child, argv[0], &actions, NULL, argv, environ);
     if (initialized)
         posix_spawn_file_actions_destroy(&actions);
     if (status) {
@@ -145,7 +146,7 @@ static const char *temporary(Driver *d, const char *ext)
     Context *c = &d->options;
     if (!d->directory) {
         const char *base = getenv("TMPDIR");
-        char *dir = (char *)format(c, "%s/mcc.XXXXXX", base && *base ? base : "/tmp");
+        char *dir = format(c, "%s/mcc.XXXXXX", base && *base ? base : "/tmp");
         if (!mkdtemp(dir)) {
             error(c, (Loc){0}, "cannot create temporary directory: %s", strerror(errno));
             return NULL;
@@ -242,7 +243,7 @@ static const char *stage(Driver *d, const char *destination)
             }
         }
     }
-    char *name = (char *)format(c, "%s.mcc.XXXXXX", destination);
+    char *name = format(c, "%s.mcc.XXXXXX", destination);
     int fd = mkstemp(name);
     if (fd < 0) {
         error(c, (Loc){0}, "%s: %s", destination, strerror(errno));
@@ -402,6 +403,9 @@ int main(int argc, char **argv)
     if (!d.toolchain || !*d.toolchain)
         d.toolchain = "aarch64-unknown-linux-musl-gcc";
     parse_options(&d, argc, argv);
+    const char *compiler_headers = getenv("MCC_COMPILER_INCLUDE");
+    if (compiler_headers && *compiler_headers)
+        PUSH(&d.options, d.options.system_includes, compiler_headers);
     const char *headers = getenv("MCC_SYSTEM_INCLUDE");
     if (headers && *headers)
         PUSH(&d.options, d.options.system_includes, headers);

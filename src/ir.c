@@ -295,6 +295,8 @@ static size_t value(Lower *l, Node *n)
     }
     case N_CAST: {
         size_t in = value(l, n->left);
+        if (aggregate(t))
+            return in;
         if (t->kind == TY_VOID)
             return 0;
         size_t dest = slot(l, t);

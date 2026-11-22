@@ -63,7 +63,7 @@ static void yyerror(Loc *loc, Context *c, const char *message)
 %type <decls> member_declarators
 %type <type> record enum_spec type_name typeof_spec
 %type <flags> record_kind record_intro
-%type <flag> quals
+%type <flags> quals
 %type <members> member_list member_declaration
 %type <node> compound block_item declaration init_declarators initialized declared initializer
 %type <node> statement expression expression_opt assignment conditional logical_or logical_and
@@ -175,8 +175,8 @@ mods:
 
 mod:
     CONST { $$ = S_CONST; }
-  | VOLATILE { $$ = 0; }
-  | RESTRICT { $$ = 0; }
+  | VOLATILE { $$ = S_VOLATILE; }
+  | RESTRICT { $$ = S_RESTRICT; }
   | INLINE { $$ = 0; }
   | NORETURN { $$ = 0; }
   | TYPEDEF { $$ = S_TYPEDEF; }
@@ -296,15 +296,15 @@ enumerator:
   ;
 
 pointers:
-    '*' quals { $$ = decl(c, D_POINTER, NULL, @1); $$->is_const = $2; }
-  | '*' quals pointers { $$ = decl(c, D_POINTER, $3, @1); $$->is_const = $2; }
+    '*' quals { $$ = decl(c, D_POINTER, NULL, @1); $$->qualifiers = $2; }
+  | '*' quals pointers { $$ = decl(c, D_POINTER, $3, @1); $$->qualifiers = $2; }
   ;
 
 quals:
-    %empty { $$ = false; }
-  | quals CONST { $$ = true; }
-  | quals VOLATILE { $$ = $1; }
-  | quals RESTRICT { $$ = $1; }
+    %empty { $$ = 0; }
+  | quals CONST { $$ = $1 | S_CONST; }
+  | quals VOLATILE { $$ = $1 | S_VOLATILE; }
+  | quals RESTRICT { $$ = $1 | S_RESTRICT; }
   ;
 
 declarator:
@@ -369,12 +369,12 @@ direct_abstract:
 
 brackets:
     '[' quals expression_opt ']' {
-      $$ = decl(c, D_ARRAY, NULL, @1); $$->bound = $3; $$->is_const = $2;
+      $$ = decl(c, D_ARRAY, NULL, @1); $$->bound = $3; $$->qualifiers = $2;
     }
   | '[' STATIC quals assignment ']' {
-      $$ = decl(c, D_ARRAY, NULL, @1); $$->bound = $4; $$->is_const = $3;
+      $$ = decl(c, D_ARRAY, NULL, @1); $$->bound = $4; $$->qualifiers = $3;
     }
-  | '[' quals '*' ']' { $$ = decl(c, D_ARRAY, NULL, @1); $$->is_const = $2; }
+  | '[' quals '*' ']' { $$ = decl(c, D_ARRAY, NULL, @1); $$->qualifiers = $2; }
   ;
 
 type_name:
@@ -525,7 +525,7 @@ cast:
   | '(' type_name ')' cast {
       if ($2->kind == TY_STRUCT || $2->kind == TY_UNION)
         extension(c, @1, "cast to an aggregate type");
-      $$ = convert(c, $4, $2, @1);
+      $$ = cast_expression(c, $4, $2, @1);
     }
   ;
 

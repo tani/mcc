@@ -93,7 +93,7 @@ long from_gcc(long a, long b, long c, long d, long e, long f, long g, long h, lo
 
         original = binary.read_bytes()
         failed = command([compiler, "-", "-o", binary], source=b"int main(void) { return missing; }")
-        assert failed.returncode and b"<stdin>:1:" in failed.stderr
+        assert failed.returncode == 1 and b"<stdin>:1:" in failed.stderr
         assert binary.read_bytes() == original
         gnu = br"""
 int main(void) {
@@ -102,7 +102,7 @@ int main(void) {
     return 1;
 }
 """
-        assert command([compiler, "-fsyntax-only", "-"], source=gnu).returncode
+        assert command([compiler, "-fsyntax-only", "-"], source=gnu).returncode == 1
         succeeded([compiler, "-std=gnu11", "-", "-o", binary], source=gnu)
         succeeded([binary])
 
@@ -165,7 +165,13 @@ after:
     return 0;
 }
 """)
-        assert failed.returncode and b"jump enters the scope" in failed.stderr
+        assert failed.returncode == 1 and b"jump enters the scope" in failed.stderr
+
+        # Exercise Bison stack relocation and large Flex input under the sanitizers.
+        expression = b"(" * 400 + b"0" + b")" * 400
+        source = b"/*" + b"x" * 20000 + b"*/ int main(void) { return " + expression + b"; }"
+        succeeded([compiler, "-", "-o", binary], source=source)
+        succeeded([binary])
 
         library = root / "libsample.so"
         succeeded([compiler, "-shared", "-", "-o", library], source=br"""

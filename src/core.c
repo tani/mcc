@@ -44,14 +44,14 @@ void *grow(Context *c, const void *old, size_t *capacity, size_t width)
     return result;
 }
 
-const char *copy(Context *c, const char *text, size_t size)
+char *copy(Context *c, const char *text, size_t size)
 {
     char *result = alloc(c, size + 1);
     memcpy(result, text, size);
     return result;
 }
 
-const char *format(Context *c, const char *fmt, ...)
+char *format(Context *c, const char *fmt, ...)
 {
     va_list args, length_args;
     va_start(args, fmt);
