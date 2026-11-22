@@ -73,12 +73,15 @@ struct Type {
 };
 
 typedef struct {
+    const char *arch;
+    bool (*emit)(Context *, FILE *);
     unsigned char_size, short_size, int_size, long_size, long_long_size, pointer_size;
     unsigned long_double_size;
-    bool char_unsigned;
+    bool char_unsigned, wchar_unsigned;
 } Target;
 
 extern const Target aarch64_linux;
+extern const Target x86_64_linux;
 
 typedef enum { D_NAME, D_POINTER, D_ARRAY, D_FUNCTION } DeclKind;
 struct Decl {
@@ -261,5 +264,9 @@ typedef struct {
 
 bool lower(Context *, Symbol *, FunctionIR *);
 bool emit_aarch64(Context *, FILE *);
+bool emit_x86_64(Context *, FILE *);
+uint64_t float_bits(long double, unsigned size);
+bool extended_float_bits(Context *, long double, uint64_t bits[2], Loc);
+void emit_static_data(Context *, FILE *, Symbol *);
 
 #endif

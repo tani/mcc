@@ -1,6 +1,6 @@
 BUILD := build
 PROGRAM := $(BUILD)/mcc
-SOURCES := driver core cpp frontend ir aarch64
+SOURCES := driver core cpp frontend ir data aarch64 x86_64
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES))) $(BUILD)/parser.o $(BUILD)/scanner.o
 WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wformat=2 -Wformat-overflow=2 -Wformat-truncation=2 -Wformat-signedness \

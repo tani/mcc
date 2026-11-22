@@ -1,10 +1,10 @@
 # mcc
 
-mcc is a compiler written in C11 for little-endian AArch64 Linux with glibc. Flex scans preprocessing tokens, mcc expands macros and includes, and Bison parses the expanded source. The front end lowers typed expressions and statements to instructions with explicit branches, calls, and memory operations. The AArch64 backend emits GNU assembly. Native GCC assembles and links it against glibc.
+mcc is a compiler written in C11 for x86-64 and little-endian AArch64 Linux with glibc. Flex scans preprocessing tokens, mcc expands macros and includes, and Bison parses the expanded source. The front end lowers typed expressions and statements to instructions with explicit branches, calls, and memory operations. The target backend emits GNU assembly. GCC assembles it and links it against glibc.
 
 ## Build and use
 
-On AArch64 Linux, the default development shell supplies GCC, glibc headers and libraries, Bison, Flex, and the test tools.
+On x86-64 and AArch64 Linux, the default development shell supplies GCC, glibc headers and libraries, Bison, Flex, and the test tools.
 
 ```sh
 nix develop path:.
@@ -16,7 +16,11 @@ printf '#include <stdio.h>\nint main(void) { puts("hello from mcc"); }\n' |
 
 `build/mcc` defaults to `-std=c11`. Select `-std=gnu11` for the GNU features implemented so far. Use `-E` to inspect expanded source, `-fsyntax-only` to check a translation unit, `-S` for assembly, and `-c` for an ELF object. Multiple source and object inputs can be linked together. Link options include `-static`, `-shared`, `-L`, `-l`, and `-pthread`. Use `-lm` for programs that call the math library.
 
-The driver finds `gcc` on `PATH` and searches the compiler's `include/` directory and the conventional system include directories. The build also works with the system GCC 13, glibc development files, GNU Make, Bison, and Flex on AArch64 Linux. Nix supplies its glibc include directory through `MCC_SYSTEM_INCLUDE`. Set `MCC_TOOLCHAIN` to select a different AArch64 glibc GCC or `MCC_COMPILER_INCLUDE` to relocate the compiler's headers. If switching from an existing build with another toolchain, run `make clean` once.
+The driver targets the architecture of the running mcc binary by default and uses `gcc` from `PATH`. Use `--target=x86_64-linux-gnu` or `--target=aarch64-linux-gnu` to select a target explicitly. For cross-compilation the default GCC executable is `<target>-gcc`, and the default system header directory is `/usr/<target>/include`. For example, `build/mcc --target=x86_64-linux-gnu -c hello.c` produces an x86-64 ELF object.
+
+Set `MCC_TOOLCHAIN` to select a different GCC executable, `MCC_SYSTEM_INCLUDE` to select the target's glibc headers, or `MCC_COMPILER_INCLUDE` to relocate mcc's own headers. Nix supplies the native glibc headers through `MCC_SYSTEM_INCLUDE`. If switching an existing build to another toolchain, run `make clean` once.
+
+Cross-compilation parses and folds `long double` constants using the compiler host's `long double` format before encoding them for the target.
 
 ## Validation
 
@@ -28,7 +32,7 @@ make check-extended
 make check-bootstrap
 ```
 
-`check` exercises the driver, owned preprocessor, generated AArch64 code, and interoperability with GCC. The `check-strict` and `check-suite` targets run the cloned `c-testsuite`. The pinned glibc GCC reference passes 212 cases with `-std=c11 -pedantic-errors` and 220 with `-std=gnu11`.
+`check` exercises the driver, preprocessor, native code generation, and interoperability with GCC. The `check-strict` and `check-suite` targets run the cloned `c-testsuite`. The pinned glibc GCC reference passes 212 cases with `-std=c11 -pedantic-errors` and 220 with `-std=gnu11`.
 
 `check-extended` compares C11 pointer constraints and execution tests with glibc GCC. It checks required diagnostics, result types, and generated code. `check-bootstrap` builds mcc with GCC, rebuilds it twice in strict C11 mode, compares the self-hosted binaries byte for byte, and runs the tests with the final compiler. Both targets use temporary build or test directories and exit nonzero on failure.
 

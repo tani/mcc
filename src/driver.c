@@ -28,7 +28,17 @@ static void usage(FILE *out)
     fputs("Usage: mcc [-std=c11|-std=gnu11] [-E|-fsyntax-only|-S|-c] [-o FILE] INPUT...\n"
           "       -I DIR, -isystem DIR, -D MACRO[=VALUE], -U MACRO\n"
           "       -static, -shared, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
-          "       Uses native AArch64 Linux GCC and glibc by default.\n", out);
+          "       --target=aarch64-linux-gnu or --target=x86_64-linux-gnu\n"
+          "       Uses native Linux GCC and glibc by default.\n", out);
+}
+
+static const Target *native_target(void)
+{
+#if defined(__x86_64__)
+    return &x86_64_linux;
+#else
+    return &aarch64_linux;
+#endif
 }
 
 static bool starts(const char *argument, const char *prefix)
@@ -69,9 +79,17 @@ static void parse_options(Driver *d, int argc, char **argv)
             d->stopped = true;
             return;
         } else if (equal(arg, "--version")) {
-            puts("mcc 0.1 (AArch64 Linux)");
+            printf("mcc 0.1 (%s Linux)\n", c->target == &aarch64_linux ? "AArch64" : "x86-64");
             d->stopped = true;
             return;
+        } else if (starts(arg, "--target=")) {
+            const char *triple = arg + 9;
+            if (equal(triple, "aarch64-linux-gnu"))
+                c->target = &aarch64_linux;
+            else if (equal(triple, "x86_64-linux-gnu"))
+                c->target = &x86_64_linux;
+            else
+                error(c, (Loc){0}, "unsupported target '%s'", triple);
         } else if (equal(arg, "-std=c11") || equal(arg, "-std=gnu11")) {
             c->gnu = equal(arg, "-std=gnu11");
         } else if (equal(arg, "-pedantic-errors")) {
@@ -173,9 +191,10 @@ static bool validate_toolchain(Driver *d)
     if (ok) {
         char result[160];
         rewind(output);
-        if (!fgets(result, sizeof result, output) || !starts(result, "aarch64-") ||
+        const char *arch = format(c, "%s-", c->target->arch);
+        if (!fgets(result, sizeof result, output) || !starts(result, arch) ||
             !suffix(result, "-linux-gnu\n")) {
-            error(c, (Loc){0}, "GCC must target little-endian AArch64 Linux with glibc");
+            error(c, (Loc){0}, "GCC must target %s Linux with glibc", c->target->arch);
             ok = false;
         }
     }
@@ -193,15 +212,19 @@ static void system_headers(Context *c)
         PUSH(c, c->system_includes, libc_headers);
         return;
     }
-    PUSH(c, c->system_includes, "/usr/local/include");
-    PUSH(c, c->system_includes, "/usr/include/aarch64-linux-gnu");
-    PUSH(c, c->system_includes, "/usr/include");
+    if (c->target == native_target()) {
+        PUSH(c, c->system_includes, "/usr/local/include");
+        PUSH(c, c->system_includes, format(c, "/usr/include/%s-linux-gnu", c->target->arch));
+        PUSH(c, c->system_includes, "/usr/include");
+    } else {
+        PUSH(c, c->system_includes, format(c, "/usr/%s-linux-gnu/include", c->target->arch));
+    }
 }
 
 static bool compile_source(Driver *d, const char *path, FILE *out)
 {
     Context c = {
-        .target = &aarch64_linux, .gnu = d->options.gnu, .pedantic = d->options.pedantic,
+        .target = d->options.target, .gnu = d->options.gnu, .pedantic = d->options.pedantic,
         .includes = d->options.includes, .system_includes = d->options.system_includes,
         .macro_options = d->options.macro_options, .input = equal(path, "-") ? "<stdin>" : path
     };
@@ -218,7 +241,7 @@ static bool compile_source(Driver *d, const char *path, FILE *out)
         if (d->mode == PREPROCESS)
             write_tokens(out, tokens);
         else
-            ok = parse(&c, tokens) && emit_aarch64(&c, out);
+            ok = parse(&c, tokens) && c.target->emit(&c, out);
     }
     if (ferror(out)) {
         error(&d->options, (Loc){0}, "writing compiler output failed");
@@ -412,10 +435,11 @@ static bool run_driver(Driver *d)
 
 int main(int argc, char **argv)
 {
-    Driver d = {.toolchain = getenv("MCC_TOOLCHAIN")};
-    if (!d.toolchain || !*d.toolchain)
-        d.toolchain = "gcc";
+    Driver d = {.options = {.target = native_target()}, .toolchain = getenv("MCC_TOOLCHAIN")};
     parse_options(&d, argc, argv);
+    if (!d.toolchain || !*d.toolchain)
+        d.toolchain = d.options.target == native_target() ? "gcc" :
+                      format(&d.options, "%s-linux-gnu-gcc", d.options.target->arch);
     system_headers(&d.options);
     bool ok = !d.options.failed && (d.stopped || run_driver(&d));
     for (size_t i = 0; i < d.scratch.len; i++)

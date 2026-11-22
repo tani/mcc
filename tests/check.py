@@ -28,6 +28,76 @@ def succeeded(args, *, source=None):
     return result.stdout
 
 
+def x86_abi(compiler, gcc, root):
+    declarations = br"""
+#include <stdarg.h>
+struct Mixed { double fp; long gp; };
+struct Large { long a, b, c; };
+struct Tiny { unsigned char bytes[3]; };
+struct Extended { long double value; };
+struct Mixed mcc_mix(struct Mixed, int, int, int, int, int, int, struct Mixed);
+struct Large mcc_large(struct Large);
+struct Extended mcc_extended(struct Extended);
+long double mcc_variadic(int, ...);
+int gcc_check(void);
+int gcc_variadic(int, ...);
+"""
+    first, second, binary = (root / name for name in ("abi-mcc.o", "abi-gcc.o", "abi"))
+    succeeded([compiler, "-c", "-", "-o", first], source=declarations + br"""
+struct Mixed mcc_mix(struct Mixed a, int b, int c, int d, int e, int f, int g, struct Mixed z) {
+    return (struct Mixed){a.fp + z.fp, a.gp + b + c + d + e + f + g + z.gp};
+}
+struct Large mcc_large(struct Large x) { return (struct Large){x.b, x.c, x.a}; }
+struct Extended mcc_extended(struct Extended x) {
+    return (struct Extended){(x.value - 3.L) / 2.L};
+}
+static int consume(va_list args) { return va_arg(args, int); }
+long double mcc_variadic(int count, ...) {
+    va_list args, saved;
+    va_start(args, count);
+    va_copy(saved, args);
+    struct Mixed mix = va_arg(args, struct Mixed);
+    long double extended = va_arg(args, long double);
+    struct Tiny tiny = va_arg(args, struct Tiny);
+    int first = consume(args);
+    int second = va_arg(args, int);
+    struct Mixed again = va_arg(saved, struct Mixed);
+    va_end(saved);
+    va_end(args);
+    return count + mix.fp + mix.gp + extended + tiny.bytes[2] + first + second + again.gp;
+}
+int main(void) {
+    volatile unsigned long maximum = 18446744073709551615UL;
+    volatile double zero = 0.0;
+    double nan = zero / zero;
+    if ((unsigned long)(long double)maximum != maximum || nan == nan || nan <= 0.0 || !nan)
+        return 1;
+    return gcc_check() || gcc_variadic(7, (struct Mixed){4.0, 3}, 2.L, 1) != 17;
+}
+""")
+    succeeded([gcc, "-x", "c", "-c", "-", "-o", second], source=declarations + br"""
+int gcc_check(void) {
+    struct Mixed mix = mcc_mix((struct Mixed){1.5, 5}, 1,2,3,4,5,6, (struct Mixed){2.0, 7});
+    struct Large large = mcc_large((struct Large){1, 2, 3});
+    struct Extended ext = mcc_extended((struct Extended){13.L});
+    long double sum = mcc_variadic(5, (struct Mixed){2.0, 4}, 3.L, (struct Tiny){{1, 2, 6}}, 7, 8);
+    return mix.fp != 3.5 || mix.gp != 33 || large.a != 2 || large.b != 3 || large.c != 1 ||
+           ext.value != 5.L || sum != 39.L;
+}
+int gcc_variadic(int n, ...) {
+    va_list args;
+    va_start(args, n);
+    struct Mixed mix = va_arg(args, struct Mixed);
+    long double extended = va_arg(args, long double);
+    int i = va_arg(args, int);
+    va_end(args);
+    return n + mix.fp + mix.gp + extended + i;
+}
+""")
+    succeeded([compiler, first, second, "-o", binary])
+    succeeded([binary])
+
+
 def smoke(compiler):
     with tempfile.TemporaryDirectory(prefix="mcc-smoke-") as tmp:
         root = Path(tmp)
@@ -86,10 +156,19 @@ int main(void) {
 """
         succeeded([compiler, "-", "-o", binary], source=source)
         assert succeeded([binary]) == b"mcc\n"
-        elf = succeeded(["readelf", "-h", "-l", binary])
-        assert b"AArch64" in elf and b"ld-linux-aarch64.so.1" in elf
-
         gcc = os.environ.get("MCC_TOOLCHAIN") or "gcc"
+        target = succeeded([gcc, "-dumpmachine"]).split(b"-")[0]
+        machine, loader = {
+            b"aarch64": (b"AArch64", b"ld-linux-aarch64.so.1"),
+            b"x86_64": (b"X86-64", b"ld-linux-x86-64.so.2"),
+        }[target]
+        elf = succeeded(["readelf", "-h", "-l", binary])
+        assert machine in elf and loader in elf
+        for arch, instruction in (("aarch64", b"movz"), ("x86_64", b"movabsq")):
+            flag = f"--target={arch}-linux-gnu"
+            source = f"#ifndef __{arch}__\n#error incorrect target\n#endif\nint f(void) {{ return 42; }}".encode()
+            assert instruction in succeeded([compiler, flag, "-S", "-o", "-", "-"], source=source)
+
         first = root / "mcc.o"
         second = root / "gcc.o"
         succeeded([compiler, "-c", "-", "-o", first], source=br"""
@@ -107,6 +186,8 @@ long from_gcc(long a, long b, long c, long d, long e, long f, long g, long h, lo
 """)
         succeeded([compiler, first, second, "-static", "-o", binary])
         succeeded([binary])
+        if target == b"x86_64":
+            x86_abi(compiler, gcc, root)
 
         original = binary.read_bytes()
         failed = command([compiler, "-", "-o", binary], source=b"int main(void) { return missing; }")

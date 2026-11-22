@@ -24,7 +24,7 @@ typedef unsigned long size_t;
 #undef __need_size_t
 #endif
 #ifdef __need_wchar_t
-typedef unsigned int wchar_t;
+typedef __WCHAR_TYPE__ wchar_t;
 #undef __need_wchar_t
 #endif
 #ifdef __need_wint_t

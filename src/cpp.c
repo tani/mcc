@@ -772,11 +772,20 @@ bool preprocess(Context *c, const char *path, FILE *input, Tokens *result)
     static const char *const builtins[] = {
         "__STDC__=1", "__STDC_VERSION__=201112L", "__STDC_HOSTED__=1",
         "__STDC_NO_ATOMICS__=1", "__STDC_NO_VLA__=1", "__STDC_NO_COMPLEX__=1",
-        "__aarch64__=1", "__AARCH64EL__=1", "__linux__=1", "__unix__=1",
-        "__LP64__=1", "__CHAR_UNSIGNED__=1", "__SIZEOF_POINTER__=8"
+        "__linux__=1", "__unix__=1", "__LP64__=1", "__SIZEOF_POINTER__=8"
     };
     for (size_t i = 0; i < sizeof builtins / sizeof *builtins; i++)
         command_define(c, builtins[i]);
+    if (c->target == &aarch64_linux) {
+        command_define(c, "__aarch64__=1");
+        command_define(c, "__AARCH64EL__=1");
+    } else {
+        command_define(c, "__x86_64__=1");
+        command_define(c, "__amd64__=1");
+    }
+    if (c->target->char_unsigned)
+        command_define(c, "__CHAR_UNSIGNED__=1");
+    command_define(c, c->target->wchar_unsigned ? "__WCHAR_TYPE__=unsigned int" : "__WCHAR_TYPE__=int");
     if (!c->gnu)
         command_define(c, "__STRICT_ANSI__=1");
     for (size_t i = 0; i < c->macro_options.len; i++) {

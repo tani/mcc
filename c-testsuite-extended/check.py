@@ -113,8 +113,13 @@ def specialized():
         #include <float.h>
 
         _Static_assert(_Alignof(max_align_t) >= _Alignof(long double), "maximum alignment");
-        _Static_assert(FLT_MANT_DIG == 24 && DBL_MANT_DIG == 53 && LDBL_MANT_DIG == 113,
-                       "AArch64 floating-point formats");
+        _Static_assert(FLT_MANT_DIG == 24 && DBL_MANT_DIG == 53, "float and double formats");
+        #if defined(__x86_64__)
+        _Static_assert(LDBL_MANT_DIG == 64 && (wchar_t)-1 < 0, "x86-64 scalar formats");
+        #else
+        _Static_assert(LDBL_MANT_DIG == 113 && (wchar_t)-1 > 0, "AArch64 scalar formats");
+        #endif
+        _Static_assert(_Generic(L'X', wchar_t: 1, default: 0), "wide character type");
 
         static int print(const char *format, ...) {
             va_list args;

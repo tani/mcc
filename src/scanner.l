@@ -81,14 +81,14 @@ bool scan(Context *c, const char *file, const char *input, size_t size, Tokens *
     unsigned line = 1, column = 1;
     size_t used = 0;
     for (size_t i = 0; i < size;) {
-        unsigned char ch = input[i];
+        unsigned char ch = (unsigned char)input[i];
         size_t width = 1;
         if (!c->gnu && ch == '?' && size - i >= 3 && input[i + 1] == '?') {
             static const char keys[] = "=/\'()!<>-";
             static const char replacements[] = "#\\^[]|{}~";
             const char *key = input[i + 2] ? strchr(keys, input[i + 2]) : NULL;
             if (key) {
-                ch = replacements[key - keys];
+                ch = (unsigned char)replacements[key - keys];
                 width = 3;
             }
         }

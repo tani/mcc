@@ -1,14 +1,11 @@
 #include "compiler.h"
 #include "parser.h"
 
-#include <float.h>
-#include <inttypes.h>
-#include <limits.h>
-#include <string.h>
-
 const Target aarch64_linux = {
+    .arch = "aarch64", .emit = emit_aarch64,
     .char_size = 1, .short_size = 2, .int_size = 4, .long_size = 8,
-    .long_long_size = 8, .pointer_size = 8, .long_double_size = 16, .char_unsigned = true
+    .long_long_size = 8, .pointer_size = 8, .long_double_size = 16,
+    .char_unsigned = true, .wchar_unsigned = true
 };
 
 typedef struct {
@@ -573,30 +570,6 @@ static void memory_loop(Emitter *e, size_t size, bool copy)
     fprintf(e->out, "\tsubs x12, x12, #1\n\tb.ne .Lm%u_%u\n", e->number, id);
 }
 
-static uint64_t float_bits(long double value, unsigned size)
-{
-    if (size == 4) {
-        float converted = (float)value;
-        uint32_t bits;
-        memcpy(&bits, &converted, sizeof bits);
-        return bits;
-    }
-    double converted = (double)value;
-    uint64_t bits;
-    memcpy(&bits, &converted, sizeof bits);
-    return bits;
-}
-
-static bool quad_bits(Context *c, long double value, uint64_t bits[2], Loc loc)
-{
-    if (LDBL_MANT_DIG != 113 || sizeof value != 16) {
-        error(c, loc, "binary128 constants require a compiler host with IEEE binary128 long double");
-        return false;
-    }
-    memcpy(bits, &value, sizeof(uint64_t) * 2);
-    return true;
-}
-
 static void instruction(Emitter *e, Inst *in)
 {
     FILE *out = e->out;
@@ -609,7 +582,7 @@ static void instruction(Emitter *e, Inst *in)
     case I_REAL:
         if (quad(in->type)) {
             uint64_t bits[2];
-            if (quad_bits(e->context, in->real, bits, in->loc)) {
+            if (extended_float_bits(e->context, in->real, bits, in->loc)) {
                 number(out, 9, bits[0]);
                 number(out, 10, bits[1]);
                 frame_address(e, 14, e->offsets[in->dest]);
@@ -811,184 +784,6 @@ static void assembly_function(Context *c, FILE *out, Symbol *s, unsigned id)
     fprintf(out, "\t.size %s, .-%s\n", s->assembly, s->assembly);
 }
 
-static void padding(FILE *out, size_t size)
-{
-    if (size)
-        fprintf(out, "\t.zero %zu\n", size);
-}
-
-static void bytes(FILE *out, const unsigned char *data, size_t len)
-{
-    for (size_t i = 0; i < len; i++) {
-        fputs(i % 16 ? "," : "\t.byte ", out);
-        fprintf(out, "%u", data[i]);
-        if (i % 16 == 15 || i + 1 == len)
-            fputc('\n', out);
-    }
-}
-
-static bool address_constant(Context *, Node *, Symbol **, uint64_t *);
-
-static bool static_address(Context *c, Node *n, Symbol **sym, uint64_t *add)
-{
-    if ((n->kind == N_SYMBOL || n->kind == N_COMPOUND) && !n->symbol->local &&
-        !n->symbol->thread_local_storage) {
-        *sym = n->symbol;
-        return true;
-    }
-    if (n->kind == N_DEREF)
-        return address_constant(c, n->left, sym, add);
-    if (n->kind == N_MEMBER && static_address(c, n->left, sym, add)) {
-        *add += n->integer;
-        return true;
-    }
-    return false;
-}
-
-static bool address_constant(Context *c, Node *n, Symbol **sym, uint64_t *add)
-{
-    uint64_t value;
-    if (n->kind == N_ADDR)
-        return static_address(c, n->left, sym, add);
-    if (n->kind == N_CAST)
-        return address_constant(c, n->left, sym, add);
-    if (constant_int(c, n, &value)) {
-        *add += value;
-        return true;
-    }
-    if (n->kind == N_BINARY && (n->op == '+' || n->op == '-') &&
-        constant_int(c, n->right, &value) && address_constant(c, n->left, sym, add)) {
-        *add += n->op == '+' ? value : 0 - value;
-        return true;
-    }
-    return false;
-}
-
-static bool real_constant(Context *c, Node *n, long double *result)
-{
-    uint64_t value;
-    long double a, b;
-    if (constant_int(c, n, &value)) {
-        *result = n->type->uns ? (long double)value : (long double)(int64_t)value;
-    } else if (n->kind == N_FLOAT) {
-        *result = n->real;
-    } else if (n->kind == N_CAST && real_constant(c, n->left, &a)) {
-        *result = a;
-    } else if (n->kind == N_UNARY && n->op == '-' && real_constant(c, n->left, &a)) {
-        *result = -a;
-    } else if (n->kind == N_BINARY && real_constant(c, n->left, &a) &&
-               real_constant(c, n->right, &b)) {
-        switch (n->op) {
-        case '+': *result = a + b; break;
-        case '-': *result = a - b; break;
-        case '*': *result = a * b; break;
-        case '/': *result = a / b; break;
-        default: return false;
-        }
-    } else {
-        return false;
-    }
-    if (n->type->kind == TY_FLOAT && n->type->size == 4)
-        *result = (float)*result;
-    else if (n->type->kind == TY_FLOAT && n->type->size == 8)
-        *result = (double)*result;
-    return true;
-}
-
-static void data_initializer(Context *c, FILE *out, Type *t, Node *n)
-{
-    if (!n) {
-        padding(out, t->size);
-        return;
-    }
-    if (n->kind == N_RANGE_VALUE)
-        n = n->left;
-    if (n->kind == N_INIT) {
-        size_t end = 0;
-        for (size_t i = 0; i < n->list.len; i++) {
-            Node *item = n->list.data[i];
-            size_t index = item->integer;
-            Member m = t->kind == TY_ARRAY ? (Member){.type=t->base, .offset=index * t->base->size}
-                                          : t->members.data[index];
-            if (m.bit_field) {
-                error(c, item->loc, "static bit-field initializers are not supported");
-                return;
-            }
-            Type *element = m.type;
-            if (element->kind == TY_ARRAY && !element->complete &&
-                item->left->type && item->left->type->kind == TY_ARRAY)
-                element = item->left->type;
-            padding(out, m.offset - end);
-            data_initializer(c, out, element, item->left);
-            end = m.offset + element->size;
-        }
-        if (t->size > end)
-            padding(out, t->size - end);
-        return;
-    }
-    if (t->kind == TY_ARRAY && n->kind == N_SYMBOL && n->symbol->bytes) {
-        size_t length = n->symbol->byte_count < t->size ? n->symbol->byte_count : t->size;
-        bytes(out, n->symbol->bytes, length);
-        padding(out, t->size - length);
-        return;
-    }
-    uint64_t value = 0;
-    Symbol *sym = NULL;
-    long double real;
-    bool valid = t->kind == TY_PTR ? address_constant(c, n, &sym, &value) :
-                 t->kind != TY_FLOAT ? constant_int(c, n, &value) :
-                 real_constant(c, n, &real);
-    if (!valid) {
-        error(c, n->loc, "unsupported or nonconstant static initializer");
-        return;
-    }
-    if (quad(t)) {
-        uint64_t bits[2];
-        if (quad_bits(c, real, bits, n->loc))
-            fprintf(out, "\t.xword %" PRIu64 ", %" PRIu64 "\n", bits[0], bits[1]);
-        return;
-    }
-    if (t->kind == TY_FLOAT)
-        value = float_bits(real, t->size);
-    if (sym) {
-        fprintf(out, "\t.xword %s%+" PRId64 "\n", sym->assembly, (int64_t)value);
-        return;
-    }
-    const char *directive = t->size == 1 ? ".byte" : t->size == 2 ? ".hword" :
-                            t->size == 4 ? ".word" : ".xword";
-    if (t->size < 8)
-        value &= (UINT64_C(1) << (8 * t->size)) - 1;
-    fprintf(out, "\t%s %" PRIu64 "\n", directive, value);
-}
-
-static void assembly_data(Context *c, FILE *out, Symbol *s)
-{
-    Type *t = s->type;
-    if (!t->complete) {
-        if (t->kind == TY_ARRAY && s->tentative) {
-            t->length = 1;
-            t->complete = true;
-            t->size = t->base->size;
-        } else {
-            error(c, s->loc, "object '%s' has incomplete type", s->name);
-            return;
-        }
-    }
-    fputs(s->thread_local_storage ? (s->init ? "\t.section .tdata,\"awT\",%progbits\n"
-                                            : "\t.section .tbss,\"awT\",%nobits\n") :
-          s->read_only ? "\t.section .rodata\n" :
-          s->init ? "\t.data\n" : "\t.bss\n", out);
-    if (!s->internal)
-        fprintf(out, "\t.global %s\n", s->assembly);
-    fprintf(out, "\t.balign %u\n\t.type %s, %%%s\n%s:\n", t->align, s->assembly,
-            s->thread_local_storage ? "tls_object" : "object", s->assembly);
-    if (s->bytes)
-        bytes(out, s->bytes, s->byte_count);
-    else
-        data_initializer(c, out, t, s->init);
-    fprintf(out, "\t.size %s, .-%s\n", s->assembly, s->assembly);
-}
-
 bool emit_aarch64(Context *c, FILE *out)
 {
     for (size_t i = 0; i < c->globals.len && !c->failed; i++) {
@@ -996,7 +791,7 @@ bool emit_aarch64(Context *c, FILE *out)
         if (s->type->kind == TY_FUNC && s->body)
             assembly_function(c, out, s, (unsigned)i);
         else if (s->type->kind != TY_FUNC && (s->defined || s->tentative))
-            assembly_data(c, out, s);
+            emit_static_data(c, out, s);
     }
     fputs("\t.section .note.GNU-stack,\"\",%progbits\n", out);
     return !c->failed && !ferror(out);

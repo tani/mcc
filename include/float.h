@@ -4,7 +4,7 @@
 #define FLT_RADIX 2
 #define FLT_ROUNDS 1
 #define FLT_EVAL_METHOD 0
-#define DECIMAL_DIG 36
+#define DECIMAL_DIG LDBL_DECIMAL_DIG
 
 #define FLT_MANT_DIG 24
 #define FLT_DIG 6
@@ -32,17 +32,26 @@
 #define DBL_TRUE_MIN 0x1p-1074
 #define DBL_HAS_SUBNORM 1
 
-#define LDBL_MANT_DIG 113
-#define LDBL_DIG 33
-#define LDBL_DECIMAL_DIG 36
 #define LDBL_MIN_EXP (-16381)
 #define LDBL_MIN_10_EXP (-4931)
 #define LDBL_MAX_EXP 16384
 #define LDBL_MAX_10_EXP 4932
+#define LDBL_MIN 0x1p-16382L
+#if defined(__x86_64__)
+#define LDBL_MANT_DIG 64
+#define LDBL_DIG 18
+#define LDBL_DECIMAL_DIG 21
+#define LDBL_MAX 0x1.fffffffffffffffep16383L
+#define LDBL_EPSILON 0x1p-63L
+#define LDBL_TRUE_MIN 0x1p-16445L
+#else
+#define LDBL_MANT_DIG 113
+#define LDBL_DIG 33
+#define LDBL_DECIMAL_DIG 36
 #define LDBL_MAX 0x1.ffffffffffffffffffffffffffffp16383L
 #define LDBL_EPSILON 0x1p-112L
-#define LDBL_MIN 0x1p-16382L
 #define LDBL_TRUE_MIN 0x1p-16494L
+#endif
 #define LDBL_HAS_SUBNORM 1
 
 #endif

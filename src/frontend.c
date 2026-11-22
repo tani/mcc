@@ -539,17 +539,25 @@ void setup_types(Context *c)
 {
     enter_scope(c);
     Members fields = {0};
+    bool x86 = c->target == &x86_64_linux;
     Type *p = pointer(c, type(c, TY_VOID, 0, 1));
-    Type *i = type_int(c, 3, false);
+    Type *i = type_int(c, 3, x86);
     Member field[] = {
         {.name="__stack",.type=p}, {.name="__gr_top",.type=p}, {.name="__vr_top",.type=p},
         {.name="__gr_offs",.type=i}, {.name="__vr_offs",.type=i}
     };
-    for (size_t n = 0; n < sizeof field / sizeof *field; n++)
-        PUSH(c, fields, field[n]);
+    Member x86_field[] = {
+        {.name="gp_offset",.type=i}, {.name="fp_offset",.type=i},
+        {.name="overflow_arg_area",.type=p}, {.name="reg_save_area",.type=p}
+    };
+    const Member *members = x86 ? x86_field : field;
+    size_t count = x86 ? sizeof x86_field / sizeof *x86_field : sizeof field / sizeof *field;
+    for (size_t n = 0; n < count; n++)
+        PUSH(c, fields, members[n]);
     Type *va = record_type(c, false, NULL, &fields, (Loc){0});
     c->va_list_type = va;
-    Symbol *s = symbol(c, "__builtin_va_list", va, (Loc){0});
+    Type *alias = x86 ? array(c, va, 1, true, (Loc){0}) : va;
+    Symbol *s = symbol(c, "__builtin_va_list", alias, (Loc){0});
     s->is_typedef = true;
     PUSH(c, c->scope->names, s);
     Type *expect = type(c, TY_FUNC, 0, 1);
@@ -677,14 +685,15 @@ Node *literal(Context *c, Token token)
         uint64_t value = 0;
         unsigned rank = 3;
         bool uns = false;
-        if (strchr("LuU", *s)) {
+        bool wide = strchr("LuU", *s) != NULL;
+        if (wide) {
             rank = *s == 'u' ? 2 : 3;
-            uns = true;
+            uns = *s != 'L' || c->target->wchar_unsigned;
             s++;
         }
         if (*s != '\'' || s[1] == '\'')
             error(c, token.loc, "invalid or unsupported character constant");
-        else if (uns) {
+        else if (wide) {
             const char *p = s + 1;
             value = *p == '\\' ? escape(c, &p, token.loc) : utf8(c, &p, token.loc);
             if (*p != '\'' || (rank == 2 && value > UINT16_MAX))
@@ -761,10 +770,12 @@ Node *strings(Context *c, Node *previous, Token token)
 {
     const char *s = token.text;
     unsigned width = 1;
+    bool uns = c->target->char_unsigned;
     if (!strncmp(s, "u8", 2))
         s += 2;
     else if (strchr("LuU", *s)) {
         width = *s == 'u' ? 2 : 4;
+        uns = *s != 'L' || c->target->wchar_unsigned;
         s++;
     }
     if (*s++ != '"') {
@@ -810,8 +821,7 @@ Node *strings(Context *c, Node *previous, Token token)
         sym->defined = sym->internal = sym->read_only = true;
         PUSH(c, c->globals, sym);
     }
-    Type *element = type_int(c, width == 1 ? 1 : width == 2 ? 2 : 3,
-                             width != 1 || c->target->char_unsigned);
+    Type *element = type_int(c, width == 1 ? 1 : width == 2 ? 2 : 3, uns);
     element->plain_char = width == 1;
     sym->type = array(c, element, length / width, true, token.loc);
     sym->bytes = bytes;
@@ -1171,6 +1181,18 @@ Node *conditional(Context *c, Node *test, Node *yes, Node *no, Loc loc)
     return n;
 }
 
+static Node *va_object(Context *c, Node *n)
+{
+    if (c->target == &x86_64_linux) {
+        if ((n->type->kind == TY_ARRAY || n->type->kind == TY_PTR) &&
+            same_type(n->type->base, c->va_list_type))
+            return unary(c, '*', decay(c, n), n->loc);
+    } else if (lvalue(n) && same_type(n->type, c->va_list_type)) {
+        return n;
+    }
+    return NULL;
+}
+
 Node *call(Context *c, Node *callee, Nodes args, Loc loc)
 {
     const char *name = callee->kind == N_SYMBOL ? callee->symbol->name : "";
@@ -1187,9 +1209,9 @@ Node *call(Context *c, Node *callee, Nodes args, Loc loc)
     if (start || end || copy_list) {
         size_t count = end ? 1 : 2;
         Type *void_type = type(c, TY_VOID, 0, 1);
-        if (args.len != count || !lvalue(args.data[0]) ||
-            !same_type(args.data[0]->type, c->va_list_type) ||
-            (copy_list && !same_type(args.data[1]->type, c->va_list_type)) ||
+        Node *list = args.len == count ? va_object(c, args.data[0]) : NULL;
+        Node *copy_from = list && copy_list ? va_object(c, args.data[1]) : NULL;
+        if (!list || (copy_list && !copy_from) ||
             (start && (!c->function || !c->function->type->variadic))) {
             error(c, loc, "invalid operands to '%s'", name);
             return integer(c, loc, 0, type_int(c, 3, false));
@@ -1198,8 +1220,8 @@ Node *call(Context *c, Node *callee, Nodes args, Loc loc)
             args.data[1]->symbol != c->function->params.data[c->function->params.len - 1]))
             error(c, loc, "va_start must name the last fixed parameter");
         if (copy_list)
-            return convert(c, assign(c, '=', args.data[0], args.data[1], false, loc), void_type, loc);
-        Node *result = node(c, start ? N_VA_START : N_VA_END, loc, args.data[0], NULL);
+            return convert(c, assign(c, '=', list, copy_from, false, loc), void_type, loc);
+        Node *result = node(c, start ? N_VA_START : N_VA_END, loc, list, NULL);
         result->type = void_type;
         return result;
     }
@@ -1229,13 +1251,14 @@ Node *call(Context *c, Node *callee, Nodes args, Loc loc)
 
 Node *va_argument(Context *c, Node *list, Type *t, Loc loc)
 {
-    if (!lvalue(list) || !same_type(list->type, c->va_list_type))
+    Node *object = va_object(c, list);
+    if (!object)
         error(c, loc, "va_arg requires a va_list object");
     if ((!scalar(t) && !(t->complete && (t->kind == TY_STRUCT || t->kind == TY_UNION))) ||
         (integer_type(t) && t->rank < 3) ||
         (t->kind == TY_FLOAT && t->size == 4))
         error(c, loc, "va_arg requires a supported type after default argument promotions");
-    Node *result = node(c, N_VA_ARG, loc, list, NULL);
+    Node *result = node(c, N_VA_ARG, loc, object ? object : list, NULL);
     result->type = t;
     return result;
 }
