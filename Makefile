@@ -2,11 +2,11 @@ BUILD := build
 PROGRAM := $(BUILD)/mcc
 ASSEMBLER := $(BUILD)/mas
 LINKER := $(BUILD)/mld
-SOURCES := driver process core cpp frontend ir data cc_aarch64 cc_x86_64
-OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES))) $(BUILD)/parser.o $(BUILD)/scanner.o
+CC_OBJECTS := $(addprefix $(BUILD)/,cc/driver.o cc/process.o core.o cc/cpp.o cc/frontend.o cc/ir.o \
+	cc/data.o cc/cc_aarch64.o cc/cc_x86_64.o cc/parser.o cc/scanner.o)
 ELF_COMMON := $(addprefix $(BUILD)/,elf_tools.o core.o)
-AS_OBJECTS := $(addprefix $(BUILD)/,as.o as_aarch64.o as_x86_64.o) $(ELF_COMMON)
-LD_OBJECTS := $(addprefix $(BUILD)/,ld.o ld_hosted.o ld_input.o ld_reloc.o) $(ELF_COMMON)
+AS_OBJECTS := $(addprefix $(BUILD)/as/,as.o as_aarch64.o as_x86_64.o) $(ELF_COMMON)
+LD_OBJECTS := $(addprefix $(BUILD)/ld/,ld.o ld_hosted.o ld_input.o ld_reloc.o) $(ELF_COMMON)
 WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wformat=2 -Wformat-overflow=2 -Wformat-truncation=2 -Wformat-signedness \
 	-Wconversion -Wsign-conversion -Wcast-qual -Wcast-align=strict -Wcast-function-type \
@@ -28,31 +28,32 @@ all: $(PROGRAM) $(ASSEMBLER) $(LINKER)
 mas: $(ASSEMBLER)
 mld: $(LINKER)
 
-$(BUILD):
+$(BUILD)/cc:
 	mkdir -p $@
 
-$(BUILD)/parser.c $(BUILD)/parser.h &: src/parser.y | $(BUILD)
-	bison -Wall -Werror -d -o $(BUILD)/parser.c $<
+$(BUILD)/cc/parser.c $(BUILD)/cc/parser.h &: src/cc/parser.y | $(BUILD)/cc
+	bison -Wall -Werror -d -o $(BUILD)/cc/parser.c $<
 
-$(BUILD)/scanner.c: src/scanner.l | $(BUILD)
+$(BUILD)/cc/scanner.c: src/cc/scanner.l | $(BUILD)/cc
 	flex -o $@ $<
 
-$(BUILD)/%.o: src/%.c src/compiler.h | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -Isrc -I$(BUILD) -c -o $@ $<
+$(BUILD)/%.o: src/%.c src/compiler.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -Isrc -I$(BUILD)/cc -c -o $@ $<
 
-$(BUILD)/driver.o: override CPPFLAGS += -DMCC_BUILTIN_INCLUDE='"$(CURDIR)/include"'
-$(addprefix $(BUILD)/,frontend.o ir.o cc_aarch64.o cc_x86_64.o): $(BUILD)/parser.h
-$(addprefix $(BUILD)/,as.o as_aarch64.o as_x86_64.o): src/as.h
-$(addprefix $(BUILD)/,elf_tools.o ld.o ld_hosted.o as.o as_aarch64.o as_x86_64.o): src/elf_tools.h
-$(addprefix $(BUILD)/,ld.o ld_hosted.o ld_input.o ld_reloc.o): src/ld.h src/elf_tools.h
+$(BUILD)/cc/driver.o: override CPPFLAGS += -DMCC_BUILTIN_INCLUDE='"$(CURDIR)/include"'
+$(addprefix $(BUILD)/cc/,frontend.o ir.o cc_aarch64.o cc_x86_64.o): $(BUILD)/cc/parser.h
+$(filter $(BUILD)/as/%,$(AS_OBJECTS)): src/as/as.h src/elf_tools.h
+$(filter $(BUILD)/ld/%,$(LD_OBJECTS)): src/ld/ld.h src/elf_tools.h
+$(BUILD)/elf_tools.o: src/elf_tools.h
 
-$(BUILD)/%.o: $(BUILD)/%.c src/compiler.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(GENERATED_WARN) -Isrc -I$(BUILD) -c -o $@ $<
+$(BUILD)/cc/%.o: $(BUILD)/cc/%.c src/compiler.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(GENERATED_WARN) -Isrc -I$(BUILD)/cc -c -o $@ $<
 
-$(BUILD)/parser.o: GENERATED_WARN = $(PARSER_WARN)
+$(BUILD)/cc/parser.o: GENERATED_WARN = $(PARSER_WARN)
 
-$(PROGRAM): $(OBJECTS) | $(ASSEMBLER) $(LINKER)
-	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
+$(PROGRAM): $(CC_OBJECTS) | $(ASSEMBLER) $(LINKER)
+	$(CC) $(LDFLAGS) -o $@ $(CC_OBJECTS) $(LDLIBS)
 
 $(ASSEMBLER): $(AS_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
