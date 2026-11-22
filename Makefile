@@ -8,7 +8,7 @@ WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wstrict-prototypes -Wold-style-definition -Wmissing-prototypes \
 	-Wshadow -Wundef -Wvla -Walloca -Walloc-zero -Wwrite-strings -Wdouble-promotion \
 	-Wnull-dereference -Warray-bounds=2 -Warray-parameter=2 -Wstringop-overflow=4 \
-	-Wstringop-overread -Wunterminated-string-initialization \
+	-Wstringop-overread \
 	-fstrict-flex-arrays=3 -Wstrict-flex-arrays \
 	-Wduplicated-cond -Wduplicated-branches -Wlogical-op -Wimplicit-fallthrough=3 \
 	-Wjump-misses-init -Wstrict-overflow=5 -Wshift-overflow=2 -Wshift-negative-value \
@@ -31,6 +31,8 @@ $(BUILD)/scanner.c: src/scanner.l | $(BUILD)
 
 $(BUILD)/%.o: src/%.c src/compiler.h $(BUILD)/parser.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -Isrc -I$(BUILD) -c -o $@ $<
+
+$(BUILD)/driver.o: override CPPFLAGS += -DMCC_BUILTIN_INCLUDE='"$(CURDIR)/include"'
 
 $(BUILD)/%.o: $(BUILD)/%.c src/compiler.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(GENERATED_WARN) -Isrc -I$(BUILD) -c -o $@ $<

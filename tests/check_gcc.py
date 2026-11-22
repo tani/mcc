@@ -21,25 +21,30 @@ UBSAN = "undefined,bounds-strict,float-divide-by-zero,float-cast-overflow"
 DEBUG = ["-O1", "-g", "-fno-omit-frame-pointer", "-fno-optimize-sibling-calls"]
 STOP_ON_UB = "-fno-sanitize-recover=all"
 PROFILES = {
-    "harden": ("MCC_TOOLCHAIN", HARDEN, [
+    "harden": (HARDEN, [
         "-Werror", "-pie", "-Wl,-z,relro,-z,now,-z,noexecstack,-z,separate-code,--fatal-warnings",
     ]),
-    "analyzer": ("MCC_TOOLCHAIN", ["-O0", "-g", "-fanalyzer"], []),
-    "undefined": ("MCC_TOOLCHAIN", [
+    "analyzer": (["-O0", "-g", "-fanalyzer"], []),
+    "undefined": ([
         *DEBUG, "-fstrict-overflow", f"-fsanitize={UBSAN}", "-fsanitize-trap=all", STOP_ON_UB,
     ], []),
-    "address": ("MCC_GCC_HOST", [
+    "address": ([
         *DEBUG, "-fstrict-overflow",
         f"-fsanitize=address,leak,pointer-compare,pointer-subtract,{UBSAN}", STOP_ON_UB,
     ], []),
-    "thread": ("MCC_GCC_HOST", [*DEBUG, "-fsanitize=thread", STOP_ON_UB], []),
-    "hwaddress": ("MCC_GCC_HOST", [*DEBUG, "-fsanitize=hwaddress", STOP_ON_UB], []),
+    "thread": ([*DEBUG, "-fsanitize=thread", STOP_ON_UB], []),
+    "hwaddress": ([*DEBUG, "-fsanitize=hwaddress", STOP_ON_UB], []),
 }
 
 
 def environment(profile):
     env = {key: value for key, value in os.environ.items()
            if key not in {"MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES"}}
+    if profile == "analyzer":
+        # glibc's Fortify wrappers require optimization; the analyzer runs at -O0.
+        for name, value in env.items():
+            if name == "NIX_HARDENING_ENABLE" or name.startswith("NIX_HARDENING_ENABLE_"):
+                env[name] = " ".join(flag for flag in value.split() if flag not in {"fortify", "fortify3"})
     if profile == "address":
         env["ASAN_OPTIONS"] = (
             "detect_leaks=1:detect_invalid_pointer_pairs=2:detect_stack_use_after_return=1:"
@@ -89,13 +94,12 @@ int main(void) {
         raise RuntimeError(f"UBSan overflow probe exited {result.returncode}, expected SIGTRAP")
 
 
-def check(profile, build, jobs):
-    compiler_variable, flags, extra_linker = PROFILES[profile]
-    compiler = os.environ[compiler_variable]
+def check(profile, compiler, build, jobs):
+    flags, extra_linker = PROFILES[profile]
     env = environment(profile)
     make = [
         "make", "-s", f"-j{jobs}", f"BUILD={build}", f"CC={compiler}",
-        f"CFLAGS={' '.join(flags)}",
+        f"CFLAGS={' '.join(flags)} -Wunterminated-string-initialization",
         f"LDFLAGS={' '.join(flags + extra_linker)}",
     ]
     if profile == "analyzer":
@@ -131,18 +135,16 @@ def main():
     _, core_limit = resource.getrlimit(resource.RLIMIT_CORE)
     resource.setrlimit(resource.RLIMIT_CORE, (0, core_limit))
     profiles = args.profiles or list(PROFILES)
+    compiler = os.environ.get("MCC_TOOLCHAIN") or "gcc"
     for profile in profiles:
         if profile not in PROFILES:
             parser.error(f"unknown profile: {profile}")
-        name = PROFILES[profile][0]
-        if not os.environ.get(name):
-            parser.error(f"{name} is required. Run this in the musl development shell.")
 
     failed = []
     with TemporaryDirectory(prefix="mcc-gcc-") as directory:
         for profile in profiles:
             try:
-                check(profile, Path(directory) / profile, args.jobs)
+                check(profile, compiler, Path(directory) / profile, args.jobs)
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 print(f"GCC check failed: {profile}: {error}", flush=True)
                 failed.append(profile)

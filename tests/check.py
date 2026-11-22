@@ -47,6 +47,23 @@ STR(two words) CAT(12,34)
                            source=source)
         assert output.split() == [b'"two', b'words"', b'1234'], output
 
+        first_source = root / "first.c"
+        second_source = root / "second.c"
+        first_source.write_text("int first;\n")
+        second_source.write_text("int second;\n")
+        combined = root / "combined.i"
+        succeeded([compiler, "-E", first_source, second_source, "-o", combined])
+        assert combined.read_text().split() == ["int", "first", ";", "int", "second", ";"]
+
+        duplicate = root / "nested" / first_source.name
+        duplicate.parent.mkdir()
+        duplicate.write_text("int duplicate;\n")
+        for mode, suffix in (("-c", ".o"), ("-S", ".s")):
+            result = subprocess.run([compiler, mode, first_source, duplicate], cwd=root,
+                                    capture_output=True, timeout=15)
+            assert result.returncode == 1 and b"multiple inputs map" in result.stderr
+            assert first_source.with_suffix(suffix).exists()
+
         source = br"""
 #include <stdio.h>
 typedef int Index;
@@ -70,9 +87,9 @@ int main(void) {
         succeeded([compiler, "-", "-o", binary], source=source)
         assert succeeded([binary]) == b"mcc\n"
         elf = succeeded(["readelf", "-h", "-l", binary])
-        assert b"AArch64" in elf and b"ld-musl-aarch64.so.1" in elf
+        assert b"AArch64" in elf and b"ld-linux-aarch64.so.1" in elf
 
-        gcc = os.environ["MCC_TOOLCHAIN"]
+        gcc = os.environ.get("MCC_TOOLCHAIN") or "gcc"
         first = root / "mcc.o"
         second = root / "gcc.o"
         succeeded([compiler, "-c", "-", "-o", first], source=br"""
@@ -207,10 +224,10 @@ def suite(compiler, directory, mode):
                 flags = ["-std=" + mode]
                 if mode == "c11":
                     flags.append("-pedantic-errors")
-                result = command([compiler, *flags, source, "-o", binary])
+                result = command([compiler, *flags, source, "-lm", "-o", binary])
                 if result.returncode:
                     detail = result.stderr.decode(errors="replace").splitlines()
-                    return False, detail[0] if detail else "compiler exited unsuccessfully"
+                    return False, "\n".join(detail[:4]) if detail else "compiler exited unsuccessfully"
                 program = subprocess.run([binary], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          timeout=5)
                 expected = source.with_suffix(".c.expected").read_bytes()

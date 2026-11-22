@@ -28,7 +28,7 @@ static void usage(FILE *out)
     fputs("Usage: mcc [-std=c11|-std=gnu11] [-E|-fsyntax-only|-S|-c] [-o FILE] INPUT...\n"
           "       -I DIR, -isystem DIR, -D MACRO[=VALUE], -U MACRO\n"
           "       -static, -shared, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
-          "       MCC_TOOLCHAIN, MCC_COMPILER_INCLUDE, and MCC_SYSTEM_INCLUDE select the AArch64 musl SDK.\n", out);
+          "       Uses native AArch64 Linux GCC and glibc by default.\n", out);
 }
 
 static bool starts(const char *argument, const char *prefix)
@@ -69,7 +69,7 @@ static void parse_options(Driver *d, int argc, char **argv)
             d->stopped = true;
             return;
         } else if (equal(arg, "--version")) {
-            puts("mcc 0.1 (AArch64 Linux musl)");
+            puts("mcc 0.1 (AArch64 Linux)");
             d->stopped = true;
             return;
         } else if (equal(arg, "-std=c11") || equal(arg, "-std=gnu11")) {
@@ -161,8 +161,7 @@ static const char *temporary(Driver *d, const char *ext)
 static bool validate_toolchain(Driver *d)
 {
     Context *c = &d->options;
-    const char *path = temporary(d, "target");
-    FILE *output = path ? fopen(path, "w+") : NULL;
+    FILE *output = tmpfile();
     if (!output) {
         error(c, (Loc){0}, "cannot open temporary file for toolchain verification");
         return false;
@@ -175,13 +174,28 @@ static bool validate_toolchain(Driver *d)
         char result[160];
         rewind(output);
         if (!fgets(result, sizeof result, output) || !starts(result, "aarch64-") ||
-            !strstr(result, "-linux-musl") || strstr(result, "musl_ilp32")) {
-            error(c, (Loc){0}, "toolchain must target little-endian AArch64 Linux with musl");
+            !suffix(result, "-linux-gnu\n")) {
+            error(c, (Loc){0}, "GCC must target little-endian AArch64 Linux with glibc");
             ok = false;
         }
     }
     fclose(output);
     return ok;
+}
+
+static void system_headers(Context *c)
+{
+    const char *compiler_headers = getenv("MCC_COMPILER_INCLUDE");
+    PUSH(c, c->system_includes,
+         compiler_headers && *compiler_headers ? compiler_headers : MCC_BUILTIN_INCLUDE);
+    const char *libc_headers = getenv("MCC_SYSTEM_INCLUDE");
+    if (libc_headers && *libc_headers) {
+        PUSH(c, c->system_includes, libc_headers);
+        return;
+    }
+    PUSH(c, c->system_includes, "/usr/local/include");
+    PUSH(c, c->system_includes, "/usr/include/aarch64-linux-gnu");
+    PUSH(c, c->system_includes, "/usr/include");
 }
 
 static bool compile_source(Driver *d, const char *path, FILE *out)
@@ -273,7 +287,8 @@ static bool publish(Driver *d, const char *path, const char *output)
 static bool from_source(Driver *d, const char *path, const char *output)
 {
     bool standard = output && equal(output, "-");
-    FILE *file = standard ? stdout : output ? fopen(output, "wb") : tmpfile();
+    FILE *file = standard ? stdout :
+                 output ? fopen(output, d->mode == PREPROCESS ? "ab" : "wb") : tmpfile();
     if (!file) {
         error(&d->options, (Loc){0}, "cannot open compiler output: %s", strerror(errno));
         return false;
@@ -298,6 +313,35 @@ static bool assemble(Driver *d, const char *input, const char *obj)
     PUSH(c, cmd, obj);
     PUSH(c, cmd, input[0] == '-' ? format(c, "./%s", input) : input);
     return invoke(d, cmd, -1) == 0;
+}
+
+static const char *input_output(Driver *d, Strings *destinations, const char *input, const char *ext)
+{
+    const char *dest = d->output ? d->output : basename_output(d, input, ext);
+    for (size_t j = 0; j < destinations->len; j++)
+        if (equal(destinations->data[j], dest)) {
+            error(&d->options, (Loc){0}, "multiple inputs map to '%s'", dest);
+            return NULL;
+        }
+    PUSH(&d->options, *destinations, dest);
+    return dest;
+}
+
+static bool link_objects(Driver *d, Strings objects)
+{
+    Context *c = &d->options;
+    const char *dest = d->output ? d->output : "a.out";
+    const char *output = stage(d, dest);
+    if (!output)
+        return false;
+    Strings cmd = {0};
+    PUSH(c, cmd, d->toolchain);
+    PUSH(c, cmd, "-o");
+    PUSH(c, cmd, output[0] == '-' ? format(c, "./%s", output) : output);
+    size_t next = 0;
+    for (size_t i = 0; i < d->link_args.len; i++)
+        PUSH(c, cmd, d->link_args.data[i] ? d->link_args.data[i] : objects.data[next++]);
+    return invoke(d, cmd, -1) == 0 && publish(d, output, dest);
 }
 
 static bool run_driver(Driver *d)
@@ -327,20 +371,15 @@ static bool run_driver(Driver *d)
             const char *assembly = source ? temporary(d, "s") : input;
             if (!assembly || (source && !from_source(d, input, assembly)))
                 return false;
-            const char *dest = d->mode == LINK ? NULL :
-                               d->output ? d->output : basename_output(d, input, "o");
-            for (size_t j = 0; dest && j < destinations.len; j++)
-                if (equal(destinations.data[j], dest)) {
-                    error(c, (Loc){0}, "multiple inputs map to '%s'", dest);
-                    return false;
-                }
+            const char *dest = NULL;
+            if (d->mode == ASSEMBLE && !(dest = input_output(d, &destinations, input, "o")))
+                return false;
             const char *object = dest ? stage(d, dest) : temporary(d, "o");
             if (!object || !assemble(d, assembly, object))
                 return false;
             if (dest) {
                 if (!publish(d, object, dest))
                     return false;
-                PUSH(c, destinations, dest);
             } else {
                 PUSH(c, objects, object);
             }
@@ -354,61 +393,30 @@ static bool run_driver(Driver *d)
             if (!from_source(d, input, NULL))
                 return false;
         } else if (d->mode == PREPROCESS) {
-            FILE *out = combined ? fopen(combined, "ab") : stdout;
-            if (!out) {
-                error(c, (Loc){0}, "cannot open preprocessor output: %s", strerror(errno));
-                return false;
-            }
-            bool ok = compile_source(d, input, out);
-            if ((combined ? fclose(out) : fflush(out)) == EOF)
-                ok = false;
-            if (!ok)
+            if (!from_source(d, input, combined ? combined : "-"))
                 return false;
         } else {
-            const char *dest = d->output ? d->output : basename_output(d, input, "s");
-            for (size_t j = 0; j < destinations.len; j++)
-                if (equal(destinations.data[j], dest)) {
-                    error(c, (Loc){0}, "multiple inputs map to '%s'", dest);
-                    return false;
-                }
+            const char *dest = input_output(d, &destinations, input, "s");
+            if (!dest)
+                return false;
             const char *output = equal(dest, "-") ? dest : stage(d, dest);
             if (!output || !from_source(d, input, output) ||
                 (!equal(dest, "-") && !publish(d, output, dest)))
                 return false;
-            PUSH(c, destinations, dest);
         }
     }
     if (combined && !publish(d, combined, d->output))
         return false;
-    if (d->mode == LINK) {
-        const char *dest = d->output ? d->output : "a.out";
-        const char *output = stage(d, dest);
-        if (!output)
-            return false;
-        Strings cmd = {0};
-        PUSH(c, cmd, d->toolchain);
-        PUSH(c, cmd, "-o");
-        PUSH(c, cmd, output[0] == '-' ? format(c, "./%s", output) : output);
-        size_t next = 0;
-        for (size_t i = 0; i < d->link_args.len; i++)
-            PUSH(c, cmd, d->link_args.data[i] ? d->link_args.data[i] : objects.data[next++]);
-        return invoke(d, cmd, -1) == 0 && publish(d, output, dest);
-    }
-    return true;
+    return d->mode != LINK || link_objects(d, objects);
 }
 
 int main(int argc, char **argv)
 {
     Driver d = {.toolchain = getenv("MCC_TOOLCHAIN")};
     if (!d.toolchain || !*d.toolchain)
-        d.toolchain = "aarch64-unknown-linux-musl-gcc";
+        d.toolchain = "gcc";
     parse_options(&d, argc, argv);
-    const char *compiler_headers = getenv("MCC_COMPILER_INCLUDE");
-    if (compiler_headers && *compiler_headers)
-        PUSH(&d.options, d.options.system_includes, compiler_headers);
-    const char *headers = getenv("MCC_SYSTEM_INCLUDE");
-    if (headers && *headers)
-        PUSH(&d.options, d.options.system_includes, headers);
+    system_headers(&d.options);
     bool ok = !d.options.failed && (d.stopped || run_driver(&d));
     for (size_t i = 0; i < d.scratch.len; i++)
         unlink(d.scratch.data[i]);

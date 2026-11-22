@@ -23,16 +23,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["c11", "gnu11"], default="c11")
     args = parser.parse_args()
-    toolchain = os.environ.get("MCC_TOOLCHAIN")
-    if not toolchain:
-        parser.error("MCC_TOOLCHAIN is required. Run this in the musl development shell.")
+    toolchain = os.environ.get("MCC_TOOLCHAIN") or "gcc"
     flags = "-std=" + args.mode
     if args.mode == "c11":
         flags += " -pedantic-errors"
 
     with TemporaryDirectory(prefix="mcc-bootstrap-") as directory:
         stage1, stage2, stage3 = [Path(directory) / f"stage{i}" for i in range(1, 4)]
-        print("Stage 1: build with musl GCC", flush=True)
+        print("Stage 1: build with GCC", flush=True)
         make(stage1, toolchain, ["all"])
         print(f"Stage 2: build with stage 1 ({flags})", flush=True)
         make(stage2, stage1 / "mcc", ["all"], flags)

@@ -105,6 +105,30 @@ def constraints():
 
 
 def specialized():
+    yield Case("glibc-compiler-headers", """
+        #include <stdio.h>
+        #include <stdarg.h>
+        #include <stddef.h>
+        #include <stdbool.h>
+        #include <float.h>
+
+        _Static_assert(_Alignof(max_align_t) >= _Alignof(long double), "maximum alignment");
+        _Static_assert(FLT_MANT_DIG == 24 && DBL_MANT_DIG == 53 && LDBL_MANT_DIG == 113,
+                       "AArch64 floating-point formats");
+
+        static int print(const char *format, ...) {
+            va_list args;
+            va_start(args, format);
+            int result = vprintf(format, args);
+            va_end(args);
+            return result;
+        }
+
+        int main(void) {
+            bool smallest_float_is_positive = FLT_TRUE_MIN > 0.0f;
+            return !smallest_float_is_positive || print("%d %.1Lf\\n", 17, 2.5L) < 0;
+        }
+    """, executable=True)
     yield Case("offsetof-zero", """
         #include <stddef.h>
         struct S { int first; };
@@ -228,7 +252,7 @@ def verify(case, compiler, reference, directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
-    parser.add_argument("--reference", default=os.environ.get("MCC_TOOLCHAIN"))
+    parser.add_argument("--reference", default=os.environ.get("MCC_TOOLCHAIN") or "gcc")
     args = parser.parse_args()
     cases = [*types(), *nulls(), *constraints(), *specialized()]
     failures = []
