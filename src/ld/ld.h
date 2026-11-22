@@ -6,15 +6,14 @@
 typedef struct {
     ElfOptions elf;
     Strings libraries, runpaths;
-    const char *root, *interpreter, *soname;
-    bool hosted, shared, pie, export_all;
+    const char *entry, *root, *interpreter, *soname;
+    bool shared, pie, export_all;
 } LinkOptions;
 
 typedef struct Linker Linker;
 typedef enum { PATCH_OK, PATCH_UNSUPPORTED, PATCH_RANGE, PATCH_TRUNCATED } PatchResult;
 
-bool mld_link(Context *, Strings args, bool hosted);
-bool hosted_link(Context *, Strings args);
+bool mld_link(Context *, Strings args);
 bool link_elf(Context *, LinkOptions *);
 bool ld_inputs(Context *, Linker *, LinkOptions *);
 void ld_take_object(Linker *, const char *, Bytes);

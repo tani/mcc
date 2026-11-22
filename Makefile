@@ -5,7 +5,7 @@ LINKER := $(BUILD)/mld
 CC_OBJECTS := $(addprefix $(BUILD)/cc/,driver.o cpp.o frontend.o ir.o data.o aarch64.o x86_64.o parser.o scanner.o)
 ELF_COMMON := $(addprefix $(BUILD)/,elf_tools.o core.o)
 AS_OBJECTS := $(addprefix $(BUILD)/as/,as.o aarch64.o x86_64.o)
-LD_OBJECTS := $(addprefix $(BUILD)/ld/,ld.o hosted.o input.o reloc.o)
+LD_OBJECTS := $(addprefix $(BUILD)/ld/,ld.o driver.o input.o reloc.o)
 WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wformat=2 -Wformat-overflow=2 -Wformat-truncation=2 -Wformat-signedness \
 	-Wconversion -Wsign-conversion -Wcast-qual -Wcast-align=strict -Wcast-function-type \

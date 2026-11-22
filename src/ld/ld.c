@@ -10,7 +10,7 @@ enum {
     OUT_VERSYM, OUT_VERNEED, OUT_EH_FRAME_HDR, OUT_COUNT
 };
 
-static const SectionKind hosted_sections[] = {
+static const SectionKind link_sections[] = {
     [OUT_INIT - SECTION_COUNT] = {".init", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR},
     [OUT_FINI - SECTION_COUNT] = {".fini", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR},
     [OUT_EH_FRAME - SECTION_COUNT] = {".eh_frame", SHT_PROGBITS, SHF_ALLOC},
@@ -93,7 +93,7 @@ enum { PAGE = 65536, BASE_ADDRESS = 0x400000 };
 
 static const SectionKind *section_kind(unsigned id)
 {
-    return id < SECTION_COUNT ? &elf_sections[id] : &hosted_sections[id - SECTION_COUNT];
+    return id < SECTION_COUNT ? &elf_sections[id] : &link_sections[id - SECTION_COUNT];
 }
 
 static bool within(size_t size, uint64_t offset, uint64_t length)
@@ -267,10 +267,6 @@ static void collect_definitions(Linker *l, Object *obj)
         const char *name;
         if (!read_symbol(l, obj, i, &s, &name))
             return;
-        if (!l->options->hosted && (s.st_shndx == SHN_COMMON || ELF64_ST_TYPE(s.st_info) == STT_GNU_IFUNC)) {
-            error(l->context, (Loc){0}, "%s: unsupported symbol '%s'", obj->path, name);
-            return;
-        }
         unsigned binding = ELF64_ST_BIND(s.st_info);
         if (binding != STB_GLOBAL && binding != STB_WEAK)
             continue;
@@ -437,13 +433,11 @@ static void place_sections(Linker *l, Object *obj)
         const Elf64_Shdr *s = &obj->sections[i];
         if (!(s->sh_flags & SHF_ALLOC) || obj->discarded[i])
             continue;
-        bool hosted = l->options->hosted;
-        bool array = hosted && (s->sh_type == SHT_PREINIT_ARRAY || s->sh_type == SHT_INIT_ARRAY ||
-                                s->sh_type == SHT_FINI_ARRAY);
-        if ((!hosted && (s->sh_flags & SHF_TLS)) ||
-            ((s->sh_flags & SHF_WRITE) && (s->sh_flags & SHF_EXECINSTR)) ||
+        bool array = s->sh_type == SHT_PREINIT_ARRAY || s->sh_type == SHT_INIT_ARRAY ||
+                     s->sh_type == SHT_FINI_ARRAY;
+        if (((s->sh_flags & SHF_WRITE) && (s->sh_flags & SHF_EXECINSTR)) ||
             (!array && s->sh_type != SHT_PROGBITS && s->sh_type != SHT_NOBITS && s->sh_type != SHT_NOTE &&
-             !(hosted && s->sh_type == SHT_X86_64_UNWIND && l->machine == EM_X86_64))) {
+             !(s->sh_type == SHT_X86_64_UNWIND && l->machine == EM_X86_64))) {
             error(l->context, (Loc){0}, "%s: unsupported allocated section %zu", obj->path, i);
             return;
         }
@@ -453,27 +447,25 @@ static void place_sections(Linker *l, Object *obj)
         }
         unsigned id = s->sh_type == SHT_NOBITS ? SECTION_BSS : s->sh_flags & SHF_EXECINSTR ? SECTION_TEXT :
                       s->sh_flags & SHF_WRITE ? SECTION_DATA : SECTION_RODATA;
-        if (hosted) {
-            const char *name = obj->section_names ? table_string(obj, obj->section_names, s->sh_name) : "";
-            if (!name) {
-                error(l->context, (Loc){0}, "%s: invalid section name", obj->path);
-                return;
-            }
-            if (s->sh_flags & SHF_TLS)
-                id = s->sh_type == SHT_NOBITS ? OUT_TBSS : OUT_TDATA;
-            else if (s->sh_type == SHT_PREINIT_ARRAY)
-                id = OUT_PREINIT_ARRAY;
-            else if (s->sh_type == SHT_INIT_ARRAY)
-                id = OUT_INIT_ARRAY;
-            else if (s->sh_type == SHT_FINI_ARRAY)
-                id = OUT_FINI_ARRAY;
-            else if (equal(name, ".init"))
-                id = OUT_INIT;
-            else if (equal(name, ".fini"))
-                id = OUT_FINI;
-            else if (equal(name, ".eh_frame"))
-                id = OUT_EH_FRAME;
+        const char *name = obj->section_names ? table_string(obj, obj->section_names, s->sh_name) : "";
+        if (!name) {
+            error(l->context, (Loc){0}, "%s: invalid section name", obj->path);
+            return;
         }
+        if (s->sh_flags & SHF_TLS)
+            id = s->sh_type == SHT_NOBITS ? OUT_TBSS : OUT_TDATA;
+        else if (s->sh_type == SHT_PREINIT_ARRAY)
+            id = OUT_PREINIT_ARRAY;
+        else if (s->sh_type == SHT_INIT_ARRAY)
+            id = OUT_INIT_ARRAY;
+        else if (s->sh_type == SHT_FINI_ARRAY)
+            id = OUT_FINI_ARRAY;
+        else if (equal(name, ".init"))
+            id = OUT_INIT;
+        else if (equal(name, ".fini"))
+            id = OUT_FINI;
+        else if (equal(name, ".eh_frame"))
+            id = OUT_EH_FRAME;
         OutputSection *out = &l->sections[id];
         uint64_t alignment = s->sh_addralign ? s->sh_addralign : 1;
         if (alignment > PAGE || (alignment & (alignment - 1)) || out->size > (size_t)PTRDIFF_MAX - PAGE ||
@@ -530,8 +522,6 @@ static bool lookup(Linker *l, Object *obj, size_t index, LinkSymbol *result)
 
 static bool synthetic(Linker *l, const char *name, uint64_t *value)
 {
-    if (!l->options->hosted)
-        return false;
     if (!l->dynamic && equal(name, "_DYNAMIC"))
         return false;
     if (equal(name, "__ehdr_start")) {
@@ -754,8 +744,7 @@ static void prepare_relocations(Linker *l, Object *obj)
                                 (branch_relocation(l->machine, type) && preemptible(l, symbol)));
             if (got || stub)
                 reserve_slot(l, symbol, kind, stub);
-            if (!l->dynamic && !l->tls_resolver && (kind == GOT_TLS_DESC ||
-                 (kind == GOT_TLS_INDEX && l->options->hosted))) {
+            if (!l->dynamic && !l->tls_resolver && (kind == GOT_TLS_DESC || kind == GOT_TLS_INDEX)) {
                 OutputSection *plt = &l->sections[OUT_PLT];
                 l->tls_resolver = plt->size + 1;
                 reserve(plt, l->context, l->machine == EM_AARCH64 ? 8 : 16, 4);
@@ -1025,9 +1014,8 @@ static bool layout(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint16_t
         rw |= l->sections[writeable[i]].size != 0;
     bool tls = l->sections[OUT_TDATA].size || l->sections[OUT_TBSS].size;
     bool interp = l->options->interpreter != NULL;
-    bool hosted = l->options->hosted;
     bool unwind = l->sections[OUT_EH_FRAME_HDR].size != 0;
-    *count = (uint16_t)(2 + ro + rw + tls + interp + hosted + unwind + l->dynamic * 3);
+    *count = (uint16_t)(3 + ro + rw + tls + interp + unwind + l->dynamic * 3);
 
     size_t sizes = 8 * PAGE;
     for (size_t i = 1; i < OUT_COUNT; i++) {
@@ -1039,9 +1027,8 @@ static bool layout(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint16_t
     }
     size_t phdr_size = *count * sizeof(Elf64_Phdr);
     unsigned i = 0;
-    if (hosted)
-        programs[i++] = segment(PT_PHDR, sizeof(Elf64_Ehdr), l->base + sizeof(Elf64_Ehdr),
-                                phdr_size, phdr_size, PF_R, 8);
+    programs[i++] = segment(PT_PHDR, sizeof(Elf64_Ehdr), l->base + sizeof(Elf64_Ehdr),
+                            phdr_size, phdr_size, PF_R, 8);
     size_t end = sizeof(Elf64_Ehdr) + phdr_size;
     for (size_t j = 0; j < sizeof code / sizeof *code; j++)
         end = place_output(l, code[j], end, l->base);
@@ -1295,19 +1282,20 @@ static bool dynamic_image(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], u
     return !c->failed;
 }
 
-static bool executable(Linker *l, ElfOptions *options, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint16_t count)
+static bool executable(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint16_t count)
 {
     Context *c = l->context;
     uint64_t address = 0;
     if (!l->options->shared) {
-        Global *entry = global_symbol(l, options->entry, false);
+        const char *name = l->options->entry;
+        Global *entry = global_symbol(l, name, false);
         if (!entry || !entry->object || entry->symbol.st_shndx >= entry->object->header.e_shnum ||
             !(section_kind(entry->object->locations[entry->symbol.st_shndx].output)->flags & SHF_EXECINSTR) ||
             entry->symbol.st_value >= entry->object->sections[entry->symbol.st_shndx].sh_size) {
-            error(c, (Loc){0}, "entry symbol '%s' must be defined in executable code", options->entry);
+            error(c, (Loc){0}, "entry symbol '%s' must be defined in executable code", name);
             return false;
         }
-        if (!symbol_address(l, entry->object, entry->symbol, options->entry, &address))
+        if (!symbol_address(l, entry->object, entry->symbol, name, &address))
             return false;
     }
     Elf64_Ehdr h = elf_header(l->machine, l->base ? ET_EXEC : ET_DYN);
@@ -1388,7 +1376,7 @@ static bool executable(Linker *l, ElfOptions *options, Elf64_Phdr programs[MAX_P
     h.e_shstrndx = EXEC_SHSTRTAB;
     bytes_add(c, &out, sections, sizeof sections);
     memcpy(out.data, &h, sizeof h);
-    return elf_write(c, options, &out, true);
+    return elf_write(c, &l->options->elf, &out, true);
 }
 
 bool link_elf(Context *c, LinkOptions *options)
@@ -1443,13 +1431,5 @@ bool link_elf(Context *c, LinkOptions *options)
     } else if (l.ifuncs.len) {
         memcpy(l.sections[OUT_IPLT_RELA].contents.data, l.ifuncs.data, l.ifuncs.len * sizeof(Elf64_Rela));
     }
-    return executable(&l, &options->elf, programs, count);
-}
-
-bool mld_link(Context *c, Strings args, bool hosted)
-{
-    if (hosted)
-        return hosted_link(c, args);
-    LinkOptions options = {.elf = elf_options(c, args, true)};
-    return !c->failed && (options.elf.stopped || link_elf(c, &options));
+    return executable(&l, programs, count);
 }

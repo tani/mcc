@@ -15,7 +15,7 @@ typedef struct {
     Mode mode;
     Strings inputs, link_args, scratch;
     const char *output, *directory;
-    bool stopped, freestanding;
+    bool stopped;
     unsigned serial;
 } Driver;
 
@@ -23,7 +23,7 @@ static void usage(FILE *out)
 {
     fputs("Usage: mcc [-std=c11|-std=gnu11] [-E|-fsyntax-only|-S|-c] [-o FILE] INPUT...\n"
           "       -I DIR, -isystem DIR, -D MACRO[=VALUE], -U MACRO\n"
-          "       -static, -shared, -nostdlib, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
+          "       -static, -shared, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
           "       --target=aarch64-linux-gnu or --target=x86_64-linux-gnu\n"
           "       Includes mas and mld. Hosted links use the target's glibc.\n", out);
 }
@@ -105,8 +105,6 @@ static void parse_options(Driver *d, int argc, char **argv)
             PUSH(c, c->macro_options, format(c, "%c%s", arg[1], value));
         } else if (equal(arg, "-O0") || equal(arg, "-fPIC") || equal(arg, "-fpic")) {
             /* Code is unoptimized and position-independent. */
-        } else if (equal(arg, "-nostdlib")) {
-            d->freestanding = true;
         } else if (equal(arg, "-static") || equal(arg, "-shared") ||
                    equal(arg, "-pthread") || equal(arg, "-pie") || equal(arg, "-no-pie") ||
                    starts(arg, "-Wl,")) {
@@ -322,7 +320,7 @@ static bool link_objects(Driver *d, Strings objects)
     size_t next = 0;
     for (size_t i = 0; i < d->link_args.len; i++)
         link_argument(&c, &args, d->link_args.data[i] ? d->link_args.data[i] : objects.data[next++]);
-    bool ok = mld_link(&c, args, !d->freestanding);
+    bool ok = mld_link(&c, args);
     release(&c);
     return ok && publish(d, output, dest);
 }

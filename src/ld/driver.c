@@ -90,10 +90,10 @@ static const char *next_value(Context *c, Strings args, size_t *i, const char *v
     return value;
 }
 
-bool hosted_link(Context *c, Strings args)
+bool mld_link(Context *c, Strings args)
 {
-    LinkOptions options = {.elf = {.output = "a.out", .entry = "_start", .machine = elf_machine(NULL)},
-                           .hosted = true, .pie = true};
+    LinkOptions options = {.elf = {.output = "a.out", .machine = elf_machine(NULL)},
+                           .entry = "_start", .pie = true};
     Strings inputs = {0};
     bool static_link = false, flags = true;
     for (size_t i = 0; i < args.len && !c->failed; i++) {
@@ -115,9 +115,9 @@ bool hosted_link(Context *c, Strings args)
         } else if (equal(arg, "-E") || equal(arg, "--export-dynamic")) {
             options.export_all = true;
         } else if (!strncmp(arg, "--entry=", 8)) {
-            options.elf.entry = next_value(c, args, &i, arg + 8);
+            options.entry = next_value(c, args, &i, arg + 8);
         } else if (equal(arg, "-e") || equal(arg, "--entry")) {
-            options.elf.entry = next_value(c, args, &i, "");
+            options.entry = next_value(c, args, &i, "");
         } else if (arg[1] == 'L' || arg[1] == 'o' || arg[1] == 'l') {
             const char *value = next_value(c, args, &i, arg + 2);
             if (arg[1] == 'o') {

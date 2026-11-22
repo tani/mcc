@@ -333,7 +333,7 @@ static Input *read_input(Reader *r, const char *path, bool searched, bool as_nee
     } else if (file.len >= 8 && !memcmp(file.data, "!<arch>\n", 8)) {
         input->kind = INPUT_ARCHIVE;
         read_archive(c, input);
-    } else if (r->options->hosted && file.len && !memchr(file.data, 0, file.len)) {
+    } else if (file.len && !memchr(file.data, 0, file.len)) {
         bytes_add(c, &input->file, NULL, 1);
         if (!read_script(r, input, depth) && !c->failed)
             error(c, (Loc){0}, "%s: unsupported linker script", path);
@@ -371,34 +371,32 @@ static bool read_inputs(Reader *r, Inputs *inputs, size_t *i, unsigned depth)
     for (; *i < files.len && !c->failed; ++*i) {
         const char *arg = files.data[*i];
         bool searched = false;
-        if (r->options->hosted) {
-            if (equal(arg, "--end-group"))
-                return depth != 0;
-            if (equal(arg, "--start-group")) {
-                Input *group = alloc(c, sizeof *group);
-                group->kind = INPUT_GROUP;
-                if (depth == 32)
-                    return false;
-                ++*i;
-                if (!read_inputs(r, &group->children, i, depth + 1))
-                    return false;
-                PUSH(c, *inputs, group);
-                continue;
-            }
-            if (equal(arg, "-Bdynamic") || equal(arg, "-Bstatic")) {
-                r->static_link = equal(arg, "-Bstatic");
-                continue;
-            }
-            if (equal(arg, "--as-needed") || equal(arg, "--no-as-needed")) {
-                r->as_needed = equal(arg, "--as-needed");
-                continue;
-            }
-            if (!strncmp(arg, "-l", 2)) {
-                searched = true;
-                arg = search_library(r, arg + 2);
-                if (!arg)
-                    return false;
-            }
+        if (equal(arg, "--end-group"))
+            return depth != 0;
+        if (equal(arg, "--start-group")) {
+            Input *group = alloc(c, sizeof *group);
+            group->kind = INPUT_GROUP;
+            if (depth == 32)
+                return false;
+            ++*i;
+            if (!read_inputs(r, &group->children, i, depth + 1))
+                return false;
+            PUSH(c, *inputs, group);
+            continue;
+        }
+        if (equal(arg, "-Bdynamic") || equal(arg, "-Bstatic")) {
+            r->static_link = equal(arg, "-Bstatic");
+            continue;
+        }
+        if (equal(arg, "--as-needed") || equal(arg, "--no-as-needed")) {
+            r->as_needed = equal(arg, "--as-needed");
+            continue;
+        }
+        if (!strncmp(arg, "-l", 2)) {
+            searched = true;
+            arg = search_library(r, arg + 2);
+            if (!arg)
+                return false;
         }
         PUSH(c, *inputs, read_input(r, arg, searched, r->as_needed, depth));
     }

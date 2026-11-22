@@ -19,12 +19,10 @@ extern const SectionKind elf_sections[SECTION_COUNT];
 
 typedef struct {
     Strings inputs;
-    const char *output, *entry;
+    const char *output;
     uint16_t machine;
-    bool stopped;
 } ElfOptions;
 
-ElfOptions elf_options(Context *, Strings args, bool linker);
 uint16_t elf_machine(const char *target);
 Elf64_Ehdr elf_header(uint16_t machine, uint16_t type);
 void bytes_add(Context *, Bytes *, const void *, size_t);

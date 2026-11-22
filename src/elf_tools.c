@@ -32,58 +32,6 @@ uint16_t elf_machine(const char *target)
 #endif
 }
 
-ElfOptions elf_options(Context *c, Strings args, bool linker)
-{
-    ElfOptions options = {.output = linker ? "a.out" : "a.o", .entry = "_start",
-                          .machine = elf_machine(NULL)};
-    const char *tool = linker ? "mld" : "mas";
-    bool flags = true;
-    for (size_t i = 0; i < args.len && !c->failed; i++) {
-        const char *arg = args.data[i];
-        if (!flags || arg[0] != '-' || equal(arg, "-")) {
-            PUSH(c, options.inputs, arg);
-        } else if (equal(arg, "--")) {
-            flags = false;
-        } else if (equal(arg, "--help")) {
-            printf("Usage: %s [--target=TARGET] [-o FILE]%s INPUT...\n"
-                   "Targets: aarch64-linux-gnu, x86_64-linux-gnu\n", tool,
-                   linker ? " [-e SYMBOL]" : "");
-            if (linker)
-                puts("Use mld --hosted for linking with the target's glibc.");
-            options.stopped = true;
-            return options;
-        } else if (equal(arg, "--version")) {
-            printf("%s 0.1\n", tool);
-            options.stopped = true;
-            return options;
-        } else if (!strncmp(arg, "--target=", 9)) {
-            options.machine = elf_machine(arg + 9);
-            if (options.machine == EM_NONE)
-                error(c, (Loc){0}, "unsupported target '%s'", arg + 9);
-        } else if (linker && !strncmp(arg, "--entry=", 8)) {
-            if (!arg[8])
-                error(c, (Loc){0}, "--entry requires a symbol");
-            else
-                options.entry = arg + 8;
-        } else if (arg[1] == 'o' || (linker && arg[1] == 'e')) {
-            const char *value = arg[2] ? arg + 2 : i + 1 < args.len ? args.data[++i] : "";
-            if (!*value)
-                error(c, (Loc){0}, "'%s' requires a value", arg);
-            else if (arg[1] == 'o')
-                options.output = value;
-            else
-                options.entry = value;
-        } else if (!(linker && equal(arg, "-static"))) {
-            error(c, (Loc){0}, "unsupported option '%s'", arg);
-        }
-    }
-    if (!c->failed && !options.inputs.len)
-        error(c, (Loc){0}, "no input files");
-    if (!c->failed && options.machine == EM_NONE)
-        error(c, (Loc){0}, "select an ELF target with --target");
-    return options;
-}
-
 Elf64_Ehdr elf_header(uint16_t machine, uint16_t type)
 {
     Elf64_Ehdr header = {.e_type = type, .e_machine = machine, .e_version = EV_CURRENT,

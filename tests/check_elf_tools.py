@@ -9,14 +9,14 @@ import sys
 from tempfile import TemporaryDirectory
 
 
-STARTUP = {
+MAIN_ASSEMBLY = {
     "aarch64": (
         183, b"AArch64",
-        b"mov x0, #20\nbl calculate\nmov x8, #93\nsvc #0\n",
+        b"mov x0, #20\nb calculate\n",
     ),
     "x86_64": (
         62, b"x86-64",
-        b"movl $20, %edi\ncall calculate\nmovl %eax, %edi\nmovl $60, %eax\nsyscall\n",
+        b"movl $20, %edi\njmp calculate\n",
     ),
 }
 
@@ -43,7 +43,7 @@ def command(*args, source=None, status=0):
     return result
 
 
-def check_hosted(mcc, mld, root):
+def check_libraries(mcc, mld, root):
     root.mkdir()
     main = root / "main.o"
     first = root / "first.o"
@@ -66,7 +66,7 @@ int main(void) {
     (root / "libgroup.so").write_text("GROUP ( libfirst.a libsecond.a )\n")
 
     dynamic = root / "dynamic"
-    command(mld, "--hosted", "-o", dynamic, main, "-L", root, "-lgroup")
+    command(mld, "-o", dynamic, main, "-L", root, "-lgroup")
     assert command(dynamic, status=42).stdout == b"hosted\n"
 
     static = root / "static"
@@ -91,48 +91,49 @@ def check(mcc, mas, mld, directory):
     installed.mkdir()
     mcc = copy2(mcc, installed / "mcc")
     version = command(mcc, "--version").stdout
+    native = next(arch for arch, (_, name, _) in MAIN_ASSEMBLY.items() if name in version)
     objects = {}
-    for arch, (machine, name, startup) in STARTUP.items():
+    for arch, (machine, _, _) in MAIN_ASSEMBLY.items():
         root = directory / arch
         root.mkdir()
         flag = f"--target={arch}-linux-gnu"
-        start, body, output = (root / filename for filename in ("start.o", "body.o", "program"))
-        start_source = root / "start.s"
-        start_source.write_bytes(b".global start\nstart:\n" + startup)
         assembly = command(mcc, flag, "-S", "-o", "-", "-", source=SOURCE).stdout
         obj = command(mas, flag, "-o", "-", "-", source=assembly).stdout
         assert obj[:6] == b"\x7fELF\x02\x01" and unpack_from("<HH", obj, 16) == (1, machine)
+        body = root / "body.o"
         body.write_bytes(obj)
-        command(mas, flag, "-o", start, start_source)
-        command(mld, flag, "-e", "start", "-o", output, start, "-", source=obj)
-        program = output.read_bytes()
-        assert unpack_from("<HH", program, 16) == (2, machine)
-        assert os.access(output, os.X_OK)
-        driven = root / "driven"
-        command(mcc, flag, "-nostdlib", "-Wl,-e,start", "-o", driven, start_source, "-", source=SOURCE)
-        assert driven.read_bytes() == program
-        if name in version:
-            command(output, status=42)
-        assert b"undefined symbol 'calculate'" in command(
-            mld, flag, "-e", "start", "-o", output, start, status=1
-        ).stderr
-        assert b"multiple definitions" in command(
-            mld, flag, "-e", "start", "-o", output, start, body, body, status=1
-        ).stderr
-        bad = command(mas, flag, "-o", start, "-", source=b"invalid_instruction\n", status=1)
+        bad = command(mas, flag, "-o", body, "-", source=b"invalid_instruction\n", status=1)
         assert b"<stdin>:1:1:" in bad.stderr
-        assert output.read_bytes() == program and start.read_bytes().startswith(b"\x7fELF")
+        assert body.read_bytes() == obj
         objects[arch] = body
 
-    failed = command(mld, "--target=aarch64-linux-gnu", "-o", directory / "mixed",
-                     objects["x86_64"], status=1)
+    root = directory / native
+    main, body, output = root / "main.o", objects[native], root / "program"
+    main_source = root / "main.s"
+    machine, _, assembly = MAIN_ASSEMBLY[native]
+    main_source.write_bytes(b".global main\nmain:\n" + assembly)
+    command(mas, "-o", main, main_source)
+    command(mld, "-o", output, main, "-", source=body.read_bytes())
+    program = output.read_bytes()
+    assert unpack_from("<HH", program, 16) == (3, machine)
+    assert os.access(output, os.X_OK)
+    command(output, status=42)
+    driven = root / "driven"
+    command(mcc, "-o", driven, main_source, "-", source=SOURCE)
+    assert driven.read_bytes() == program
+    assert b"undefined symbol 'calculate'" in command(mld, "-o", output, main, status=1).stderr
+    assert b"multiple definitions" in command(mld, "-o", output, main, body, body, status=1).stderr
+    assert output.read_bytes() == program
+
+    foreign = next(obj for arch, obj in objects.items() if arch != native)
+    failed = command(mld, "-o", directory / "mixed", foreign, status=1)
     assert b"does not match the selected target" in failed.stderr
     broken = directory / "truncated.o"
     broken.write_bytes(b"\x7fELF")
     failed = command(mld, "-o", directory / "broken", broken, status=1)
     assert b"truncated ELF" in failed.stderr
     assert not (directory / "mixed").exists() and not (directory / "broken").exists()
-    check_hosted(mcc, mld, directory / "hosted")
+    check_libraries(mcc, mld, directory / "libraries")
     print("mas and mld ELF tests passed")
 
 
