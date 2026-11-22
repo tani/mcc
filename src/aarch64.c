@@ -2,7 +2,7 @@
 #include "parser.h"
 
 const Target aarch64_linux = {
-    .arch = "aarch64", .emit = emit_aarch64,
+    .arch = "aarch64", .display_name = "AArch64", .emit = emit_aarch64,
     .char_size = 1, .short_size = 2, .int_size = 4, .long_size = 8,
     .long_long_size = 8, .pointer_size = 8, .long_double_size = 16,
     .char_unsigned = true, .wchar_unsigned = true
@@ -17,7 +17,7 @@ typedef struct {
     size_t indirect_return;
     unsigned named_gp, named_fp;
     size_t named_stack;
-    unsigned number, scratch_label;
+    unsigned function_id, next_label;
 } Emitter;
 
 static void number(FILE *out, unsigned reg, uint64_t n)
@@ -450,7 +450,7 @@ static void va_arg_instruction(Emitter *e, Inst *in)
     Type *t = in->type;
     Argument model = argument_model(t);
     bool fp = model.kind == ARG_FP, indirect = model.kind == ARG_INDIRECT;
-    unsigned idx = e->scratch_label++;
+    unsigned idx = e->next_label++;
     FILE *out = e->out;
     unsigned reg_offset = fp ? 28 : 24;
     unsigned increment = model.count * (fp ? 16 : 8);
@@ -458,27 +458,27 @@ static void va_arg_instruction(Emitter *e, Inst *in)
     bool aligned = !indirect && t->align > 8;
     slot_load(e, 9, in->a);
     fprintf(out, "\tldrsw x10, [x9, #%u]\n\ttbz x10, #63, .Lvstack%u_%u\n",
-            reg_offset, e->number, idx);
+            reg_offset, e->function_id, idx);
     if (!fp && aligned)
         fputs("\tadd x10, x10, #15\n\tand x10, x10, #-16\n", out);
     fprintf(out, "\tadds w11, w10, #%u\n\tstr w11, [x9, #%u]\n\tb.gt .Lvstack%u_%u\n"
                  "\tldr x11, [x9, #%u]\n\tadd x10, x11, x10\n",
-            increment, reg_offset, e->number, idx, fp ? 16u : 8u);
+            increment, reg_offset, e->function_id, idx, fp ? 16u : 8u);
     if (fp && aggregate(t)) {
         slot_load(e, 9, in->dest);
         char width = model.element == 4 ? 's' : model.element == 8 ? 'd' : 'q';
         for (unsigned j = 0; j < model.count; j++)
             fprintf(out, "\tldr %c0, [x10, #%u]\n\tstr %c0, [x9, #%zu]\n",
                     width, j * 16, width, model.offsets[j]);
-        fprintf(out, "\tb .Lvcomplete%u_%u\n", e->number, idx);
+        fprintf(out, "\tb .Lvcomplete%u_%u\n", e->function_id, idx);
     } else {
-        fprintf(out, "\tb .Lvarg%u_%u\n", e->number, idx);
+        fprintf(out, "\tb .Lvarg%u_%u\n", e->function_id, idx);
     }
-    fprintf(out, ".Lvstack%u_%u:\n\tldr x10, [x9]\n", e->number, idx);
+    fprintf(out, ".Lvstack%u_%u:\n\tldr x10, [x9]\n", e->function_id, idx);
     if (aligned)
         fputs("\tadd x10, x10, #15\n\tand x10, x10, #-16\n", out);
     number(out, 11, size);
-    fprintf(out, "\tadd x11, x10, x11\n\tstr x11, [x9]\n.Lvarg%u_%u:\n", e->number, idx);
+    fprintf(out, "\tadd x11, x10, x11\n\tstr x11, [x9]\n.Lvarg%u_%u:\n", e->function_id, idx);
     if (aggregate(t)) {
         if (indirect)
             fputs("\tldr x10, [x10]\n", out);
@@ -491,7 +491,7 @@ static void va_arg_instruction(Emitter *e, Inst *in)
         object_load(out, t, 9, 10);
         slot_store(e, 9, in->dest);
     }
-    fprintf(out, ".Lvcomplete%u_%u:\n", e->number, idx);
+    fprintf(out, ".Lvcomplete%u_%u:\n", e->function_id, idx);
 }
 
 static void call_instruction(Emitter *e, Inst *in)
@@ -560,14 +560,14 @@ static void memory_loop(Emitter *e, size_t size, bool copy)
 {
     if (!size)
         return;
-    unsigned id = e->scratch_label++;
+    unsigned id = e->next_label++;
     number(e->out, 12, size);
-    fprintf(e->out, ".Lm%u_%u:\n", e->number, id);
+    fprintf(e->out, ".Lm%u_%u:\n", e->function_id, id);
     if (copy)
         fputs("\tldrb w11, [x10], #1\n\tstrb w11, [x9], #1\n", e->out);
     else
         fputs("\tstrb wzr, [x9], #1\n", e->out);
-    fprintf(e->out, "\tsubs x12, x12, #1\n\tb.ne .Lm%u_%u\n", e->number, id);
+    fprintf(e->out, "\tsubs x12, x12, #1\n\tb.ne .Lm%u_%u\n", e->function_id, id);
 }
 
 static void instruction(Emitter *e, Inst *in)
@@ -678,13 +678,13 @@ static void instruction(Emitter *e, Inst *in)
         slot_store(e, 9, in->dest);
         break;
     case I_BINARY: binary_instruction(e, in); break;
-    case I_LABEL: fprintf(out, ".L%u_%zu:\n", e->number, in->label); break;
+    case I_LABEL: fprintf(out, ".L%u_%zu:\n", e->function_id, in->label); break;
     case I_JUMP:
         if (in->a) {
             slot_load(e, 9, in->a);
             fputs("\tmov sp, x9\n", out);
         }
-        fprintf(out, "\tb .L%u_%zu\n", e->number, in->label);
+        fprintf(out, "\tb .L%u_%zu\n", e->function_id, in->label);
         break;
     case I_STACK_ALLOC:
         fputs("\tmov x9, sp\n", out);
@@ -699,7 +699,7 @@ static void instruction(Emitter *e, Inst *in)
         break;
     case I_ZERO:
         slot_load(e, 9, in->a);
-        fprintf(out, "\t%s x9, .L%u_%zu\n", in->op ? "cbnz" : "cbz", e->number, in->label);
+        fprintf(out, "\t%s x9, .L%u_%zu\n", in->op ? "cbnz" : "cbz", e->function_id, in->label);
         break;
     case I_CALL: call_instruction(e, in); break;
     case I_VA_START: va_start_instruction(e, in); break;
@@ -729,17 +729,17 @@ static void instruction(Emitter *e, Inst *in)
             else
                 slot_load(e, 0, in->a);
         }
-        fprintf(out, "\tb .Lreturn%u\n", e->number);
+        fprintf(out, "\tb .Lreturn%u\n", e->function_id);
         break;
     }
 }
 
-static void assembly_function(Context *c, FILE *out, Symbol *s, unsigned id)
+static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
 {
     FunctionIR ir;
     if (!lower(c, s, &ir))
         return;
-    Emitter e = {.context = c, .out = out, .ir = &ir, .number = id};
+    Emitter e = {.context = c, .out = out, .ir = &ir, .function_id = id};
     e.offsets = alloc(c, (ir.slots.len + 1) * sizeof *e.offsets);
     size_t frame = 0;
     for (size_t i = 0; i < ir.slots.len; i++) {
@@ -780,7 +780,7 @@ static void assembly_function(Context *c, FILE *out, Symbol *s, unsigned id)
     for (size_t i = 0; i < ir.instructions.len; i++)
         instruction(&e, &ir.instructions.data[i]);
     fprintf(out, ".Lreturn%u:\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n",
-            e.number);
+            e.function_id);
     fprintf(out, "\t.size %s, .-%s\n", s->assembly, s->assembly);
 }
 
@@ -789,7 +789,7 @@ bool emit_aarch64(Context *c, FILE *out)
     for (size_t i = 0; i < c->globals.len && !c->failed; i++) {
         Symbol *s = c->globals.data[i];
         if (s->type->kind == TY_FUNC && s->body)
-            assembly_function(c, out, s, (unsigned)i);
+            emit_function(c, out, s, (unsigned)i);
         else if (s->type->kind != TY_FUNC && (s->defined || s->tentative))
             emit_static_data(c, out, s);
     }

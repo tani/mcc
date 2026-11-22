@@ -5,7 +5,7 @@
 #include <limits.h>
 
 const Target x86_64_linux = {
-    .arch = "x86_64", .emit = emit_x86_64,
+    .arch = "x86_64", .display_name = "x86-64", .emit = emit_x86_64,
     .char_size = 1, .short_size = 2, .int_size = 4, .long_size = 8,
     .long_long_size = 8, .pointer_size = 8, .long_double_size = 16
 };
@@ -109,8 +109,8 @@ static const Reg result_regs[] = {
 typedef struct {
     Context *context;
     FILE *out;
-    size_t *slots;
-    unsigned function, label;
+    size_t *offsets;
+    unsigned function_id, next_label;
     size_t indirect_result, registers, scratch;
     ArgumentState named;
 } Emitter;
@@ -122,12 +122,12 @@ static void number(FILE *out, uint64_t value, const char *reg)
 
 static void slot_load(Emitter *e, size_t id, const char *reg)
 {
-    fprintf(e->out, "\tmovq -%zu(%%rbp), %s\n", e->slots[id], reg);
+    fprintf(e->out, "\tmovq -%zu(%%rbp), %s\n", e->offsets[id], reg);
 }
 
 static void slot_store(Emitter *e, size_t id, const char *reg)
 {
-    fprintf(e->out, "\tmovq %s, -%zu(%%rbp)\n", reg, e->slots[id]);
+    fprintf(e->out, "\tmovq %s, -%zu(%%rbp)\n", reg, e->offsets[id]);
 }
 
 static bool extended(Type *t)
@@ -147,12 +147,12 @@ static const char *sse_suffix(Type *t)
 
 static void x87_load(Emitter *e, Type *t, size_t id)
 {
-    fprintf(e->out, "\tfld%c -%zu(%%rbp)\n", fp_suffix(t), e->slots[id]);
+    fprintf(e->out, "\tfld%c -%zu(%%rbp)\n", fp_suffix(t), e->offsets[id]);
 }
 
 static void x87_store(Emitter *e, Type *t, size_t id)
 {
-    fprintf(e->out, "\tfstp%c -%zu(%%rbp)\n", fp_suffix(t), e->slots[id]);
+    fprintf(e->out, "\tfstp%c -%zu(%%rbp)\n", fp_suffix(t), e->offsets[id]);
 }
 
 static void normalize(FILE *out, Type *t)
@@ -265,7 +265,7 @@ static void object_address(Emitter *e, Symbol *s)
 {
     FILE *out = e->out;
     if (s->local) {
-        fprintf(out, "\tleaq -%zu(%%rbp), %%rax\n", e->slots[s->slot]);
+        fprintf(out, "\tleaq -%zu(%%rbp), %%rax\n", e->offsets[s->slot]);
     } else if (s->thread_local_storage) {
         /* The GNU TLSGD sequence also lets the linker relax executable-local TLS. */
         fprintf(out, "\tdata16 leaq %s@tlsgd(%%rip), %%rdi\n"
@@ -327,13 +327,13 @@ static void fp_binary(Emitter *e, Inst *in)
         }
     } else {
         const char *suffix = sse_suffix(t);
-        fprintf(out, "\tmov%s -%zu(%%rbp), %%xmm0\n", suffix, e->slots[in->a]);
+        fprintf(out, "\tmov%s -%zu(%%rbp), %%xmm0\n", suffix, e->offsets[in->a]);
         if (compare) {
-            fprintf(out, "\tucomi%s -%zu(%%rbp), %%xmm0\n", suffix, e->slots[in->b]);
+            fprintf(out, "\tucomi%s -%zu(%%rbp), %%xmm0\n", suffix, e->offsets[in->b]);
         } else {
             fprintf(out, "\t%s%s -%zu(%%rbp), %%xmm0\n"
                          "\tmov%s %%xmm0, -%zu(%%rbp)\n",
-                    op, suffix, e->slots[in->b], suffix, e->slots[in->dest]);
+                    op, suffix, e->offsets[in->b], suffix, e->offsets[in->dest]);
         }
     }
     if (compare) {
@@ -388,13 +388,13 @@ static void fp_to_integer(Emitter *e, Inst *in)
     bool unsigned_wide = in->type->uns && in->type->size == 8;
     x87_load(e, in->source_type, in->a);
     if (unsigned_wide) {
-        unsigned label = e->label++;
-        fputs("\txorl %r10d, %r10d\n\tfldl .Lx86_two63(%rip)\n"
+        unsigned label = e->next_label++;
+        fputs("\txorl %r10d, %r10d\n\tfldl .Ltwo63(%rip)\n"
               "\tfucomip %st(1), %st\n", out);
-        fprintf(out, "\tja .Lx86_cast%u_%u\n\tfsubl .Lx86_two63(%%rip)\n",
-                e->function, label);
+        fprintf(out, "\tja .Lcast%u_%u\n\tfsubl .Ltwo63(%%rip)\n",
+                e->function_id, label);
         number(out, UINT64_C(1) << 63, "%r10");
-        fprintf(out, ".Lx86_cast%u_%u:\n", e->function, label);
+        fprintf(out, ".Lcast%u_%u:\n", e->function_id, label);
     }
     /* x86-64 baseline has x87 but does not require SSE3's truncating FISTTP. */
     fprintf(out, "\tfnstcw -%zu(%%rbp)\n\tmovzwl -%zu(%%rbp), %%eax\n"
@@ -402,7 +402,7 @@ static void fp_to_integer(Emitter *e, Inst *in)
                  "\tfldcw -%zu(%%rbp)\n\tfistpq -%zu(%%rbp)\n"
                  "\tfldcw -%zu(%%rbp)\n",
             e->scratch, e->scratch, e->scratch - 2, e->scratch - 2,
-            e->slots[in->dest], e->scratch);
+            e->offsets[in->dest], e->scratch);
     slot_load(e, in->dest, "%rax");
     if (unsigned_wide)
         fputs("\torq %r10, %rax\n", out);
@@ -410,7 +410,7 @@ static void fp_to_integer(Emitter *e, Inst *in)
     slot_store(e, in->dest, "%rax");
 }
 
-static void cast_value(Emitter *e, Inst *in)
+static void cast_instruction(Emitter *e, Inst *in)
 {
     Type *from = in->source_type, *to = in->type;
     FILE *out = e->out;
@@ -425,13 +425,13 @@ static void cast_value(Emitter *e, Inst *in)
             fp_to_integer(e, in);
         }
     } else if (to->kind == TY_FLOAT) {
-        fprintf(out, "\tfildq -%zu(%%rbp)\n", e->slots[in->a]);
+        fprintf(out, "\tfildq -%zu(%%rbp)\n", e->offsets[in->a]);
         if (from->uns && from->size == 8) {
-            unsigned label = e->label++;
+            unsigned label = e->next_label++;
             slot_load(e, in->a, "%rax");
-            fprintf(out, "\ttestq %%rax, %%rax\n\tjns .Lx86_cast%u_%u\n"
-                         "\tfaddl .Lx86_two64(%%rip)\n.Lx86_cast%u_%u:\n",
-                    e->function, label, e->function, label);
+            fprintf(out, "\ttestq %%rax, %%rax\n\tjns .Lcast%u_%u\n"
+                         "\tfaddl .Ltwo64(%%rip)\n.Lcast%u_%u:\n",
+                    e->function_id, label, e->function_id, label);
         }
         x87_store(e, to, in->dest);
     } else {
@@ -524,7 +524,7 @@ static void parameters(Emitter *e, Symbol *s)
         Argument a = argument(&state, p->type);
         if (!a.stack)
             register_value(out, p->type, a.abi, argument_regs + a.gp, a.sse,
-                           "%rbp", -(ptrdiff_t)e->slots[p->slot], false);
+                           "%rbp", -(ptrdiff_t)e->offsets[p->slot], false);
     }
     e->named = state;
     state = (ArgumentState){.gp = e->indirect_result ? 1u : 0u};
@@ -533,13 +533,13 @@ static void parameters(Emitter *e, Symbol *s)
         Argument a = argument(&state, p->type);
         if (a.stack) {
             fprintf(out, "\tleaq %zu(%%rbp), %%rsi\n\tleaq -%zu(%%rbp), %%rdi\n",
-                    a.offset + 16, e->slots[p->slot]);
+                    a.offset + 16, e->offsets[p->slot]);
             copy_bytes(out, p->type->size);
         }
     }
 }
 
-static void call_value(Emitter *e, Inst *in)
+static void call_instruction(Emitter *e, Inst *in)
 {
     FILE *out = e->out;
     Abi result = classify(in->type);
@@ -565,7 +565,7 @@ static void call_value(Emitter *e, Inst *in)
             if (aggregate(t))
                 slot_load(e, slot, "%rsi");
             else
-                fprintf(out, "\tleaq -%zu(%%rbp), %%rsi\n", e->slots[slot]);
+                fprintf(out, "\tleaq -%zu(%%rbp), %%rsi\n", e->offsets[slot]);
             fprintf(out, "\tleaq %zu(%%rsp), %%rdi\n", a.offset);
             copy_bytes(out, t->size);
         } else {
@@ -585,7 +585,7 @@ static void call_value(Emitter *e, Inst *in)
             register_value(out, t, a.abi, argument_regs + a.gp, a.sse, "%r10", 0, true);
         } else {
             register_value(out, t, a.abi, argument_regs + a.gp, a.sse,
-                           "%rbp", -(ptrdiff_t)e->slots[slot], true);
+                           "%rbp", -(ptrdiff_t)e->offsets[slot], true);
         }
     }
     if (result.memory)
@@ -606,7 +606,7 @@ static void call_value(Emitter *e, Inst *in)
         register_value(out, in->type, result, result_regs, 0, "%r10", 0, false);
     } else if (in->type->kind == TY_FLOAT) {
         register_value(out, in->type, result, result_regs, 0,
-                       "%rbp", -(ptrdiff_t)e->slots[in->dest], false);
+                       "%rbp", -(ptrdiff_t)e->offsets[in->dest], false);
     } else {
         if (in->type->kind == TY_BOOL)
             fputs("\tmovzbl %al, %eax\n", out);
@@ -628,15 +628,15 @@ static void return_value(Emitter *e, Inst *in, Type *t)
             register_value(out, t, classify(t), result_regs, 0, "%r10", 0, true);
         } else if (t->kind == TY_FLOAT) {
             register_value(out, t, classify(t), result_regs, 0,
-                           "%rbp", -(ptrdiff_t)e->slots[in->a], true);
+                           "%rbp", -(ptrdiff_t)e->offsets[in->a], true);
         } else {
             slot_load(e, in->a, "%rax");
         }
     }
-    fprintf(out, "\tjmp .Lx86_return%u\n", e->function);
+    fprintf(out, "\tjmp .Lreturn%u\n", e->function_id);
 }
 
-static void va_start(Emitter *e, Inst *in)
+static void va_start_instruction(Emitter *e, Inst *in)
 {
     slot_load(e, in->a, "%r10");
     fprintf(e->out, "\tmovl $%u, (%%r10)\n\tmovl $%u, 4(%%r10)\n"
@@ -661,20 +661,20 @@ static void read_vararg(Emitter *e, Inst *in, const char *source)
     }
 }
 
-static void va_arg(Emitter *e, Inst *in)
+static void va_arg_instruction(Emitter *e, Inst *in)
 {
     Type *t = in->type;
     Abi abi = classify(t);
     FILE *out = e->out;
-    unsigned label = e->label++;
+    unsigned label = e->next_label++;
     slot_load(e, in->a, "%r10");
     if (!abi.memory && abi.part[0] != ABI_X87) {
         if (abi.gp)
-            fprintf(out, "\tmovl (%%r10), %%r8d\n\tcmpl $%u, %%r8d\n\tja .Lx86_va_stack%u_%u\n",
-                    GP_SAVE_SIZE - 8 * abi.gp, e->function, label);
+            fprintf(out, "\tmovl (%%r10), %%r8d\n\tcmpl $%u, %%r8d\n\tja .Lvstack%u_%u\n",
+                    GP_SAVE_SIZE - 8 * abi.gp, e->function_id, label);
         if (abi.sse)
-            fprintf(out, "\tmovl 4(%%r10), %%r9d\n\tcmpl $%u, %%r9d\n\tja .Lx86_va_stack%u_%u\n",
-                    REGISTER_SAVE_SIZE - 16 * abi.sse, e->function, label);
+            fprintf(out, "\tmovl 4(%%r10), %%r9d\n\tcmpl $%u, %%r9d\n\tja .Lvstack%u_%u\n",
+                    REGISTER_SAVE_SIZE - 16 * abi.sse, e->function_id, label);
         if (abi.gp)
             fprintf(out, "\taddl $%u, (%%r10)\n", 8 * abi.gp);
         if (abi.sse)
@@ -697,15 +697,15 @@ static void va_arg(Emitter *e, Inst *in)
             fprintf(out, "\tleaq (%%rsi,%s), %%r11\n", abi.gp ? "%r8" : "%r9");
             read_vararg(e, in, "%r11");
         }
-        fprintf(out, "\tjmp .Lx86_va_end%u_%u\n.Lx86_va_stack%u_%u:\n",
-                e->function, label, e->function, label);
+        fprintf(out, "\tjmp .Lvcomplete%u_%u\n.Lvstack%u_%u:\n",
+                e->function_id, label, e->function_id, label);
     }
     fputs("\tmovq 8(%r10), %rsi\n", out);
     if (t->align > 8)
         fputs("\taddq $15, %rsi\n\tandq $-16, %rsi\n", out);
     fprintf(out, "\tleaq %zu(%%rsi), %%rax\n\tmovq %%rax, 8(%%r10)\n", align_to(t->size, 8));
     read_vararg(e, in, "%rsi");
-    fprintf(out, ".Lx86_va_end%u_%u:\n", e->function, label);
+    fprintf(out, ".Lvcomplete%u_%u:\n", e->function_id, label);
 }
 
 static void copy_extended(FILE *out, const char *source, const char *destination)
@@ -717,7 +717,7 @@ static void copy_extended(FILE *out, const char *source, const char *destination
 
 static void slot_address(Emitter *e, size_t id, const char *reg)
 {
-    fprintf(e->out, "\tleaq -%zu(%%rbp), %s\n", e->slots[id], reg);
+    fprintf(e->out, "\tleaq -%zu(%%rbp), %s\n", e->offsets[id], reg);
 }
 
 static void instruction(Emitter *e, Inst *in, Type *result)
@@ -736,7 +736,7 @@ static void instruction(Emitter *e, Inst *in, Type *result)
                 number(out, bits[0], "%rax");
                 slot_store(e, in->dest, "%rax");
                 number(out, bits[1], "%rax");
-                fprintf(out, "\tmovq %%rax, -%zu(%%rbp)\n", e->slots[in->dest] - 8);
+                fprintf(out, "\tmovq %%rax, -%zu(%%rbp)\n", e->offsets[in->dest] - 8);
             }
         } else {
             number(out, float_bits(in->real, in->type->size), "%rax");
@@ -786,7 +786,7 @@ static void instruction(Emitter *e, Inst *in, Type *result)
             slot_store(e, in->dest, "%rax");
         }
         break;
-    case I_CAST: cast_value(e, in); break;
+    case I_CAST: cast_instruction(e, in); break;
     case I_UNARY: unary_value(e, in); break;
     case I_BINARY:
         if (in->source_type->kind == TY_FLOAT)
@@ -795,18 +795,18 @@ static void instruction(Emitter *e, Inst *in, Type *result)
             integer_binary(e, in);
         break;
     case I_LABEL:
-        fprintf(out, ".Lx86_%u_%zu:\n", e->function, in->label);
+        fprintf(out, ".L%u_%zu:\n", e->function_id, in->label);
         break;
     case I_JUMP:
         if (in->a)
             slot_load(e, in->a, "%rsp");
-        fprintf(out, "\tjmp .Lx86_%u_%zu\n", e->function, in->label);
+        fprintf(out, "\tjmp .L%u_%zu\n", e->function_id, in->label);
         break;
     case I_ZERO:
-        fprintf(out, "\tcmpq $0, -%zu(%%rbp)\n\t%s .Lx86_%u_%zu\n",
-                e->slots[in->a], in->op ? "jne" : "je", e->function, in->label);
+        fprintf(out, "\tcmpq $0, -%zu(%%rbp)\n\t%s .L%u_%zu\n",
+                e->offsets[in->a], in->op ? "jne" : "je", e->function_id, in->label);
         break;
-    case I_CALL: call_value(e, in); break;
+    case I_CALL: call_instruction(e, in); break;
     case I_RETURN: return_value(e, in, result); break;
     case I_MEMCOPY:
         slot_load(e, in->a, "%rdi");
@@ -818,8 +818,8 @@ static void instruction(Emitter *e, Inst *in, Type *result)
         number(out, in->immediate, "%rcx");
         fputs("\txorl %eax, %eax\n\trep stosb\n", out);
         break;
-    case I_VA_START: va_start(e, in); break;
-    case I_VA_ARG: va_arg(e, in); break;
+    case I_VA_START: va_start_instruction(e, in); break;
+    case I_VA_ARG: va_arg_instruction(e, in); break;
     case I_BITLOAD: bit_load(e, in); break;
     case I_BITSTORE: bit_store(e, in); break;
     case I_STACK_ALLOC:
@@ -839,15 +839,15 @@ static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
     FunctionIR ir;
     if (!lower(c, s, &ir))
         return;
-    Emitter e = {.context = c, .out = out, .function = id};
-    e.slots = alloc(c, (ir.slots.len + 1) * sizeof *e.slots);
+    Emitter e = {.context = c, .out = out, .function_id = id};
+    e.offsets = alloc(c, (ir.slots.len + 1) * sizeof *e.offsets);
     size_t frame = 0;
     for (size_t i = 0; i < ir.slots.len; i++) {
         Type *t = ir.slots.data[i];
         size_t width = t->size < 8 ? 8 : t->size;
         size_t alignment = t->align < 8 ? 8 : t->align;
         frame = align_to(frame + width, alignment);
-        e.slots[i + 1] = frame;
+        e.offsets[i + 1] = frame;
     }
     e.scratch = frame = align_to(frame, 8) + 8;
     Type *result = s->type->base;
@@ -870,7 +870,7 @@ static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
     parameters(&e, s);
     for (size_t i = 0; i < ir.instructions.len && !c->failed; i++)
         instruction(&e, &ir.instructions.data[i], result);
-    fprintf(out, ".Lx86_return%u:\n\tleave\n\tret\n\t.size %s, .-%s\n",
+    fprintf(out, ".Lreturn%u:\n\tleave\n\tret\n\t.size %s, .-%s\n",
             id, s->assembly, s->assembly);
 }
 
@@ -884,8 +884,8 @@ bool emit_x86_64(Context *c, FILE *out)
             emit_static_data(c, out, s);
     }
     fputs("\t.section .rodata\n\t.p2align 3\n"
-          ".Lx86_two63:\n\t.quad 0x43e0000000000000\n"
-          ".Lx86_two64:\n\t.quad 0x43f0000000000000\n"
+          ".Ltwo63:\n\t.quad 0x43e0000000000000\n"
+          ".Ltwo64:\n\t.quad 0x43f0000000000000\n"
           "\t.section .note.GNU-stack,\"\",@progbits\n", out);
     return !c->failed && !ferror(out);
 }

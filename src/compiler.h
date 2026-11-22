@@ -73,7 +73,7 @@ struct Type {
 };
 
 typedef struct {
-    const char *arch;
+    const char *arch, *display_name;
     bool (*emit)(Context *, FILE *);
     unsigned char_size, short_size, int_size, long_size, long_long_size, pointer_size;
     unsigned long_double_size;

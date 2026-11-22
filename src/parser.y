@@ -637,8 +637,8 @@ static int attributes(Context *c, Loc loc)
         if (equal(name, "packed"))
             packed = true;
         else if (equal(name, "stdcall"))
-            fprintf(stderr, "%s:%u:%u: warning: stdcall is ignored on AArch64\n",
-                    attr.loc.file, attr.loc.line, attr.loc.column);
+            fprintf(stderr, "%s:%u:%u: warning: stdcall is ignored on %s\n",
+                    attr.loc.file, attr.loc.line, attr.loc.column, c->target->display_name);
         else if (!equal(name, "noinline") && !equal(name, "used")) {
             error(c, attr.loc, "unsupported attribute '%s'", attr.text);
             return YYerror;

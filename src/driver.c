@@ -79,7 +79,7 @@ static void parse_options(Driver *d, int argc, char **argv)
             d->stopped = true;
             return;
         } else if (equal(arg, "--version")) {
-            printf("mcc 0.1 (%s Linux)\n", c->target == &aarch64_linux ? "AArch64" : "x86-64");
+            printf("mcc 0.1 (%s Linux)\n", c->target->display_name);
             d->stopped = true;
             return;
         } else if (starts(arg, "--target=")) {

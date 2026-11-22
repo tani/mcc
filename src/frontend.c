@@ -539,25 +539,25 @@ void setup_types(Context *c)
 {
     enter_scope(c);
     Members fields = {0};
-    bool x86 = c->target == &x86_64_linux;
+    bool array_va_list = c->target == &x86_64_linux;
     Type *p = pointer(c, type(c, TY_VOID, 0, 1));
-    Type *i = type_int(c, 3, x86);
-    Member field[] = {
+    Type *offset_type = type_int(c, 3, array_va_list);
+    const Member aarch64_fields[] = {
         {.name="__stack",.type=p}, {.name="__gr_top",.type=p}, {.name="__vr_top",.type=p},
-        {.name="__gr_offs",.type=i}, {.name="__vr_offs",.type=i}
+        {.name="__gr_offs",.type=offset_type}, {.name="__vr_offs",.type=offset_type}
     };
-    Member x86_field[] = {
-        {.name="gp_offset",.type=i}, {.name="fp_offset",.type=i},
+    const Member x86_64_fields[] = {
+        {.name="gp_offset",.type=offset_type}, {.name="fp_offset",.type=offset_type},
         {.name="overflow_arg_area",.type=p}, {.name="reg_save_area",.type=p}
     };
-    const Member *members = x86 ? x86_field : field;
-    size_t count = x86 ? sizeof x86_field / sizeof *x86_field : sizeof field / sizeof *field;
+    const Member *members = array_va_list ? x86_64_fields : aarch64_fields;
+    size_t count = array_va_list ? sizeof x86_64_fields / sizeof *x86_64_fields :
+                                   sizeof aarch64_fields / sizeof *aarch64_fields;
     for (size_t n = 0; n < count; n++)
         PUSH(c, fields, members[n]);
-    Type *va = record_type(c, false, NULL, &fields, (Loc){0});
-    c->va_list_type = va;
-    Type *alias = x86 ? array(c, va, 1, true, (Loc){0}) : va;
-    Symbol *s = symbol(c, "__builtin_va_list", alias, (Loc){0});
+    Type *va_record = record_type(c, false, NULL, &fields, (Loc){0});
+    c->va_list_type = array_va_list ? array(c, va_record, 1, true, (Loc){0}) : va_record;
+    Symbol *s = symbol(c, "__builtin_va_list", c->va_list_type, (Loc){0});
     s->is_typedef = true;
     PUSH(c, c->scope->names, s);
     Type *expect = type(c, TY_FUNC, 0, 1);
@@ -1183,11 +1183,12 @@ Node *conditional(Context *c, Node *test, Node *yes, Node *no, Loc loc)
 
 static Node *va_object(Context *c, Node *n)
 {
-    if (c->target == &x86_64_linux) {
+    Type *list_type = c->va_list_type;
+    if (list_type->kind == TY_ARRAY) {
         if ((n->type->kind == TY_ARRAY || n->type->kind == TY_PTR) &&
-            same_type(n->type->base, c->va_list_type))
+            same_type(n->type->base, list_type->base))
             return unary(c, '*', decay(c, n), n->loc);
-    } else if (lvalue(n) && same_type(n->type, c->va_list_type)) {
+    } else if (lvalue(n) && same_type(n->type, list_type)) {
         return n;
     }
     return NULL;
