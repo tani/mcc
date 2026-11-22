@@ -10,18 +10,19 @@ struct AsmSymbol {
     const char *name;
     unsigned section;
     size_t offset, size;
-    unsigned type;
+    unsigned type, visibility;
     uint32_t index;
     bool global;
 };
 
 static const SectionKind *section_kind(unsigned index)
 {
-    static const SectionKind tls[] = {
+    static const SectionKind extra[] = {
         {".tdata", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS},
         {".tbss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS},
+        {".fini_array", SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE},
     };
-    return index < SECTION_COUNT ? &elf_sections[index] : &tls[index - SECTION_COUNT];
+    return index < SECTION_COUNT ? &elf_sections[index] : &extra[index - SECTION_COUNT];
 }
 
 char *mas_trim(char *text)
@@ -228,12 +229,15 @@ static bool string_literal(Assembler *a, const char *text)
 
 static bool symbol_directive(Assembler *a, const char *op, AsmArgs *args)
 {
-    if (equal(op, ".global") || equal(op, ".globl")) {
+    if (!equal(op, ".type") && !equal(op, ".size")) {
         for (size_t i = 0; i < args->len; i++) {
             AsmSymbol *s = symbol(a, args->data[i]);
             if (!s)
                 return false;
-            s->global = true;
+            if (equal(op, ".hidden"))
+                s->visibility = STV_HIDDEN;
+            else
+                s->global = true;
         }
         return args->len != 0;
     }
@@ -294,8 +298,9 @@ static bool directive(Assembler *a, const char *op, AsmArgs *args)
             if (!equal(name, kind->name))
                 continue;
             const char *flags = i == SECTION_TEXT ? "\"ax\"" : i == SECTION_RODATA ? "\"a\"" :
-                                i >= SECTION_TDATA ? "\"awT\"" : "\"aw\"";
-            const char *type = kind->type == SHT_NOBITS ? "nobits" : "progbits";
+                                kind->flags & SHF_TLS ? "\"awT\"" : "\"aw\"";
+            const char *type = kind->type == SHT_NOBITS ? "nobits" :
+                               kind->type == SHT_FINI_ARRAY ? "fini_array" : "progbits";
             if (args->len > 3 || (args->len > 1 && !equal(args->data[1], flags)) ||
                 (args->len == 3 && ((*args->data[2] != '%' && *args->data[2] != '@') ||
                                    !equal(args->data[2] + 1, type))))
@@ -319,7 +324,8 @@ static bool directive(Assembler *a, const char *op, AsmArgs *args)
         mas_relocate(a, R_AARCH64_TLSDESC_CALL, target);
         return true;
     }
-    if (equal(op, ".global") || equal(op, ".globl") || equal(op, ".type") || equal(op, ".size"))
+    if (equal(op, ".global") || equal(op, ".globl") || equal(op, ".hidden") ||
+        equal(op, ".type") || equal(op, ".size"))
         return symbol_directive(a, op, args);
     if (equal(op, ".byte"))
         return data_directive(a, args, 1);
@@ -471,9 +477,10 @@ static bool build_object(Assembler *a, ElfOptions *options)
             unsigned actual = s->global || !s->section ? STB_GLOBAL : STB_LOCAL;
             if (actual != binding)
                 continue;
-            unsigned type = s->section >= SECTION_TDATA ? STT_TLS : s->type;
+            unsigned type = section_kind(s->section)->flags & SHF_TLS ? STT_TLS : s->type;
             Elf64_Sym entry = {.st_name = bytes_string(c, &strings, s->name), .st_shndx = section_index[s->section],
                                .st_info = (unsigned char)ELF64_ST_INFO(actual, type),
+                               .st_other = (unsigned char)s->visibility,
                                .st_value = s->offset, .st_size = s->size};
             s->index = index++;
             bytes_add(c, &symbols, &entry, sizeof entry);

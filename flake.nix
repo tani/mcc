@@ -14,7 +14,6 @@
           MCC_SYSTEM_INCLUDE = "${nixpkgs.lib.getDev pkgs.glibc}/include";
           MCC_SYSTEM_LIB = "${pkgs.glibc}/lib";
           MCC_STATIC_LIB = "${pkgs.glibc.static}/lib";
-          MCC_RUNTIME_LIB = "${pkgs.gcc.cc}/lib/gcc/${pkgs.stdenv.hostPlatform.config}/${pkgs.gcc.cc.version}";
           NIX_LDFLAGS = "-L${pkgs.glibc}/lib -L${pkgs.glibc.static}/lib";
         };
       });

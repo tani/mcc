@@ -317,9 +317,13 @@ static Input *read_input(Reader *r, const char *path, bool searched, bool as_nee
         error(c, (Loc){0}, "%s: linker scripts nested too deeply", path);
         return input;
     }
-    if (!read_file(c, path, &input->file))
+    if (!ld_runtime(c, r->options->elf.machine, path, &input->file)) {
+        if (!read_file(c, path, &input->file))
+            return input;
+        PUSH(c, r->files, path);
+    }
+    if (c->failed)
         return input;
-    PUSH(c, r->files, path);
     Bytes file = input->file;
     if (file.len >= SELFMAG && !memcmp(file.data, ELFMAG, SELFMAG)) {
         Elf64_Ehdr h = {0};

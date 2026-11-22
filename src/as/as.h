@@ -19,7 +19,7 @@ typedef struct {
     bool present;
 } AsmSection;
 
-enum { SECTION_TDATA = SECTION_COUNT, SECTION_TBSS, ASM_SECTION_COUNT };
+enum { SECTION_TDATA = SECTION_COUNT, SECTION_TBSS, SECTION_FINI_ARRAY, ASM_SECTION_COUNT };
 
 typedef struct {
     Context *context;

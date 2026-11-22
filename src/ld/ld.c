@@ -427,6 +427,29 @@ void ld_take_shared(Linker *l, const char *path, const char *link_name, Bytes fi
     }
 }
 
+static size_t frame_records(const unsigned char *data, size_t size)
+{
+    size_t offset = 0;
+    while (size - offset >= 4) {
+        uint32_t length;
+        memcpy(&length, data + offset, sizeof length);
+        if (!length)
+            return offset;
+        unsigned header = 4;
+        uint64_t content = length;
+        if (length == UINT32_MAX) {
+            header = 12;
+            if (size - offset < header)
+                break;
+            memcpy(&content, data + offset + 4, sizeof content);
+        }
+        if (content > size - offset - header)
+            break;
+        offset += header + (size_t)content;
+    }
+    return size;
+}
+
 static void place_sections(Linker *l, Object *obj)
 {
     for (size_t i = 1; i < obj->header.e_shnum && !l->context->failed; i++) {
@@ -473,12 +496,17 @@ static void place_sections(Linker *l, Object *obj)
             error(l->context, (Loc){0}, "%s: unsupported section size or alignment", obj->path);
             return;
         }
-        size_t offset = align_to(out->size, (size_t)alignment);
+        size_t offset = id == OUT_EH_FRAME ? out->size : align_to(out->size, (size_t)alignment);
+        size_t size = (size_t)s->sh_size;
         if (s->sh_type != SHT_NOBITS) {
-            bytes_align(l->context, &out->contents, (size_t)alignment);
-            bytes_add(l->context, &out->contents, obj->file.data + s->sh_offset, (size_t)s->sh_size);
+            const unsigned char *data = obj->file.data + s->sh_offset;
+            if (id == OUT_EH_FRAME)
+                size = frame_records(data, size);
+            else
+                bytes_align(l->context, &out->contents, (size_t)alignment);
+            bytes_add(l->context, &out->contents, data, size);
         }
-        out->size = offset + (size_t)s->sh_size;
+        out->size = offset + size;
         if (alignment > out->alignment)
             out->alignment = (size_t)alignment;
         obj->locations[i] = (Placement){id, offset};

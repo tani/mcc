@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include "ld.h"
 
-#include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -25,36 +24,6 @@ static const char *find_libc(Context *c, const char *root, const char *triple, b
     return NULL;
 }
 
-static const char *runtime_directory(Context *c, const char *root, const char *triple)
-{
-    const char *configured = getenv("MCC_RUNTIME_LIB");
-    if (configured && *configured)
-        return configured;
-    const char *layouts[] = {"gcc", "gcc-cross"};
-    for (size_t i = 0; i < sizeof layouts / sizeof *layouts; i++) {
-        const char *base = format(c, "%s/usr/lib/%s/%s", root, layouts[i], triple);
-        DIR *versions = opendir(base);
-        if (!versions)
-            continue;
-        const char *best = NULL, *path = NULL;
-        struct dirent *entry;
-        while ((entry = readdir(versions))) {
-            const char *name = entry->d_name;
-            if (*name < '0' || *name > '9' || (best && strverscmp(name, best) <= 0))
-                continue;
-            const char *candidate = format(c, "%s/%s", base, name);
-            if (access(format(c, "%s/libgcc.a", candidate), R_OK) == 0) {
-                best = copy(c, name, strlen(name));
-                path = candidate;
-            }
-        }
-        closedir(versions);
-        if (path)
-            return path;
-    }
-    return NULL;
-}
-
 static const char *interpreter(Context *c, uint16_t machine, const char *libc, const char *root)
 {
     const char *path = machine == EM_AARCH64 ? "/lib/ld-linux-aarch64.so.1" : "/lib64/ld-linux-x86-64.so.2";
@@ -64,15 +33,6 @@ static const char *interpreter(Context *c, uint16_t machine, const char *libc, c
             return candidate;
     }
     return path;
-}
-
-static void add_runtime_file(Context *c, Strings *inputs, const char *directory, const char *name)
-{
-    if (directory) {
-        const char *file = format(c, "%s/%s", directory, name);
-        if (access(file, R_OK) == 0)
-            PUSH(c, *inputs, file);
-    }
 }
 
 static bool link_mode(const char *arg, const char *name)
@@ -165,7 +125,6 @@ bool mld_link(Context *c, Strings args)
     const char *libc = find_libc(c, root, triple, native);
     if (!libc)
         return false;
-    const char *runtime = runtime_directory(c, root, triple);
     options.root = root;
     options.pie &= !static_link;
     if (!static_link && !options.shared)
@@ -176,8 +135,6 @@ bool mld_link(Context *c, Strings args)
     const char *static_dir = getenv("MCC_STATIC_LIB");
     if (static_dir && *static_dir)
         PUSH(c, options.libraries, static_dir);
-    if (runtime)
-        PUSH(c, options.libraries, runtime);
 
     Strings *files = &options.elf.inputs;
     if (static_link)
@@ -185,21 +142,14 @@ bool mld_link(Context *c, Strings args)
     if (!options.shared)
         PUSH(c, *files, format(c, "%s/%s", libc, options.pie ? "Scrt1.o" : "crt1.o"));
     PUSH(c, *files, format(c, "%s/crti.o", libc));
-    bool pic = options.shared || options.pie;
-    add_runtime_file(c, files, runtime, pic ? "crtbeginS.o" : static_link ? "crtbeginT.o" : "crtbegin.o");
+    PUSH(c, *files, options.shared ? mcc_shared_crt : mcc_executable_crt);
     for (size_t i = 0; i < inputs.len; i++)
         PUSH(c, *files, inputs.data[i]);
     PUSH(c, *files, "--start-group");
-    add_runtime_file(c, files, runtime, "libgcc.a");
-    if (static_link) {
-        PUSH(c, *files, "-Bstatic");
-        add_runtime_file(c, files, runtime, "libgcc_eh.a");
-    } else {
-        PUSH(c, *files, "-Bdynamic");
-    }
+    PUSH(c, *files, static_link ? "-Bstatic" : "-Bdynamic");
+    PUSH(c, *files, mcc_runtime_archive);
     PUSH(c, *files, "-lc");
     PUSH(c, *files, "--end-group");
-    add_runtime_file(c, files, runtime, pic ? "crtendS.o" : "crtend.o");
     PUSH(c, *files, format(c, "%s/crtn.o", libc));
     return link_elf(c, &options);
 }

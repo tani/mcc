@@ -14,6 +14,8 @@ typedef struct Linker Linker;
 typedef enum { PATCH_OK, PATCH_UNSUPPORTED, PATCH_RANGE, PATCH_TRUNCATED } PatchResult;
 
 bool mld_link(Context *, Strings args);
+extern const char mcc_executable_crt[], mcc_shared_crt[], mcc_runtime_archive[];
+bool ld_runtime(Context *, uint16_t machine, const char *path, Bytes *);
 bool link_elf(Context *, LinkOptions *);
 bool ld_inputs(Context *, Linker *, LinkOptions *);
 void ld_take_object(Linker *, const char *, Bytes);
