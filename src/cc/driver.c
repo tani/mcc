@@ -1,8 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
-#include "compiler.h"
+#include "as/as.h"
+#include "ld/ld.h"
 
 #include <errno.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -25,7 +25,7 @@ static void usage(FILE *out)
           "       -I DIR, -isystem DIR, -D MACRO[=VALUE], -U MACRO\n"
           "       -static, -shared, -nostdlib, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
           "       --target=aarch64-linux-gnu or --target=x86_64-linux-gnu\n"
-          "       Uses mas and mld. Hosted links use the target's glibc.\n", out);
+          "       Includes mas and mld. Hosted links use the target's glibc.\n", out);
 }
 
 static const Target *native_target(void)
@@ -124,23 +124,6 @@ static void parse_options(Driver *d, int argc, char **argv)
         error(c, (Loc){0}, "cannot use -o with multiple inputs in this mode");
     if (d->output && equal(d->output, "-") && d->mode != PREPROCESS && d->mode != ASSEMBLY)
         error(c, (Loc){0}, "stdout output requires -E or -S");
-}
-
-static const char *companion(Context *c, const char *program)
-{
-    char path[PATH_MAX];
-    ssize_t length = readlink("/proc/self/exe", path, sizeof path - 1);
-    if (length > 0 && (size_t)length < sizeof path - 1) {
-        path[length] = 0;
-        char *base = strrchr(path, '/');
-        if (base) {
-            *base = 0;
-            const char *sibling = format(c, "%s/%s", path, program);
-            if (access(sibling, X_OK) == 0)
-                return sibling;
-        }
-    }
-    return program;
 }
 
 static const char *temporary(Driver *d, const char *ext)
@@ -288,14 +271,12 @@ static bool from_source(Driver *d, const char *path, const char *output)
 
 static bool assemble(Driver *d, const char *input, const char *obj)
 {
-    Context *c = &d->options;
-    Strings cmd = {0};
-    PUSH(c, cmd, companion(c, "mas"));
-    PUSH(c, cmd, format(c, "--target=%s-linux-gnu", c->target->arch));
-    PUSH(c, cmd, "-o");
-    PUSH(c, cmd, obj);
-    PUSH(c, cmd, input[0] == '-' ? format(c, "./%s", input) : input);
-    return run_command(c, cmd);
+    Context c = {.program = "mas"};
+    ElfOptions options = {.output = obj, .machine = elf_machine(format(&c, "%s-linux-gnu", d->options.target->arch))};
+    PUSH(&c, options.inputs, input);
+    bool ok = mas_assemble(&c, &options);
+    release(&c);
+    return ok;
 }
 
 static const char *input_output(Driver *d, Strings *destinations, const char *input, const char *ext)
@@ -310,41 +291,40 @@ static const char *input_output(Driver *d, Strings *destinations, const char *in
     return dest;
 }
 
-static void link_argument(Context *c, Strings *command, const char *arg)
+static void link_argument(Context *c, Strings *args, const char *arg)
 {
     if (!starts(arg, "-Wl,")) {
-        PUSH(c, *command, arg);
+        PUSH(c, *args, arg);
         return;
     }
     for (const char *part = arg + 4;;) {
         const char *comma = strchr(part, ',');
         if (!comma) {
-            PUSH(c, *command, part);
+            PUSH(c, *args, part);
             break;
         }
-        PUSH(c, *command, copy(c, part, (size_t)(comma - part)));
+        PUSH(c, *args, copy(c, part, (size_t)(comma - part)));
         part = comma + 1;
     }
 }
 
 static bool link_objects(Driver *d, Strings objects)
 {
-    Context *c = &d->options;
     const char *dest = d->output ? d->output : "a.out";
     const char *output = stage(d, dest);
     if (!output)
         return false;
-    Strings cmd = {0};
-    PUSH(c, cmd, companion(c, "mld"));
-    if (!d->freestanding)
-        PUSH(c, cmd, "--hosted");
-    PUSH(c, cmd, format(c, "--target=%s-linux-gnu", c->target->arch));
-    PUSH(c, cmd, "-o");
-    PUSH(c, cmd, output[0] == '-' ? format(c, "./%s", output) : output);
+    Context c = {.program = "mld"};
+    Strings args = {0};
+    PUSH(&c, args, format(&c, "--target=%s-linux-gnu", d->options.target->arch));
+    PUSH(&c, args, "-o");
+    PUSH(&c, args, output);
     size_t next = 0;
     for (size_t i = 0; i < d->link_args.len; i++)
-        link_argument(c, &cmd, d->link_args.data[i] ? d->link_args.data[i] : objects.data[next++]);
-    return run_command(c, cmd) && publish(d, output, dest);
+        link_argument(&c, &args, d->link_args.data[i] ? d->link_args.data[i] : objects.data[next++]);
+    bool ok = mld_link(&c, args, !d->freestanding);
+    release(&c);
+    return ok && publish(d, output, dest);
 }
 
 static bool run_driver(Driver *d)

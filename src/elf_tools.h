@@ -24,7 +24,7 @@ typedef struct {
     bool stopped;
 } ElfOptions;
 
-ElfOptions elf_options(Context *, int argc, char **argv, bool linker);
+ElfOptions elf_options(Context *, Strings args, bool linker);
 uint16_t elf_machine(const char *target);
 Elf64_Ehdr elf_header(uint16_t machine, uint16_t type);
 void bytes_add(Context *, Bytes *, const void *, size_t);

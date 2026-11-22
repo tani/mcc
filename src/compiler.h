@@ -185,7 +185,6 @@ void error(Context *, Loc, const char *, ...);
 void extension(Context *, Loc, const char *);
 size_t align_to(size_t, size_t);
 bool equal(const char *, const char *);
-bool run_command(Context *, Strings);
 
 bool scan(Context *, const char *, const char *, size_t, Tokens *);
 bool preprocess(Context *, const char *, FILE *, Tokens *);

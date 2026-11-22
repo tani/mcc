@@ -30,6 +30,7 @@ typedef struct {
     VECTOR(AsmSymbol *) symbols;
 } Assembler;
 
+bool mas_assemble(Context *, ElfOptions *);
 char *mas_trim(char *);
 bool mas_integer(const char *, uint64_t *);
 bool mas_expression(Assembler *, char *, AsmExpr *);

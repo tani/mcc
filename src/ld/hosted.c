@@ -80,24 +80,24 @@ static bool link_mode(const char *arg, const char *name)
     return arg[0] == '-' && equal(arg + (arg[1] == '-' ? 2 : 1), name);
 }
 
-static const char *next_value(Context *c, int argc, char **argv, int *i, const char *value)
+static const char *next_value(Context *c, Strings args, size_t *i, const char *value)
 {
-    const char *arg = argv[*i];
-    if (!*value && *i + 1 < argc)
-        value = argv[++*i];
+    const char *arg = args.data[*i];
+    if (!*value && *i + 1 < args.len)
+        value = args.data[++*i];
     if (!*value)
         error(c, (Loc){0}, "'%s' requires a value", arg);
     return value;
 }
 
-bool hosted_link(Context *c, int argc, char **argv)
+bool hosted_link(Context *c, Strings args)
 {
     LinkOptions options = {.elf = {.output = "a.out", .entry = "_start", .machine = elf_machine(NULL)},
                            .hosted = true, .pie = true};
     Strings inputs = {0};
     bool static_link = false, flags = true;
-    for (int i = 0; i < argc && !c->failed; i++) {
-        const char *arg = argv[i];
+    for (size_t i = 0; i < args.len && !c->failed; i++) {
+        const char *arg = args.data[i];
         if (!flags && arg[0] == '-' && arg[1]) {
             PUSH(c, inputs, format(c, "./%s", arg));
         } else if (!flags || arg[0] != '-' || !arg[1]) {
@@ -115,11 +115,11 @@ bool hosted_link(Context *c, int argc, char **argv)
         } else if (equal(arg, "-E") || equal(arg, "--export-dynamic")) {
             options.export_all = true;
         } else if (!strncmp(arg, "--entry=", 8)) {
-            options.elf.entry = next_value(c, argc, argv, &i, arg + 8);
+            options.elf.entry = next_value(c, args, &i, arg + 8);
         } else if (equal(arg, "-e") || equal(arg, "--entry")) {
-            options.elf.entry = next_value(c, argc, argv, &i, "");
+            options.elf.entry = next_value(c, args, &i, "");
         } else if (arg[1] == 'L' || arg[1] == 'o' || arg[1] == 'l') {
-            const char *value = next_value(c, argc, argv, &i, arg + 2);
+            const char *value = next_value(c, args, &i, arg + 2);
             if (arg[1] == 'o') {
                 options.elf.output = value;
             } else if (arg[1] == 'L') {
@@ -129,14 +129,14 @@ bool hosted_link(Context *c, int argc, char **argv)
             }
         } else if (link_mode(arg, "rpath") || !strncmp(arg, "--rpath=", 8) || !strncmp(arg, "-rpath=", 7)) {
             const char *assignment = strchr(arg, '=');
-            const char *value = next_value(c, argc, argv, &i, assignment ? assignment + 1 : "");
+            const char *value = next_value(c, args, &i, assignment ? assignment + 1 : "");
             PUSH(c, options.runpaths, value);
         } else if (link_mode(arg, "soname") || equal(arg, "-h") || !strncmp(arg, "--soname=", 9)) {
-            options.soname = next_value(c, argc, argv, &i, !strncmp(arg, "--soname=", 9) ? arg + 9 : "");
+            options.soname = next_value(c, args, &i, !strncmp(arg, "--soname=", 9) ? arg + 9 : "");
         } else if (equal(arg, "-pthread")) {
             PUSH(c, inputs, "-lpthread");
         } else if (equal(arg, "-z")) {
-            const char *value = next_value(c, argc, argv, &i, "");
+            const char *value = next_value(c, args, &i, "");
             if (!c->failed && !equal(value, "relro") && !equal(value, "now") &&
                 !equal(value, "noexecstack") && !equal(value, "separate-code"))
                 error(c, (Loc){0}, "unsupported hosted link option '-z %s'", value);

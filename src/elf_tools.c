@@ -32,14 +32,14 @@ uint16_t elf_machine(const char *target)
 #endif
 }
 
-ElfOptions elf_options(Context *c, int argc, char **argv, bool linker)
+ElfOptions elf_options(Context *c, Strings args, bool linker)
 {
     ElfOptions options = {.output = linker ? "a.out" : "a.o", .entry = "_start",
                           .machine = elf_machine(NULL)};
     const char *tool = linker ? "mld" : "mas";
     bool flags = true;
-    for (int i = 1; i < argc && !c->failed; i++) {
-        const char *arg = argv[i];
+    for (size_t i = 0; i < args.len && !c->failed; i++) {
+        const char *arg = args.data[i];
         if (!flags || arg[0] != '-' || equal(arg, "-")) {
             PUSH(c, options.inputs, arg);
         } else if (equal(arg, "--")) {
@@ -66,7 +66,7 @@ ElfOptions elf_options(Context *c, int argc, char **argv, bool linker)
             else
                 options.entry = arg + 8;
         } else if (arg[1] == 'o' || (linker && arg[1] == 'e')) {
-            const char *value = arg[2] ? arg + 2 : i + 1 < argc ? argv[++i] : "";
+            const char *value = arg[2] ? arg + 2 : i + 1 < args.len ? args.data[++i] : "";
             if (!*value)
                 error(c, (Loc){0}, "'%s' requires a value", arg);
             else if (arg[1] == 'o')

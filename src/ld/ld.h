@@ -13,7 +13,8 @@ typedef struct {
 typedef struct Linker Linker;
 typedef enum { PATCH_OK, PATCH_UNSUPPORTED, PATCH_RANGE, PATCH_TRUNCATED } PatchResult;
 
-bool hosted_link(Context *, int argc, char **argv);
+bool mld_link(Context *, Strings args, bool hosted);
+bool hosted_link(Context *, Strings args);
 bool link_elf(Context *, LinkOptions *);
 bool ld_inputs(Context *, Linker *, LinkOptions *);
 void ld_take_object(Linker *, const char *, Bytes);

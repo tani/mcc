@@ -2,11 +2,10 @@ BUILD := build
 PROGRAM := $(BUILD)/mcc
 ASSEMBLER := $(BUILD)/mas
 LINKER := $(BUILD)/mld
-CC_OBJECTS := $(addprefix $(BUILD)/,cc/driver.o cc/process.o core.o cc/cpp.o cc/frontend.o cc/ir.o \
-	cc/data.o cc/cc_aarch64.o cc/cc_x86_64.o cc/parser.o cc/scanner.o)
+CC_OBJECTS := $(addprefix $(BUILD)/cc/,driver.o cpp.o frontend.o ir.o data.o aarch64.o x86_64.o parser.o scanner.o)
 ELF_COMMON := $(addprefix $(BUILD)/,elf_tools.o core.o)
-AS_OBJECTS := $(addprefix $(BUILD)/as/,as.o as_aarch64.o as_x86_64.o) $(ELF_COMMON)
-LD_OBJECTS := $(addprefix $(BUILD)/ld/,ld.o ld_hosted.o ld_input.o ld_reloc.o) $(ELF_COMMON)
+AS_OBJECTS := $(addprefix $(BUILD)/as/,as.o aarch64.o x86_64.o)
+LD_OBJECTS := $(addprefix $(BUILD)/ld/,ld.o hosted.o input.o reloc.o)
 WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wformat=2 -Wformat-overflow=2 -Wformat-truncation=2 -Wformat-signedness \
 	-Wconversion -Wsign-conversion -Wcast-qual -Wcast-align=strict -Wcast-function-type \
@@ -42,9 +41,10 @@ $(BUILD)/%.o: src/%.c src/compiler.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -Isrc -I$(BUILD)/cc -c -o $@ $<
 
 $(BUILD)/cc/driver.o: override CPPFLAGS += -DMCC_BUILTIN_INCLUDE='"$(CURDIR)/include"'
-$(addprefix $(BUILD)/cc/,frontend.o ir.o cc_aarch64.o cc_x86_64.o): $(BUILD)/cc/parser.h
-$(filter $(BUILD)/as/%,$(AS_OBJECTS)): src/as/as.h src/elf_tools.h
-$(filter $(BUILD)/ld/%,$(LD_OBJECTS)): src/ld/ld.h src/elf_tools.h
+$(BUILD)/cc/driver.o: src/as/as.h src/ld/ld.h src/elf_tools.h
+$(addprefix $(BUILD)/cc/,frontend.o ir.o aarch64.o x86_64.o): $(BUILD)/cc/parser.h
+$(BUILD)/as/main.o $(AS_OBJECTS): src/as/as.h src/elf_tools.h
+$(BUILD)/ld/main.o $(LD_OBJECTS): src/ld/ld.h src/elf_tools.h
 $(BUILD)/elf_tools.o: src/elf_tools.h
 
 $(BUILD)/cc/%.o: $(BUILD)/cc/%.c src/compiler.h
@@ -52,13 +52,13 @@ $(BUILD)/cc/%.o: $(BUILD)/cc/%.c src/compiler.h
 
 $(BUILD)/cc/parser.o: GENERATED_WARN = $(PARSER_WARN)
 
-$(PROGRAM): $(CC_OBJECTS) | $(ASSEMBLER) $(LINKER)
-	$(CC) $(LDFLAGS) -o $@ $(CC_OBJECTS) $(LDLIBS)
-
-$(ASSEMBLER): $(AS_OBJECTS)
+$(PROGRAM): $(CC_OBJECTS) $(AS_OBJECTS) $(LD_OBJECTS) $(ELF_COMMON)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(LINKER): $(LD_OBJECTS)
+$(ASSEMBLER): $(BUILD)/as/main.o $(AS_OBJECTS) $(ELF_COMMON)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(LINKER): $(BUILD)/ld/main.o $(LD_OBJECTS) $(ELF_COMMON)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 check: all

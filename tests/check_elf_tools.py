@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from shutil import copy2
 from struct import unpack_from
 import subprocess
 import sys
@@ -34,7 +35,7 @@ int calculate(int value) {
 
 
 def command(*args, source=None, status=0):
-    # These phases are usable with just the three project binaries.
+    # The tools can run with an empty PATH.
     result = subprocess.run(args, input=source, capture_output=True, timeout=15,
                             env={**os.environ, "PATH": ""})
     if result.returncode != status:
@@ -85,6 +86,10 @@ int main(void) { return call(); }
 
 
 def check(mcc, mas, mld, directory):
+    # Test the compiler in a directory containing only its own executable.
+    installed = directory / "standalone"
+    installed.mkdir()
+    mcc = copy2(mcc, installed / "mcc")
     version = command(mcc, "--version").stdout
     objects = {}
     for arch, (machine, name, startup) in STARTUP.items():

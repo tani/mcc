@@ -1446,16 +1446,10 @@ bool link_elf(Context *c, LinkOptions *options)
     return executable(&l, &options->elf, programs, count);
 }
 
-int main(int argc, char **argv)
+bool mld_link(Context *c, Strings args, bool hosted)
 {
-    Context c = {.program = "mld"};
-    if (argc > 1 && equal(argv[1], "--hosted")) {
-        bool ok = hosted_link(&c, argc - 2, argv + 2);
-        release(&c);
-        return ok ? 0 : 1;
-    }
-    LinkOptions options = {.elf = elf_options(&c, argc, argv, true)};
-    bool ok = !c.failed && (options.elf.stopped || link_elf(&c, &options));
-    release(&c);
-    return ok ? 0 : 1;
+    if (hosted)
+        return hosted_link(c, args);
+    LinkOptions options = {.elf = elf_options(c, args, true)};
+    return !c->failed && (options.elf.stopped || link_elf(c, &options));
 }

@@ -534,19 +534,14 @@ static bool build_object(Assembler *a, ElfOptions *options)
     return elf_write(c, options, &output, false);
 }
 
-int main(int argc, char **argv)
+bool mas_assemble(Context *c, ElfOptions *options)
 {
-    Context c = {.program = "mas"};
-    ElfOptions options = elf_options(&c, argc, argv, false);
-    Assembler assembler = {.context = &c, .machine = options.machine, .section = SECTION_TEXT};
+    Assembler assembler = {.context = c, .machine = options->machine, .section = SECTION_TEXT};
     for (unsigned i = 1; i < ASM_SECTION_COUNT; i++)
         assembler.sections[i].alignment = 1;
-    if (options.machine == EM_AARCH64)
+    if (options->machine == EM_AARCH64)
         assembler.sections[SECTION_TEXT].alignment = 4;
-    if (!options.stopped)
-        for (size_t i = 0; i < options.inputs.len && !c.failed; i++)
-            assemble_file(&assembler, options.inputs.data[i]);
-    bool ok = !c.failed && (options.stopped || build_object(&assembler, &options));
-    release(&c);
-    return ok ? 0 : 1;
+    for (size_t i = 0; i < options->inputs.len && !c->failed; i++)
+        assemble_file(&assembler, options->inputs.data[i]);
+    return !c->failed && build_object(&assembler, options);
 }

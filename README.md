@@ -1,6 +1,6 @@
 # mcc
 
-mcc is a compiler written in C11 for x86-64 and little-endian AArch64 Linux with glibc. Flex scans preprocessing tokens, mcc expands macros and includes, and Bison parses the expanded source. The front end lowers typed expressions and statements to instructions with explicit branches, calls, and memory operations. The target backend emits GNU assembly. The driver invokes mas to assemble it and mld to link it.
+mcc is a compiler written in C11 for x86-64 and little-endian AArch64 Linux with glibc. Flex scans preprocessing tokens, mcc expands macros and includes, and Bison parses the expanded source. The front end lowers typed expressions and statements to instructions with explicit branches, calls, and memory operations. The target backend emits GNU assembly. The driver calls the built-in mas assembler and mld linker in the same process.
 
 ## Build and use
 
@@ -16,7 +16,7 @@ printf '#include <stdio.h>\nint main(void) { puts("hello from mcc"); }\n' |
 
 `build/mcc` defaults to `-std=c11`. Select `-std=gnu11` for the GNU features implemented so far. Use `-E` to inspect expanded source, `-fsyntax-only` to check a translation unit, `-S` for assembly, and `-c` for an ELF object. Multiple source and object inputs can be linked together. Link options include `-static`, `-shared`, `-L`, `-l`, and `-pthread`. Use `-lm` for programs that call the math library and `-nostdlib` for a freestanding link with an entry point supplied by the program.
 
-The driver targets the architecture of the running mcc binary by default. Use `--target=x86_64-linux-gnu` or `--target=aarch64-linux-gnu` to select a target explicitly. mcc looks for mas and mld alongside its executable and on `PATH`. For hosted links, mld reads the target's startup objects and libraries and writes the ELF output itself. GCC can build mcc itself and serve as the reference compiler in the tests.
+The driver targets the architecture of the running mcc binary by default. Use `--target=x86_64-linux-gnu` or `--target=aarch64-linux-gnu` to select a target explicitly. For hosted links, mld reads the target's startup objects and libraries and writes the ELF output itself. GCC can build mcc itself and serve as the reference compiler in the tests.
 
 Set `MCC_SYSROOT` to locate a target's headers and glibc libraries under a common root. `MCC_SYSTEM_INCLUDE` and `MCC_SYSTEM_LIB` override the glibc header and library directories. Set `MCC_STATIC_LIB` when static glibc archives live in a separate directory. `MCC_RUNTIME_LIB` overrides the directory for compiler runtime objects and archives such as `libgcc.a`. Nix sets these directory overrides for its layout. Use `MCC_COMPILER_INCLUDE` to relocate mcc's own headers.
 
@@ -24,7 +24,7 @@ Cross-compilation parses and folds `long double` constants using the compiler ho
 
 ## Assembling and linking ELF objects
 
-`make` builds two companion tools, `build/mas` and `build/mld`. You can also build them with `make mas mld`. Both accept the same `--target` values as mcc and default to their native architecture.
+`make` also builds the standalone tools `build/mas` and `build/mld`. You can build them separately with `make mas mld`. Both accept the same `--target` values as mcc and default to their native architecture.
 
 - `mas [-o FILE] INPUT...` assembles GNU-style AArch64 or x86-64 AT&T syntax into an ELF64 relocatable object. It handles common instructions and directives emitted by mcc. Use `-` to read assembly from stdin. The default output is `a.o`.
 - `mld [-e SYMBOL] [-o FILE] INPUT...` resolves symbols and relocations in ELF64 objects and writes a freestanding static executable. Its default entry is `_start`, and its default output is `a.out`. Inputs can come from mas or GNU tools.
