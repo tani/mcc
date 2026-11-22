@@ -149,6 +149,7 @@ struct Symbol {
 struct Context {
     Arena *arena;
     const Target *target;
+    const char *program;
     Scope *scope;
     Macro *macros;
     SavedMacro *saved_macros;
@@ -184,6 +185,7 @@ void error(Context *, Loc, const char *, ...);
 void extension(Context *, Loc, const char *);
 size_t align_to(size_t, size_t);
 bool equal(const char *, const char *);
+bool run_command(Context *, Strings);
 
 bool scan(Context *, const char *, const char *, size_t, Tokens *);
 bool preprocess(Context *, const char *, FILE *, Tokens *);

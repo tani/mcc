@@ -1,7 +1,12 @@
 BUILD := build
 PROGRAM := $(BUILD)/mcc
-SOURCES := driver core cpp frontend ir data aarch64 x86_64
+ASSEMBLER := $(BUILD)/mas
+LINKER := $(BUILD)/mld
+SOURCES := driver process core cpp frontend ir data cc_aarch64 cc_x86_64
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES))) $(BUILD)/parser.o $(BUILD)/scanner.o
+ELF_COMMON := $(addprefix $(BUILD)/,elf_tools.o core.o)
+AS_OBJECTS := $(addprefix $(BUILD)/,as.o as_aarch64.o as_x86_64.o) $(ELF_COMMON)
+LD_OBJECTS := $(addprefix $(BUILD)/,ld.o ld_hosted.o ld_input.o ld_reloc.o) $(ELF_COMMON)
 WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wformat=2 -Wformat-overflow=2 -Wformat-truncation=2 -Wformat-signedness \
 	-Wconversion -Wsign-conversion -Wcast-qual -Wcast-align=strict -Wcast-function-type \
@@ -17,8 +22,11 @@ WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wframe-larger-than=65536 -Wstack-usage=65536
 PARSER_WARN ?= $(if $(filter -Wall,$(WARN)),-Wno-unused-but-set-variable)
 
-.PHONY: all clean check check-suite check-strict check-extended check-bootstrap check-gcc
-all: $(PROGRAM)
+.PHONY: all mas mld clean check check-suite check-strict check-extended check-bootstrap check-gcc
+all: $(PROGRAM) $(ASSEMBLER) $(LINKER)
+
+mas: $(ASSEMBLER)
+mld: $(LINKER)
 
 $(BUILD):
 	mkdir -p $@
@@ -29,21 +37,32 @@ $(BUILD)/parser.c $(BUILD)/parser.h &: src/parser.y | $(BUILD)
 $(BUILD)/scanner.c: src/scanner.l | $(BUILD)
 	flex -o $@ $<
 
-$(BUILD)/%.o: src/%.c src/compiler.h $(BUILD)/parser.h
+$(BUILD)/%.o: src/%.c src/compiler.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -Isrc -I$(BUILD) -c -o $@ $<
 
 $(BUILD)/driver.o: override CPPFLAGS += -DMCC_BUILTIN_INCLUDE='"$(CURDIR)/include"'
+$(addprefix $(BUILD)/,frontend.o ir.o cc_aarch64.o cc_x86_64.o): $(BUILD)/parser.h
+$(addprefix $(BUILD)/,as.o as_aarch64.o as_x86_64.o): src/as.h
+$(addprefix $(BUILD)/,elf_tools.o ld.o ld_hosted.o as.o as_aarch64.o as_x86_64.o): src/elf_tools.h
+$(addprefix $(BUILD)/,ld.o ld_hosted.o ld_input.o ld_reloc.o): src/ld.h src/elf_tools.h
 
 $(BUILD)/%.o: $(BUILD)/%.c src/compiler.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(GENERATED_WARN) -Isrc -I$(BUILD) -c -o $@ $<
 
 $(BUILD)/parser.o: GENERATED_WARN = $(PARSER_WARN)
 
-$(PROGRAM): $(OBJECTS)
+$(PROGRAM): $(OBJECTS) | $(ASSEMBLER) $(LINKER)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
 
-check: $(PROGRAM)
+$(ASSEMBLER): $(AS_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(LINKER): $(LD_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+check: all
 	python3 tests/check.py $(PROGRAM)
+	python3 tests/check_elf_tools.py $(PROGRAM) $(ASSEMBLER) $(LINKER)
 
 check-suite: $(PROGRAM)
 	python3 tests/check.py $(PROGRAM) --suite c-testsuite/tests/single-exec

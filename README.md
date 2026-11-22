@@ -1,6 +1,6 @@
 # mcc
 
-mcc is a compiler written in C11 for x86-64 and little-endian AArch64 Linux with glibc. Flex scans preprocessing tokens, mcc expands macros and includes, and Bison parses the expanded source. The front end lowers typed expressions and statements to instructions with explicit branches, calls, and memory operations. The target backend emits GNU assembly. GCC assembles it and links it against glibc.
+mcc is a compiler written in C11 for x86-64 and little-endian AArch64 Linux with glibc. Flex scans preprocessing tokens, mcc expands macros and includes, and Bison parses the expanded source. The front end lowers typed expressions and statements to instructions with explicit branches, calls, and memory operations. The target backend emits GNU assembly. The driver invokes mas to assemble it and mld to link it.
 
 ## Build and use
 
@@ -14,13 +14,39 @@ printf '#include <stdio.h>\nint main(void) { puts("hello from mcc"); }\n' |
 ./hello
 ```
 
-`build/mcc` defaults to `-std=c11`. Select `-std=gnu11` for the GNU features implemented so far. Use `-E` to inspect expanded source, `-fsyntax-only` to check a translation unit, `-S` for assembly, and `-c` for an ELF object. Multiple source and object inputs can be linked together. Link options include `-static`, `-shared`, `-L`, `-l`, and `-pthread`. Use `-lm` for programs that call the math library.
+`build/mcc` defaults to `-std=c11`. Select `-std=gnu11` for the GNU features implemented so far. Use `-E` to inspect expanded source, `-fsyntax-only` to check a translation unit, `-S` for assembly, and `-c` for an ELF object. Multiple source and object inputs can be linked together. Link options include `-static`, `-shared`, `-L`, `-l`, and `-pthread`. Use `-lm` for programs that call the math library and `-nostdlib` for a freestanding link with an entry point supplied by the program.
 
-The driver targets the architecture of the running mcc binary by default and uses `gcc` from `PATH`. Use `--target=x86_64-linux-gnu` or `--target=aarch64-linux-gnu` to select a target explicitly. For cross-compilation the default GCC executable is `<target>-gcc`, and the default system header directory is `/usr/<target>/include`. For example, `build/mcc --target=x86_64-linux-gnu -c hello.c` produces an x86-64 ELF object.
+The driver targets the architecture of the running mcc binary by default. Use `--target=x86_64-linux-gnu` or `--target=aarch64-linux-gnu` to select a target explicitly. mcc looks for mas and mld alongside its executable and on `PATH`. For hosted links, mld reads the target's startup objects and libraries and writes the ELF output itself. GCC can build mcc itself and serve as the reference compiler in the tests.
 
-Set `MCC_TOOLCHAIN` to select a different GCC executable, `MCC_SYSTEM_INCLUDE` to select the target's glibc headers, or `MCC_COMPILER_INCLUDE` to relocate mcc's own headers. Nix supplies the native glibc headers through `MCC_SYSTEM_INCLUDE`. If switching an existing build to another toolchain, run `make clean` once.
+Set `MCC_SYSROOT` to locate a target's headers and glibc libraries under a common root. `MCC_SYSTEM_INCLUDE` and `MCC_SYSTEM_LIB` override the glibc header and library directories. Set `MCC_STATIC_LIB` when static glibc archives live in a separate directory. `MCC_RUNTIME_LIB` overrides the directory for compiler runtime objects and archives such as `libgcc.a`. Nix sets these directory overrides for its layout. Use `MCC_COMPILER_INCLUDE` to relocate mcc's own headers.
 
 Cross-compilation parses and folds `long double` constants using the compiler host's `long double` format before encoding them for the target.
+
+## Assembling and linking ELF objects
+
+`make` builds two companion tools, `build/mas` and `build/mld`. You can also build them with `make mas mld`. Both accept the same `--target` values as mcc and default to their native architecture.
+
+- `mas [-o FILE] INPUT...` assembles GNU-style AArch64 or x86-64 AT&T syntax into an ELF64 relocatable object. It handles common instructions and directives emitted by mcc. Use `-` to read assembly from stdin. The default output is `a.o`.
+- `mld [-e SYMBOL] [-o FILE] INPUT...` resolves symbols and relocations in ELF64 objects and writes a freestanding static executable. Its default entry is `_start`, and its default output is `a.out`. Inputs can come from mas or GNU tools.
+- `mld --hosted [--target=TARGET] [OPTIONS] INPUT...` links with glibc. It supports PIE by default, `-no-pie`, `-static`, `-shared`, `-L`, `-l`, `-pthread`, `-rpath`, and `-soname`. It reads indexed GNU archives and the `INPUT`, `GROUP`, `AS_NEEDED`, and `OUTPUT_FORMAT` directives used by glibc library scripts.
+
+For example, these commands build a freestanding x86-64 executable that exits with status 42.
+
+```sh
+printf 'int twice(int x) { return 2 * x; }\n' |
+  build/mcc --target=x86_64-linux-gnu -S -o twice.s -
+build/mas --target=x86_64-linux-gnu -o twice.o twice.s
+build/mas --target=x86_64-linux-gnu -o start.o - <<'ASM'
+.global _start
+_start:
+    movl $21, %edi
+    call twice
+    movl %eax, %edi
+    movl $60, %eax
+    syscall
+ASM
+build/mld --target=x86_64-linux-gnu -o twice start.o twice.o
+```
 
 ## Validation
 
@@ -32,7 +58,7 @@ make check-extended
 make check-bootstrap
 ```
 
-`check` exercises the driver, preprocessor, native code generation, and interoperability with GCC. The `check-strict` and `check-suite` targets run the cloned `c-testsuite`. The pinned glibc GCC reference passes 212 cases with `-std=c11 -pedantic-errors` and 220 with `-std=gnu11`.
+`check` exercises the driver, preprocessor, native code generation, interoperability with GCC, and the mcc–mas–mld pipeline. The `check-strict` and `check-suite` targets run the cloned `c-testsuite`. The pinned glibc GCC reference passes 212 cases with `-std=c11 -pedantic-errors` and 220 with `-std=gnu11`.
 
 `check-extended` compares C11 pointer constraints and execution tests with glibc GCC. It checks required diagnostics, result types, and generated code. `check-bootstrap` builds mcc with GCC, rebuilds it twice in strict C11 mode, compares the self-hosted binaries byte for byte, and runs the tests with the final compiler. Both targets use temporary build or test directories and exit nonzero on failure.
 

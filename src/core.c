@@ -20,7 +20,7 @@ void *alloc(Context *c, size_t bytes)
             abort();
         block = calloc(1, sizeof *block + capacity);
         if (!block) {
-            fputs("mcc: out of memory\n", stderr);
+            fprintf(stderr, "%s: out of memory\n", c->program ? c->program : "mcc");
             exit(1);
         }
         block->capacity = capacity;
@@ -83,7 +83,7 @@ void error(Context *c, Loc loc, const char *fmt, ...)
     if (loc.file)
         fprintf(stderr, "%s:%u:%u: error: ", loc.file, loc.line, loc.column);
     else
-        fputs("mcc: error: ", stderr);
+        fprintf(stderr, "%s: error: ", c->program ? c->program : "mcc");
     va_list args;
     va_start(args, fmt);
     vfprintf(stderr, fmt, args);

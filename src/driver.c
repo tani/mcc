@@ -2,15 +2,11 @@
 #include "compiler.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <spawn.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
-
-extern char **environ;
 
 typedef enum { LINK, ASSEMBLE, ASSEMBLY, PREPROCESS, CHECK } Mode;
 
@@ -18,8 +14,8 @@ typedef struct {
     Context options;
     Mode mode;
     Strings inputs, link_args, scratch;
-    const char *output, *directory, *toolchain;
-    bool stopped;
+    const char *output, *directory;
+    bool stopped, freestanding;
     unsigned serial;
 } Driver;
 
@@ -27,9 +23,9 @@ static void usage(FILE *out)
 {
     fputs("Usage: mcc [-std=c11|-std=gnu11] [-E|-fsyntax-only|-S|-c] [-o FILE] INPUT...\n"
           "       -I DIR, -isystem DIR, -D MACRO[=VALUE], -U MACRO\n"
-          "       -static, -shared, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
+          "       -static, -shared, -nostdlib, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
           "       --target=aarch64-linux-gnu or --target=x86_64-linux-gnu\n"
-          "       Uses native Linux GCC and glibc by default.\n", out);
+          "       Uses mas and mld. Hosted links use the target's glibc.\n", out);
 }
 
 static const Target *native_target(void)
@@ -109,6 +105,8 @@ static void parse_options(Driver *d, int argc, char **argv)
             PUSH(c, c->macro_options, format(c, "%c%s", arg[1], value));
         } else if (equal(arg, "-O0") || equal(arg, "-fPIC") || equal(arg, "-fpic")) {
             /* Code is unoptimized and position-independent. */
+        } else if (equal(arg, "-nostdlib")) {
+            d->freestanding = true;
         } else if (equal(arg, "-static") || equal(arg, "-shared") ||
                    equal(arg, "-pthread") || equal(arg, "-pie") || equal(arg, "-no-pie") ||
                    starts(arg, "-Wl,")) {
@@ -128,35 +126,21 @@ static void parse_options(Driver *d, int argc, char **argv)
         error(c, (Loc){0}, "stdout output requires -E or -S");
 }
 
-static int invoke(Driver *d, Strings args, int stdout_fd)
+static const char *companion(Context *c, const char *program)
 {
-    Context *c = &d->options;
-    char **argv = alloc(c, (args.len + 1) * sizeof *argv);
-    for (size_t i = 0; i < args.len; i++)
-        argv[i] = copy(c, args.data[i], strlen(args.data[i]));
-    posix_spawn_file_actions_t actions;
-    int status = posix_spawn_file_actions_init(&actions);
-    bool initialized = status == 0;
-    if (!status && stdout_fd >= 0)
-        status = posix_spawn_file_actions_adddup2(&actions, stdout_fd, STDOUT_FILENO);
-    pid_t child;
-    if (!status)
-        status = posix_spawnp(&child, argv[0], &actions, NULL, argv, environ);
-    if (initialized)
-        posix_spawn_file_actions_destroy(&actions);
-    if (status) {
-        error(c, (Loc){0}, "cannot start %s: %s", args.data[0], strerror(status));
-        return 1;
+    char path[PATH_MAX];
+    ssize_t length = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (length > 0 && (size_t)length < sizeof path - 1) {
+        path[length] = 0;
+        char *base = strrchr(path, '/');
+        if (base) {
+            *base = 0;
+            const char *sibling = format(c, "%s/%s", path, program);
+            if (access(sibling, X_OK) == 0)
+                return sibling;
+        }
     }
-    int result;
-    do {
-        status = waitpid(child, &result, 0) < 0 ? errno : 0;
-    } while (status == EINTR);
-    if (status || !WIFEXITED(result) || WEXITSTATUS(result)) {
-        error(c, (Loc){0}, "%s failed", args.data[0]);
-        return 1;
-    }
-    return 0;
+    return program;
 }
 
 static const char *temporary(Driver *d, const char *ext)
@@ -176,32 +160,6 @@ static const char *temporary(Driver *d, const char *ext)
     return path;
 }
 
-static bool validate_toolchain(Driver *d)
-{
-    Context *c = &d->options;
-    FILE *output = tmpfile();
-    if (!output) {
-        error(c, (Loc){0}, "cannot open temporary file for toolchain verification");
-        return false;
-    }
-    Strings cmd = {0};
-    PUSH(c, cmd, d->toolchain);
-    PUSH(c, cmd, "-dumpmachine");
-    bool ok = invoke(d, cmd, fileno(output)) == 0;
-    if (ok) {
-        char result[160];
-        rewind(output);
-        const char *arch = format(c, "%s-", c->target->arch);
-        if (!fgets(result, sizeof result, output) || !starts(result, arch) ||
-            !suffix(result, "-linux-gnu\n")) {
-            error(c, (Loc){0}, "GCC must target %s Linux with glibc", c->target->arch);
-            ok = false;
-        }
-    }
-    fclose(output);
-    return ok;
-}
-
 static void system_headers(Context *c)
 {
     const char *compiler_headers = getenv("MCC_COMPILER_INCLUDE");
@@ -212,12 +170,16 @@ static void system_headers(Context *c)
         PUSH(c, c->system_includes, libc_headers);
         return;
     }
-    if (c->target == native_target()) {
-        PUSH(c, c->system_includes, "/usr/local/include");
-        PUSH(c, c->system_includes, format(c, "/usr/include/%s-linux-gnu", c->target->arch));
-        PUSH(c, c->system_includes, "/usr/include");
-    } else {
-        PUSH(c, c->system_includes, format(c, "/usr/%s-linux-gnu/include", c->target->arch));
+    const char *root = getenv("MCC_SYSROOT");
+    if (!root)
+        root = "";
+    if (c->target == native_target())
+        PUSH(c, c->system_includes, format(c, "%s/usr/local/include", root));
+    if (c->target != native_target() || *root)
+        PUSH(c, c->system_includes, format(c, "%s/usr/%s-linux-gnu/include", root, c->target->arch));
+    if (c->target == native_target() || *root) {
+        PUSH(c, c->system_includes, format(c, "%s/usr/include/%s-linux-gnu", root, c->target->arch));
+        PUSH(c, c->system_includes, format(c, "%s/usr/include", root));
     }
 }
 
@@ -328,14 +290,12 @@ static bool assemble(Driver *d, const char *input, const char *obj)
 {
     Context *c = &d->options;
     Strings cmd = {0};
-    PUSH(c, cmd, d->toolchain);
-    PUSH(c, cmd, "-x");
-    PUSH(c, cmd, "assembler");
-    PUSH(c, cmd, "-c");
+    PUSH(c, cmd, companion(c, "mas"));
+    PUSH(c, cmd, format(c, "--target=%s-linux-gnu", c->target->arch));
     PUSH(c, cmd, "-o");
     PUSH(c, cmd, obj);
     PUSH(c, cmd, input[0] == '-' ? format(c, "./%s", input) : input);
-    return invoke(d, cmd, -1) == 0;
+    return run_command(c, cmd);
 }
 
 static const char *input_output(Driver *d, Strings *destinations, const char *input, const char *ext)
@@ -350,6 +310,23 @@ static const char *input_output(Driver *d, Strings *destinations, const char *in
     return dest;
 }
 
+static void link_argument(Context *c, Strings *command, const char *arg)
+{
+    if (!starts(arg, "-Wl,")) {
+        PUSH(c, *command, arg);
+        return;
+    }
+    for (const char *part = arg + 4;;) {
+        const char *comma = strchr(part, ',');
+        if (!comma) {
+            PUSH(c, *command, part);
+            break;
+        }
+        PUSH(c, *command, copy(c, part, (size_t)(comma - part)));
+        part = comma + 1;
+    }
+}
+
 static bool link_objects(Driver *d, Strings objects)
 {
     Context *c = &d->options;
@@ -358,20 +335,21 @@ static bool link_objects(Driver *d, Strings objects)
     if (!output)
         return false;
     Strings cmd = {0};
-    PUSH(c, cmd, d->toolchain);
+    PUSH(c, cmd, companion(c, "mld"));
+    if (!d->freestanding)
+        PUSH(c, cmd, "--hosted");
+    PUSH(c, cmd, format(c, "--target=%s-linux-gnu", c->target->arch));
     PUSH(c, cmd, "-o");
     PUSH(c, cmd, output[0] == '-' ? format(c, "./%s", output) : output);
     size_t next = 0;
     for (size_t i = 0; i < d->link_args.len; i++)
-        PUSH(c, cmd, d->link_args.data[i] ? d->link_args.data[i] : objects.data[next++]);
-    return invoke(d, cmd, -1) == 0 && publish(d, output, dest);
+        link_argument(c, &cmd, d->link_args.data[i] ? d->link_args.data[i] : objects.data[next++]);
+    return run_command(c, cmd) && publish(d, output, dest);
 }
 
 static bool run_driver(Driver *d)
 {
     Context *c = &d->options;
-    if ((d->mode == LINK || d->mode == ASSEMBLE) && !validate_toolchain(d))
-        return false;
     Strings objects = {0}, destinations = {0};
     const char *combined = NULL;
     if (d->mode == PREPROCESS && d->output && !equal(d->output, "-")) {
@@ -435,11 +413,8 @@ static bool run_driver(Driver *d)
 
 int main(int argc, char **argv)
 {
-    Driver d = {.options = {.target = native_target()}, .toolchain = getenv("MCC_TOOLCHAIN")};
+    Driver d = {.options = {.target = native_target()}};
     parse_options(&d, argc, argv);
-    if (!d.toolchain || !*d.toolchain)
-        d.toolchain = d.options.target == native_target() ? "gcc" :
-                      format(&d.options, "%s-linux-gnu-gcc", d.options.target->arch);
     system_headers(&d.options);
     bool ok = !d.options.failed && (d.stopped || run_driver(&d));
     for (size_t i = 0; i < d.scratch.len; i++)

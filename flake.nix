@@ -12,7 +12,9 @@
           nativeBuildInputs = with pkgs; [ bison flex python3 wasmtime ];
           buildInputs = [ pkgs.gtest ];
           MCC_SYSTEM_INCLUDE = "${nixpkgs.lib.getDev pkgs.glibc}/include";
-          # Keep libc.so ahead of the separate Nix output containing libc.a.
+          MCC_SYSTEM_LIB = "${pkgs.glibc}/lib";
+          MCC_STATIC_LIB = "${pkgs.glibc.static}/lib";
+          MCC_RUNTIME_LIB = "${pkgs.gcc.cc}/lib/gcc/${pkgs.stdenv.hostPlatform.config}/${pkgs.gcc.cc.version}";
           NIX_LDFLAGS = "-L${pkgs.glibc}/lib -L${pkgs.glibc.static}/lib";
         };
       });

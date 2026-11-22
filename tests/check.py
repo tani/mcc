@@ -154,7 +154,9 @@ int main(void) {
     return 0;
 }
 """
-        succeeded([compiler, "-", "-o", binary], source=source)
+        hosted = subprocess.run([compiler, "-", "-o", binary], input=source, capture_output=True,
+                                timeout=15, env={**os.environ, "MCC_TOOLCHAIN": str(root / "missing-gcc")})
+        assert hosted.returncode == 0, hosted.stderr
         assert succeeded([binary]) == b"mcc\n"
         gcc = os.environ.get("MCC_TOOLCHAIN") or "gcc"
         target = succeeded([gcc, "-dumpmachine"]).split(b"-")[0]
