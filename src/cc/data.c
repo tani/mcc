@@ -574,6 +574,11 @@ void emit_symbol_linkage(FILE *out, Symbol *s)
         fprintf(out, "\t%s %s\n", directive, s->assembly);
     if (s->weak)
         fprintf(out, "\t.weak %s\n", s->assembly);
+    if (s->ifunc) {
+        if (!s->internal)
+            fprintf(out, "\t.global %s\n", s->assembly);
+        fprintf(out, "\t.type %s, %%gnu_indirect_function\n\t.set %s, %s\n", s->assembly, s->assembly, s->ifunc);
+    }
     if (s->alias) {
         if (!s->weak && !s->internal)
             fprintf(out, "\t.global %s\n", s->assembly);

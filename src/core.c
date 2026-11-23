@@ -1,6 +1,7 @@
 #include "compiler.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,12 +97,14 @@ static const char *const warning_options[WARNING_COUNT] = {
     [WARNING_PEDANTIC] = "pedantic",
     [WARNING_CPP] = "cpp",
     [WARNING_ATTRIBUTES] = "attributes",
+    [WARNING_ATTRIBUTE_ALIAS] = "attribute-alias",
     [WARNING_PRAGMAS] = "pragmas",
     [WARNING_UNKNOWN_PRAGMAS] = "unknown-pragmas",
     [WARNING_INVALID_MEMORY_MODEL] = "invalid-memory-model",
     [WARNING_STRINGOP_OVERFLOW] = "stringop-overflow",
     [WARNING_STRINGOP_OVERREAD] = "stringop-overread",
     [WARNING_PRIORITY_CTOR_DTOR] = "prio-ctor-dtor",
+    [WARNING_DEPRECATED] = "deprecated",
     [WARNING_DEPRECATED_DECLARATIONS] = "deprecated-declarations",
     [WARNING_DISCARDED_QUALIFIERS] = "discarded-qualifiers",
     [WARNING_DESIGNATED_INIT] = "designated-init",
@@ -110,14 +113,29 @@ static const char *const warning_options[WARNING_COUNT] = {
     [WARNING_IMPLICIT_FALLTHROUGH] = "implicit-fallthrough",
     [WARNING_ATTRIBUTE_WARNING] = "attribute-warning",
     [WARNING_FORMAT] = "format",
+    [WARNING_FORMAT_NONLITERAL] = "format-nonliteral",
+    [WARNING_FORMAT_SECURITY] = "format-security",
+    [WARNING_FORMAT_SIGNEDNESS] = "format-signedness",
+    [WARNING_FORMAT_Y2K] = "format-y2k",
     [WARNING_NONNULL] = "nonnull",
     [WARNING_NONNULL_COMPARE] = "nonnull-compare",
     [WARNING_UNINITIALIZED] = "uninitialized",
     [WARNING_MAYBE_UNINITIALIZED] = "maybe-uninitialized",
+    [WARNING_CLOBBERED] = "clobbered",
+    [WARNING_ALLOCA] = "alloca",
+    [WARNING_ALLOCA_LARGE] = "alloca-larger-than=",
+    [WARNING_VLA] = "vla",
+    [WARNING_VLA_LARGE] = "vla-larger-than=",
+    [WARNING_FRAME_LARGE] = "frame-larger-than=",
+    [WARNING_STACK_USAGE] = "stack-usage=",
+    [WARNING_UNDEF] = "undef",
+    [WARNING_EXPANSION_DEFINED] = "expansion-to-defined",
 };
 
 WarningKind warning_kind(const char *name)
 {
+    if (equal(name, "attribute-alias=0") || equal(name, "attribute-alias=1") || equal(name, "attribute-alias=2"))
+        return WARNING_ATTRIBUTE_ALIAS;
     for (size_t i = 1; i < WARNING_COUNT; i++)
         if (equal(name, warning_options[i]))
             return (WarningKind)i;
@@ -165,8 +183,75 @@ bool attribute_ignored(Loc loc, const char *namespace, const char *name)
     return false;
 }
 
+static bool size_warning_argument(Context *c, const char *argument, const char *name, WarningKind kind,
+                                  uint64_t *limit, bool *limit_set)
+{
+    char regular[64], error_option[64], disabled[64];
+    snprintf(regular, sizeof regular, "-W%s=", name);
+    snprintf(error_option, sizeof error_option, "-Werror=%s=", name);
+    snprintf(disabled, sizeof disabled, "-Wno-%s", name);
+    if (equal(argument, disabled)) {
+        c->warnings[kind].enabled = DIAG_IGNORED;
+        return true;
+    }
+    size_t regular_len = strlen(regular), error_len = strlen(error_option);
+    bool as_error = !strncmp(argument, error_option, error_len);
+    if (!as_error && strncmp(argument, regular, regular_len))
+        return false;
+    const char *number = argument + (as_error ? error_len : regular_len);
+    char *end;
+    errno = 0;
+    unsigned long long value = strtoull(number, &end, 10);
+    uint64_t multiplier = 1;
+    if (*end) {
+        static const struct { const char *suffix; uint64_t scale; } units[] = {
+            {"kB", UINT64_C(1000)}, {"KB", UINT64_C(1000)},
+            {"MB", UINT64_C(1000000)}, {"GB", UINT64_C(1000000000)},
+            {"TB", UINT64_C(1000000000000)}, {"PB", UINT64_C(1000000000000000)},
+            {"EB", UINT64_C(1000000000000000000)},
+            {"KiB", UINT64_C(1024)}, {"MiB", UINT64_C(1048576)},
+            {"GiB", UINT64_C(1073741824)}, {"TiB", UINT64_C(1099511627776)},
+            {"PiB", UINT64_C(1125899906842624)}, {"EiB", UINT64_C(1152921504606846976)}
+        };
+        bool found = false;
+        for (size_t i = 0; i < sizeof units / sizeof *units; i++)
+            if (equal(end, units[i].suffix)) {
+                multiplier = units[i].scale;
+                found = true;
+                break;
+            }
+        if (!found)
+            errno = EINVAL;
+    }
+    if (number[0] < '0' || number[0] > '9' || errno || value > UINT64_MAX / multiplier) {
+        error(c, (Loc){0}, "invalid %s warning size '%s'", name, number);
+    } else {
+        *limit = value * multiplier;
+        *limit_set = true;
+        WarningOption *option = &c->warnings[kind];
+        option->enabled = *limit == UINT64_MAX ? DIAG_IGNORED : DIAG_WARNING;
+        if (as_error)
+            option->severity = DIAG_ERROR;
+    }
+    return true;
+}
+
 bool warning_argument(Context *c, const char *argument)
 {
+    static const char alias_prefix[] = "-Wattribute-alias=";
+    static const char alias_error_prefix[] = "-Werror=attribute-alias=";
+    bool alias_error = !strncmp(argument, alias_error_prefix, sizeof alias_error_prefix - 1);
+    if (alias_error || !strncmp(argument, alias_prefix, sizeof alias_prefix - 1)) {
+        const char *level = argument + (alias_error ? sizeof alias_error_prefix - 1 : sizeof alias_prefix - 1);
+        if (level[0] < '0' || level[0] > '2' || level[1])
+            error(c, (Loc){0}, "attribute-alias warning level must be between 0 and 2");
+        else {
+            c->warnings[WARNING_ATTRIBUTE_ALIAS].enabled = *level == '0' ? DIAG_IGNORED : DIAG_WARNING;
+            if (alias_error)
+                c->warnings[WARNING_ATTRIBUTE_ALIAS].severity = DIAG_ERROR;
+        }
+        return true;
+    }
     if (equal(argument, "-Wall") || equal(argument, "-Wno-all")) {
         c->warn_all = equal(argument, "-Wall");
         return true;
@@ -175,6 +260,15 @@ bool warning_argument(Context *c, const char *argument)
         c->warn_extra = !equal(argument, "-Wno-extra");
         return true;
     }
+    if (size_warning_argument(c, argument, "alloca-larger-than", WARNING_ALLOCA_LARGE,
+                              &c->alloca_warning_limit, &c->alloca_warning_limit_set) ||
+        size_warning_argument(c, argument, "vla-larger-than", WARNING_VLA_LARGE,
+                              &c->vla_warning_limit, &c->vla_warning_limit_set) ||
+        size_warning_argument(c, argument, "frame-larger-than", WARNING_FRAME_LARGE,
+                              &c->frame_warning_limit, &c->frame_warning_limit_set) ||
+        size_warning_argument(c, argument, "stack-usage", WARNING_STACK_USAGE,
+                              &c->stack_warning_limit, &c->stack_warning_limit_set))
+        return true;
     static const char format_prefix[] = "-Wformat=";
     if (!strncmp(argument, format_prefix, sizeof format_prefix - 1)) {
         const char *level = argument + sizeof format_prefix - 1;
@@ -182,8 +276,18 @@ bool warning_argument(Context *c, const char *argument)
         unsigned long value = strtoul(level, &end, 0);
         if (level[0] < '0' || level[0] > '9' || *end || value > 2)
             error(c, (Loc){0}, "format warning level must be between 0 and 2");
-        else
+        else {
             c->warnings[WARNING_FORMAT].enabled = value ? DIAG_WARNING : DIAG_IGNORED;
+            c->format_level = (unsigned)value;
+            if (value == 2 && c->warnings[WARNING_FORMAT].severity == DIAG_ERROR) {
+                if (!c->warnings[WARNING_FORMAT_NONLITERAL].severity)
+                    c->warnings[WARNING_FORMAT_NONLITERAL].severity = DIAG_ERROR;
+                if (!c->warnings[WARNING_FORMAT_SECURITY].severity)
+                    c->warnings[WARNING_FORMAT_SECURITY].severity = DIAG_ERROR;
+                if (!c->warnings[WARNING_FORMAT_Y2K].severity)
+                    c->warnings[WARNING_FORMAT_Y2K].severity = DIAG_ERROR;
+            }
+        }
         return true;
     }
     static const char fallthrough_prefix[] = "-Wimplicit-fallthrough=";
@@ -223,6 +327,8 @@ bool warning_argument(Context *c, const char *argument)
     if (kind == WARNING_NONE)
         return false;
     WarningOption *option = &c->warnings[kind];
+    if (kind == WARNING_FORMAT && (!severity || !disable))
+        c->format_level = disable ? 0u : 1u;
     if (kind == WARNING_IMPLICIT_FALLTHROUGH) {
         if (!severity)
             c->fallthrough_level = disable ? 0u : 3u;
@@ -260,16 +366,26 @@ static DiagnosticLevel warning_level(Context *c, WarningKind kind, Loc loc)
         if (!option.severity)
             option.severity = definite.severity;
     }
-    bool pedantic_error = kind == WARNING_PEDANTIC && c->dialect.pedantic == PEDANTIC_ERROR;
+    bool c90_vla = kind == WARNING_VLA && c->dialect.standard == C90 && !c->extension_depth;
+    bool pedantic_error = (kind == WARNING_PEDANTIC || kind == WARNING_EXPANSION_DEFINED || c90_vla) &&
+                          c->dialect.pedantic == PEDANTIC_ERROR;
     if (option.enabled == DIAG_IGNORED)
         return DIAG_IGNORED;
     if (!option.enabled && ((kind == WARNING_PEDANTIC && c->dialect.pedantic == PEDANTIC_OFF) ||
-                           kind == WARNING_UNKNOWN_PRAGMAS ||
+                           kind == WARNING_UNKNOWN_PRAGMAS || kind == WARNING_ALLOCA || kind == WARNING_ALLOCA_LARGE ||
+                           kind == WARNING_VLA_LARGE || kind == WARNING_FRAME_LARGE || kind == WARNING_STACK_USAGE ||
+                           kind == WARNING_UNDEF ||
+                           kind == WARNING_FORMAT_SIGNEDNESS ||
+                           ((kind == WARNING_FORMAT_NONLITERAL || kind == WARNING_FORMAT_SECURITY || kind == WARNING_FORMAT_Y2K) &&
+                            c->format_level < 2) ||
+                           (kind == WARNING_EXPANSION_DEFINED && !c->warn_extra &&
+                            c->dialect.pedantic == PEDANTIC_OFF) ||
+                           (kind == WARNING_VLA && (!c90_vla || c->dialect.pedantic == PEDANTIC_OFF)) ||
                            ((kind == WARNING_FRAME_ADDRESS || kind == WARNING_FORMAT || kind == WARNING_NONNULL ||
                              kind == WARNING_NONNULL_COMPARE) && !c->warn_all) ||
                            ((kind == WARNING_UNINITIALIZED || kind == WARNING_MAYBE_UNINITIALIZED) &&
                             !c->warn_all && !c->warn_extra) ||
-                           (kind == WARNING_IMPLICIT_FALLTHROUGH && !c->warn_extra)))
+                           ((kind == WARNING_IMPLICIT_FALLTHROUGH || kind == WARNING_CLOBBERED) && !c->warn_extra)))
         return DIAG_IGNORED;
     if (option.severity)
         return option.severity;

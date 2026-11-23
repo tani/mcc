@@ -1,6 +1,6 @@
 #include "compiler.h"
 #include "parser.h"
-#include "inline_asm.h"
+#include "register.h"
 
 const Target aarch64_linux = {
     .arch = "aarch64", .display_name = "AArch64", .emit = emit_aarch64,
@@ -817,60 +817,6 @@ static void memory_loop(Emitter *e, size_t size, bool copy)
     }
 }
 
-static void preserve_asm_registers(Emitter *e, const AsmPlan *plan, bool restore)
-{
-    for (unsigned i = 0; i < 64; i++) {
-        size_t id = plan->save_slots[i];
-        if (!id)
-            continue;
-        if (i >= 32) {
-            frame_address(e, 14, e->offsets[id]);
-            fprintf(e->out, "\t%s d%u, [x14]\n", restore ? "ldr" : "str", i - 32);
-        } else if (restore) {
-            slot_load(e, i, id);
-        } else {
-            slot_store(e, i, id);
-        }
-    }
-}
-
-static void prepare_asm(Emitter *e, const AsmPlan *plan)
-{
-    preserve_asm_registers(e, plan, false);
-    /* Tied inputs for spilled global outputs use scratch registers while staging. */
-    for (int staged = 1; staged >= 0; staged--) {
-        for (size_t i = 0; i < plan->assembly->operands.len; i++) {
-            const AsmBinding *binding = &plan->bindings[i];
-            if (binding->load && (e->register_spills[binding->reg] != 0) == staged)
-                write_register_slot(e, binding->reg, binding->load);
-        }
-    }
-    sync_register_spills(e, 0, true);
-    emit_asm_template(e->context, e->out, plan, e->function_id);
-}
-
-static void finish_asm(Emitter *e, const AsmPlan *plan)
-{
-    sync_register_spills(e, 0, false);
-    for (size_t i = 0; i < plan->assembly->outputs; i++) {
-        const AsmBinding *binding = &plan->bindings[i];
-        if (binding->location != ASM_REGISTER || !binding->result)
-            continue;
-        if (binding->reg >= 32)
-            fp_store(e, binding->reg - 32, binding->result);
-        else
-            slot_store(e, binding->reg, binding->result);
-    }
-    for (size_t i = 0; i < plan->assembly->outputs; i++) {
-        const AsmBinding *binding = &plan->bindings[i];
-        if (binding->location == ASM_FLAGS) {
-            fprintf(e->out, "\tcset w9, %s\n", binding->condition);
-            slot_store(e, 9, binding->result);
-        }
-    }
-    preserve_asm_registers(e, plan, true);
-}
-
 static void stack_pin_checkpoint(Emitter *e, size_t pin, bool restoring)
 {
     if (!pin)
@@ -1104,9 +1050,6 @@ static void instruction(Emitter *e, Inst *in)
         fprintf(out, "\tprfm %s%s, [x9]\n", in->op ? "pst" : "pld", locality[in->immediate]);
         break;
     }
-    case I_ASM: fprintf(out, "\t%s\n", in->asm_text); break;
-    case I_EXTENDED_ASM: prepare_asm(e, in->asm_plan); break;
-    case I_ASM_OUTPUT: finish_asm(e, in->asm_plan); break;
     case I_JUMP:
         fprintf(out, "\tb .L%u_%zu\n", e->function_id, in->label);
         break;
@@ -1175,6 +1118,23 @@ static void instruction(Emitter *e, Inst *in)
     }
 }
 
+static size_t maximum_outgoing_stack(const FunctionIR *ir)
+{
+    size_t maximum = 0;
+    for (size_t i = 0; i < ir->instructions.len; i++) {
+        const Inst *in = &ir->instructions.data[i];
+        if (in->code != I_CALL)
+            continue;
+        ArgumentState state = {0};
+        for (size_t j = 0; j < in->args.len; j++)
+            classify(&state, in->arg_types.data[j]);
+        size_t outgoing = align_to(state.stack, 16);
+        if (outgoing > maximum)
+            maximum = outgoing;
+    }
+    return maximum;
+}
+
 static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
 {
     FunctionIR ir;
@@ -1200,11 +1160,19 @@ static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
         e.varargs_fp = e.varargs_gp + 128;
         frame = e.varargs_fp;
     }
-    emit_function_entry(c, out, s, id);
-    fputs("\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n", out);
     if (e.stack_checkpoint_pin)
         frame += 16;
     frame = align_to(frame, 16);
+    check_frame_size(c, s, frame);
+    if (!c->failed && !c->syntax_only && (c->stack_usage_report ||
+        warning_enabled(c, WARNING_STACK_USAGE, s->function_end_loc))) {
+        size_t outgoing = maximum_outgoing_stack(&ir);
+        check_stack_usage(c, &ir, frame, outgoing, outgoing != 0);
+    }
+    if (c->failed)
+        return;
+    emit_function_entry(c, out, s, id);
+    fputs("\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n", out);
     if (frame > 4095 && e.register_spills[15]) {
         fputs("\tstr x15, [sp, #-16]!\n", out);
         adjust_stack(out, frame - 16, false);
@@ -1248,11 +1216,7 @@ bool emit_aarch64(Context *c, FILE *out)
         emit_symbol_linkage(out, s);
         if (s->alias)
             continue;
-        if (s->asm_plan)
-            emit_asm_template(c, out, s->asm_plan, 0);
-        else if (s->asm_text)
-            fprintf(out, "%s\n", s->asm_text);
-        else if (s->type->kind == TY_FUNC && s->body)
+        if (s->type->kind == TY_FUNC && s->body)
             emit_function(c, out, s, (unsigned)i);
         else if (s->type->kind != TY_FUNC && !global_register(s) && (s->defined || s->tentative))
             emit_static_data(c, out, s);

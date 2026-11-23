@@ -9,7 +9,7 @@ RT_NATIVE := $(shell uname -m)
 RT_FILES := $(foreach arch,$(RT_ARCHS),$(addprefix $(RUNTIME)/$(arch)/,crt-exe.o crt-shared.o libmccrt.a))
 RT_EMBEDDED := $(RUNTIME)/embedded.o
 RT_SEED := $(RUNTIME)/seed-quad.o $(RUNTIME)/seed-quad-complex.o $(RUNTIME)/seed-decimal.o $(RUNTIME)/seed-float-bits.o $(RUNTIME)/$(RT_NATIVE)/fp.o
-CC_OBJECTS := $(addprefix $(BUILD)/cc/,driver.o cpp.o frontend.o ir.o data.o inline_asm.o aarch64.o x86_64.o parser.o scanner.o)
+CC_OBJECTS := $(addprefix $(BUILD)/cc/,driver.o cpp.o frontend.o ir.o data.o register.o aarch64.o x86_64.o parser.o scanner.o)
 ELF_COMMON := $(addprefix $(BUILD)/,elf_tools.o core.o)
 AS_OBJECTS := $(addprefix $(BUILD)/as/,as.o aarch64.o x86_64.o)
 LD_OBJECTS := $(addprefix $(BUILD)/ld/,ld.o driver.o input.o reloc.o)
@@ -55,7 +55,7 @@ $(addprefix $(BUILD)/cc/,frontend.o data.o): src/int128_float.h
 $(addprefix $(BUILD)/cc/,frontend.o data.o ir.o): src/int128_math.h
 $(addprefix $(BUILD)/cc/,frontend.o data.o): src/quad.h
 $(BUILD)/cc/data.o: src/float16.h src/quad_bits.h
-$(addprefix $(BUILD)/cc/,frontend.o inline_asm.o ir.o aarch64.o x86_64.o): src/cc/inline_asm.h
+$(addprefix $(BUILD)/cc/,frontend.o register.o ir.o aarch64.o x86_64.o): src/cc/register.h
 $(BUILD)/as/main.o $(AS_OBJECTS): src/as/as.h src/elf_tools.h
 $(BUILD)/ld/main.o $(BUILD)/ld/runtime.o $(LD_OBJECTS): src/ld/ld.h src/elf_tools.h
 $(BUILD)/elf_tools.o: src/elf_tools.h

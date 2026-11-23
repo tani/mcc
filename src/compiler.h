@@ -34,22 +34,22 @@ typedef struct Scope Scope;
 typedef struct RecordBoundsScope RecordBoundsScope;
 typedef struct Macro Macro;
 typedef struct SavedMacro SavedMacro;
+typedef struct SourceIdentity SourceIdentity;
 typedef struct PackSetting PackSetting;
 typedef struct Hide Hide;
 typedef struct EnumDefinition EnumDefinition;
-typedef struct InlineAssembly InlineAssembly;
-typedef struct AsmPlan AsmPlan;
 
 typedef enum { C90, C99, C11, C17, C23, C2Y } CStandard;
 typedef enum { VIS_UNSPECIFIED, VIS_DEFAULT, VIS_INTERNAL, VIS_HIDDEN, VIS_PROTECTED } Visibility;
 typedef enum { PEDANTIC_OFF, PEDANTIC_WARN, PEDANTIC_ERROR } Pedantic;
 typedef enum {
-    WARNING_NONE, WARNING_PEDANTIC, WARNING_CPP, WARNING_ATTRIBUTES, WARNING_PRAGMAS,
+    WARNING_NONE, WARNING_PEDANTIC, WARNING_CPP, WARNING_ATTRIBUTES, WARNING_ATTRIBUTE_ALIAS, WARNING_PRAGMAS,
     WARNING_UNKNOWN_PRAGMAS, WARNING_INVALID_MEMORY_MODEL, WARNING_STRINGOP_OVERFLOW, WARNING_STRINGOP_OVERREAD,
-    WARNING_PRIORITY_CTOR_DTOR, WARNING_DEPRECATED_DECLARATIONS, WARNING_DISCARDED_QUALIFIERS,
+    WARNING_PRIORITY_CTOR_DTOR, WARNING_DEPRECATED, WARNING_DEPRECATED_DECLARATIONS, WARNING_DISCARDED_QUALIFIERS,
     WARNING_DESIGNATED_INIT, WARNING_FRAME_ADDRESS, WARNING_UNUSED_RESULT,
-    WARNING_IMPLICIT_FALLTHROUGH, WARNING_ATTRIBUTE_WARNING, WARNING_FORMAT,
-    WARNING_NONNULL, WARNING_NONNULL_COMPARE, WARNING_UNINITIALIZED, WARNING_MAYBE_UNINITIALIZED, WARNING_COUNT
+    WARNING_IMPLICIT_FALLTHROUGH, WARNING_ATTRIBUTE_WARNING, WARNING_FORMAT, WARNING_FORMAT_NONLITERAL, WARNING_FORMAT_SECURITY, WARNING_FORMAT_SIGNEDNESS, WARNING_FORMAT_Y2K,
+    WARNING_NONNULL, WARNING_NONNULL_COMPARE, WARNING_UNINITIALIZED, WARNING_MAYBE_UNINITIALIZED, WARNING_CLOBBERED,
+    WARNING_ALLOCA, WARNING_ALLOCA_LARGE, WARNING_VLA, WARNING_VLA_LARGE, WARNING_FRAME_LARGE, WARNING_STACK_USAGE, WARNING_UNDEF, WARNING_EXPANSION_DEFINED, WARNING_COUNT
 } WarningKind;
 typedef enum { DIAG_DEFAULT, DIAG_IGNORED, DIAG_WARNING, DIAG_ERROR } DiagnosticLevel;
 typedef struct {
@@ -89,11 +89,11 @@ typedef enum {
 typedef enum { SYSREG_THREAD_POINTER, SYSREG_FPCR, SYSREG_FPSR, SYSREG_MXCSR } SystemRegister;
 typedef enum {
     ATTR_NONE, ATTR_PACKED, ATTR_NOINLINE, ATTR_USED, ATTR_STDCALL, ATTR_GNU_INLINE, ATTR_ALIGNED,
-    ATTR_WEAK, ATTR_ALIAS, ATTR_WEAKREF, ATTR_VISIBILITY, ATTR_CONSTRUCTOR, ATTR_DESTRUCTOR,
-    ATTR_ALLOC_SIZE, ATTR_CLEANUP, ATTR_SECTION, ATTR_VECTOR_SIZE, ATTR_MODE, ATTR_DEPRECATED,
-    ATTR_TRANSPARENT_UNION, ATTR_DESIGNATED_INIT, ATTR_NORETURN, ATTR_WARN_UNUSED_RESULT,
+    ATTR_WEAK, ATTR_ALIAS, ATTR_IFUNC, ATTR_WEAKREF, ATTR_VISIBILITY, ATTR_CONSTRUCTOR, ATTR_DESTRUCTOR,
+    ATTR_ALLOC_SIZE, ATTR_ALLOC_ALIGN, ATTR_ASSUME_ALIGNED, ATTR_CLEANUP, ATTR_SECTION, ATTR_VECTOR_SIZE, ATTR_MODE, ATTR_DEPRECATED,
+    ATTR_TRANSPARENT_UNION, ATTR_DESIGNATED_INIT, ATTR_NORETURN, ATTR_WARN_UNUSED_RESULT, ATTR_RETURNS_TWICE,
     ATTR_FALLTHROUGH, ATTR_ERROR, ATTR_WARNING, ATTR_SENTINEL, ATTR_NONNULL, ATTR_RETURNS_NONNULL,
-    ATTR_NOPLT, ATTR_PATCHABLE_FUNCTION_ENTRY, ATTR_ACCESS
+    ATTR_NOPLT, ATTR_PATCHABLE_FUNCTION_ENTRY, ATTR_ACCESS, ATTR_LEAF, ATTR_HOT, ATTR_COLD, ATTR_FORMAT, ATTR_FORMAT_ARG
 } Attribute;
 
 typedef enum {
@@ -106,7 +106,7 @@ typedef struct {
     TokenKind kind;
     const char *text;
     Loc loc;
-    bool space, poison_checked;
+    bool space, poison_checked, macro_origin, macro_system_header;
     const Hide *hide;
 } Token;
 
@@ -148,10 +148,12 @@ typedef VECTOR(AccessPointerStore) AccessPointerStores;
 typedef bool (*AccessPointerLookup)(void *, const Symbol *, size_t, AccessPointerStores *);
 typedef IntegerRange (*AccessOffsetRange)(void *, Node *, size_t);
 typedef IntegerRange (*AccessAllocationRange)(void *, const Node *, unsigned, Node *);
+typedef bool (*AccessLayoutRange)(void *, const Symbol *, size_t, IntegerRange *);
 typedef struct {
     AccessPointerLookup pointer_stores;
     AccessOffsetRange offset;
     AccessAllocationRange allocation;
+    AccessLayoutRange layout;
     void *data;
     size_t point;
 } AccessRangeSource;
@@ -171,6 +173,9 @@ typedef struct {
 typedef VECTOR(Member) Members;
 typedef enum { FLOAT_DEFAULT, FLOAT32, FLOAT64, FLOAT32X, FLOAT64X, FLOAT128 } FloatVariant;
 typedef struct { unsigned first, second; } AllocationSize;
+typedef struct { uint64_t alignment, offset; } AssumedAlignment;
+typedef struct FormatSpec FormatSpec;
+struct FormatSpec { const char *style; unsigned index, first; Loc loc; const FormatSpec *next; };
 typedef struct { Integer128 position; bool explicit_position; } Sentinel;
 typedef VECTOR(Sentinel) Sentinels;
 typedef VECTOR(unsigned) ParameterIndices;
@@ -207,7 +212,11 @@ struct Type {
     Nodes record_bounds;
     size_t length;
     AllocationSize allocation;
+    unsigned allocation_alignment;
+    const AssumedAlignment *assumed_alignment;
     Sentinels sentinels;
+    const FormatSpec *format_spec;
+    const ParameterIndices *format_args;
     FunctionNullability nullability;
     const AccessClauses *accesses;
     Members members;
@@ -261,8 +270,12 @@ struct Decl {
     Members params;
     Scope *parameter_scope;
     AllocationSize allocation;
+    unsigned allocation_alignment;
+    const AssumedAlignment *assumed_alignment;
     const PatchableEntries *patchable_entries;
     Sentinels sentinels, member_sentinels;
+    const FormatSpec *format_spec, *member_format_spec;
+    const ParameterIndices *format_args, *member_format_args;
     FunctionNullability nullability, member_nullability;
     const AccessClauses *accesses, *member_accesses;
     TypeAttributes type_attributes, member_type_attributes;
@@ -270,6 +283,8 @@ struct Decl {
     unsigned qualifiers, alignment;
     unsigned member_alignment, member_alignment_attributes, attribute_markers, member_attribute_markers;
     AllocationSize member_allocation;
+    unsigned member_allocation_alignment;
+    const AssumedAlignment *member_assumed_alignment;
     bool packed_member, designated_init;
 };
 
@@ -289,15 +304,19 @@ enum {
 typedef struct {
     unsigned flags;
     Type *type;
-    const char *alias;
+    const char *alias, *ifunc;
     const char *cleanup;
     const char *section, *deprecated;
     unsigned iso_alignment, gnu_alignment, alignment_attributes;
     unsigned constructor_priority, destructor_priority;
     unsigned attribute_markers;
     AllocationSize allocation;
+    unsigned allocation_alignment;
+    const AssumedAlignment *assumed_alignment;
     const PatchableEntries *patchable_entries, *inherited_patchable_entries;
     Sentinels sentinels;
+    const FormatSpec *format_spec;
+    const ParameterIndices *format_args;
     FunctionNullability nullability;
     const AccessClauses *accesses;
     TypeAttributes type_attributes;
@@ -311,7 +330,8 @@ enum {
     DEFAULT_ALIGNED_ATTRIBUTE = 1u << 17,
     MARK_NOINLINE = 1u << 0, MARK_USED = 1u << 1,
     DEFAULT_CONSTRUCTOR_ATTRIBUTE = 1u << 2, DEFAULT_DESTRUCTOR_ATTRIBUTE = 1u << 3,
-    MARK_NORETURN = 1u << 4, MARK_WARN_UNUSED_RESULT = 1u << 5, MARK_NOPLT = 1u << 6
+    MARK_NORETURN = 1u << 4, MARK_WARN_UNUSED_RESULT = 1u << 5, MARK_NOPLT = 1u << 6,
+    MARK_LEAF = 1u << 7, MARK_HOT = 1u << 8, MARK_COLD = 1u << 9, MARK_RETURNS_TWICE = 1u << 10
 };
 
 typedef enum {
@@ -319,7 +339,7 @@ typedef enum {
     N_UNARY, N_BINARY, N_ASSIGN, N_UPDATE, N_COND, N_CALL, N_SEQUENCE, N_INIT,
     N_DESIGNATE, N_RANGE_VALUE, N_COMPOUND, N_STATEMENT_EXPR, N_VA_START, N_VA_ARG, N_VA_END,
     N_BLOCK, N_EXPR, N_DECL, N_IF, N_LOOP, N_DO, N_RETURN, N_BREAK, N_CONTINUE,
-    N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL, N_INDIRECT_GOTO, N_TRAP, N_ASM, N_FALLTHROUGH,
+    N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL, N_INDIRECT_GOTO, N_TRAP, N_FALLTHROUGH,
     N_PREFETCH, N_CLEAR_CACHE, N_CLEAR_PADDING, N_SETJMP, N_LONGJMP, N_FRAME_QUERY,
     N_STACK_SAVE, N_STACK_RESTORE, N_SPECULATION_SAFE_VALUE, N_SYSTEM_REGISTER,
     N_LOCAL_LABEL, N_NONLOCAL_GOTO, N_ATOMIC, N_OVERFLOW, N_CARRY, N_OBJECT_SIZE, N_OBJECT_REMAINING, N_ALLOCA,
@@ -334,32 +354,17 @@ enum { CAST_EXCESS_PRECISION = 1 };
 enum { FLOAT_BITS_LITERAL = 1 };
 enum { PACKED_BIT_FIELD = 1 };
 enum { DEFAULT_LIFECYCLE_PRIORITY = 65535 };
-enum { ASM_VOLATILE = 1, ASM_INLINE = 2, ASM_GOTO = 4, ASM_MAX_OPERANDS = 30 };
-
-typedef struct {
-    const char *name, *constraint;
-    Node *expression;
-    Loc loc;
-    bool addressable;
-} AsmOperand;
-typedef VECTOR(AsmOperand) AsmOperands;
-struct InlineAssembly {
-    const char *text;
-    AsmOperands operands;
-    Strings clobbers;
-    Nodes labels;
-    size_t outputs, extra_inputs;
-};
 
 struct Node {
     NodeKind kind;
     Loc loc;
     Type *type, *operand_type;
     Node *left, *right, *third, *fourth;
+    Node *object_subsize, *object_displacement;
     Nodes list;
     Symbol *symbol;
+    Symbol *extent_source;
     const Member *member;
-    InlineAssembly *inline_asm;
     const char *name;
     uint64_t integer, integer_high;
     long double real;
@@ -383,24 +388,22 @@ typedef enum { INLINE_ORDINARY, INLINE_ISO, INLINE_GNU_EXTERN } InlineDefinition
 struct Symbol {
     const char *name;
     const char *assembly;
-    const char *alias;
+    const char *alias, *ifunc;
     const char *section, *deprecated;
     CallDiagnostics call_diagnostics;
     const PatchableEntries *patchable_entries;
-    const char *asm_text;
-    AsmPlan *asm_plan;
-    Loc loc;
+    Loc loc, function_definition_loc, function_end_loc;
     Type *type;
     bool local, internal, defined, tentative, is_typedef, enum_constant, read_only;
     bool thread_local_storage, forward_parameter;
     bool label_referenced, label_address_taken;
     bool explicit_asm_name;
-    bool has_nonlocal_labels, has_builtin_setjmp, has_explicit_stack;
+    bool has_nonlocal_labels, has_builtin_setjmp, has_returns_twice, has_explicit_stack;
     bool captured_in_nested_function, address_taken;
     bool has_stack_alloca, has_variable_temporary;
     bool iso_external;
     bool weak, weak_reference, explicit_visibility;
-    bool pointer_size_untracked, has_switch;
+    bool pointer_size_untracked, has_switch, array_layout_size;
     bool checking_extent, checked_extent, constant_extent;
     unsigned inline_declarations;
     unsigned register_binding;
@@ -415,7 +418,7 @@ struct Symbol {
     Node *init, *body, *cleanup;
     Symbol *owner, *static_chain, *trampolines;
     Symbol *nonlocal_state;
-    Symbol *object_extent;
+    Symbol *object_extent, *object_subextent, *object_base;
     uint64_t extent_value;
     Symbols locals, params, labels;
     Nodes object_size_queries, pointer_assignments, fortified_calls, parameter_bounds;
@@ -447,16 +450,20 @@ struct Context {
     RecordBoundsScope *record_bounds_scope;
     Macro *macros;
     SavedMacro *saved_macros;
+    SourceIdentity *source_identities;
     PackSetting *pack_stack;
     const DiagnosticState *diagnostics;
     const IgnoredAttribute *ignored_attributes;
     VECTOR(const DiagnosticState *) diagnostic_stack;
     WarningOption warnings[WARNING_COUNT];
     bool warnings_as_errors, suppress_warnings, warn_all, warn_extra, syntax_only;
+    FILE *stack_usage_report;
     bool no_delete_null_pointer_checks;
     bool no_plt;
     PatchableEntry patchable_entry;
-    unsigned fallthrough_level;
+    unsigned fallthrough_level, format_level;
+    uint64_t alloca_warning_limit, vla_warning_limit, frame_warning_limit, stack_warning_limit;
+    bool alloca_warning_limit_set, vla_warning_limit_set, frame_warning_limit_set, stack_warning_limit_set;
     VECTOR(WeakPragma) weak_pragmas;
     VECTOR(Visibility) visibility_stack;
     Visibility default_visibility, pragma_visibility;
@@ -474,7 +481,7 @@ struct Context {
     bool freestanding, no_builtin;
     bool force_pack;
     unsigned char default_pack_alignment, pack_alignment;
-    Strings once, poisoned_identifiers;
+    Strings poisoned_identifiers;
     Tokens tokens;
     size_t current;
     unsigned enum_tag_context;
@@ -550,8 +557,18 @@ const PatchableEntries *patchable_entry_spec(Context *, Node *, Node *, Loc);
 const PatchableEntries *combine_patchable_entries(Context *, const PatchableEntries *, const PatchableEntries *);
 AllocationSize allocation_size_spec(Context *, Node *, Node *, Loc);
 Type *allocation_size_type(Context *, Type *, AllocationSize, Loc);
+unsigned allocation_alignment_spec(Context *, Node *, Loc);
+Type *allocation_alignment_type(Context *, Type *, unsigned, Loc);
+const AssumedAlignment *assumed_alignment_spec(Context *, Node *, Node *, Loc);
+Type *assumed_alignment_type(Context *, Type *, const AssumedAlignment *, Loc);
 Sentinels combine_sentinels(Context *, Sentinels, Sentinels);
 Sentinels sentinel_spec(Context *, Node *, Loc);
+const FormatSpec *format_attribute_spec(Context *, const char *, Node *, Node *, Loc);
+Type *format_attribute_type(Context *, Type *, const FormatSpec *);
+const FormatSpec *combine_format_specs(Context *, const FormatSpec *, const FormatSpec *);
+const ParameterIndices *format_argument_spec(Context *, Node *, Loc);
+const ParameterIndices *combine_format_arguments(Context *, const ParameterIndices *, const ParameterIndices *);
+Type *format_argument_type(Context *, Type *, const ParameterIndices *, Loc);
 Type *sentinel_type(Context *, Type *, Sentinels, Loc);
 FunctionNullability combine_nullability(Context *, FunctionNullability, FunctionNullability);
 FunctionNullability nonnull_spec(Context *, Nodes, Loc);
@@ -660,9 +677,6 @@ Node *labeled_statement(Context *, const char *, Node *, bool, Loc);
 Node *label_address(Context *, const char *, Loc);
 Node *indirect_goto(Context *, Node *, Loc);
 const char *asm_string(Context *, Node *, Loc);
-Node *asm_statement(Context *, Node *, bool, Loc);
-Node *extended_asm(Context *, Node *, InlineAssembly *, unsigned, Loc);
-Node *asm_goto_label(Context *, const char *, Loc);
 Symbol *explicit_register_object(Context *, Node *, size_t *);
 bool address_constant(Context *, Node *, Symbol **, uint64_t *);
 Node *begin_function(Context *, Specs, Decl *, Loc);
@@ -684,14 +698,15 @@ static inline bool address_value(Type *t)
 }
 bool same_type(Type *, Type *);
 bool function_noreturn(Context *, const Symbol *);
+bool function_returns_twice(Context *, const Symbol *);
 
 typedef enum {
     I_IMMEDIATE, I_REAL, I_ADDRESS, I_LOAD, I_STORE, I_COPY, I_CAST, I_UNARY, I_BINARY,
     I_LABEL, I_JUMP, I_ZERO, I_CALL, I_RETURN, I_MEMCOPY, I_MEMZERO, I_VA_START, I_VA_ARG,
-    I_BITLOAD, I_BITSTORE, I_STACK_SAVE, I_STACK_ALLOC, I_STACK_RESTORE, I_INDIRECT_JUMP, I_TRAP, I_ASM,
+    I_BITLOAD, I_BITSTORE, I_STACK_SAVE, I_STACK_ALLOC, I_STACK_RESTORE, I_INDIRECT_JUMP, I_TRAP,
     I_SPECULATION_BARRIER, I_SYSTEM_REGISTER,
     I_PREFETCH, I_SETJMP, I_LONGJMP,
-    I_FRAME, I_FRAME_RETURN, I_EXTENDED_ASM, I_ASM_OUTPUT, I_REGISTER_READ, I_REGISTER_WRITE,
+    I_FRAME, I_FRAME_RETURN, I_REGISTER_READ, I_REGISTER_WRITE,
     I_FLOW_STATEMENT, I_FALLTHROUGH, I_CASE_BOUNDARY, I_NOP, I_NONNULL_COMPARE, I_NONNULL_WRITE
 } Opcode;
 typedef VECTOR(size_t) Values;
@@ -708,8 +723,6 @@ typedef struct {
     Symbol *symbol;
     union { const Node *access_call; Node *branch_condition, *stored_value; };
     size_t *access_argument_starts;
-    const char *asm_text;
-    AsmPlan *asm_plan;
     Values args;
     Types arg_types;
 } Inst;
@@ -719,10 +732,14 @@ typedef struct {
     Symbol *function;
     VECTOR(FrameSlot) slots;
     Instructions instructions;
+    uint64_t dynamic_stack_bound;
+    bool has_dynamic_stack, dynamic_stack_unbounded;
 } FunctionIR;
 
 bool lower(Context *, Symbol *, FunctionIR *);
 size_t layout_frame_slot(size_t *, FrameSlot);
+void check_frame_size(Context *, const Symbol *, size_t);
+void check_stack_usage(Context *, const FunctionIR *, size_t, size_t, bool);
 bool emit_aarch64(Context *, FILE *);
 bool emit_x86_64(Context *, FILE *);
 uint64_t float_bits(long double, unsigned format);

@@ -15,7 +15,7 @@ typedef struct {
     Mode mode;
     Strings inputs, link_args, scratch, after_includes;
     const char *output, *directory;
-    bool stopped, strip_line_markers;
+    bool stopped, strip_line_markers, stack_usage;
     unsigned serial;
 } Driver;
 
@@ -28,7 +28,7 @@ static void usage(FILE *out)
           "       -fgnu89-inline, -fno-gnu89-inline, -fshort-enums, -fno-short-enums\n"
           "       -fpack-struct[=N], -fno-pack-struct, -fvisibility=MODE\n"
           "       -ffreestanding, -fhosted, -fno-builtin, -fno-builtin-NAME\n"
-          "       -fplt, -fno-plt, -fpatchable-function-entry=N[,M]\n"
+          "       -fplt, -fno-plt, -fpatchable-function-entry=N[,M], -fstack-usage\n"
           "       -static, -shared, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
           "       --target=aarch64-linux-gnu or --target=x86_64-linux-gnu\n"
           "       Includes mas and mld. Hosted links use the target's glibc.\n", out);
@@ -137,6 +137,8 @@ static void parse_options(Driver *d, int argc, char **argv)
             c->freestanding = c->no_builtin = false;
         } else if (equal(arg, "-fdelete-null-pointer-checks") || equal(arg, "-fno-delete-null-pointer-checks")) {
             c->no_delete_null_pointer_checks = equal(arg, "-fno-delete-null-pointer-checks");
+        } else if (equal(arg, "-fstack-usage") || equal(arg, "-fno-stack-usage")) {
+            d->stack_usage = equal(arg, "-fstack-usage");
         } else if (equal(arg, "-fplt") || equal(arg, "-fno-plt")) {
             c->no_plt = equal(arg, "-fno-plt");
         } else if (starts(arg, "-fpatchable-function-entry=")) {
@@ -275,7 +277,7 @@ static void system_headers(Context *c)
     }
 }
 
-static bool compile_source(Driver *d, const char *path, FILE *out)
+static bool compile_source(Driver *d, const char *path, FILE *out, FILE *stack_report)
 {
     Context c = {
         .target = d->options.target, .dialect = d->options.dialect,
@@ -288,7 +290,16 @@ static bool compile_source(Driver *d, const char *path, FILE *out)
         .no_plt = d->options.no_plt,
         .patchable_entry = d->options.patchable_entry,
         .fallthrough_level = d->options.fallthrough_level,
-        .syntax_only = d->mode == CHECK,
+        .format_level = d->options.format_level,
+        .alloca_warning_limit = d->options.alloca_warning_limit,
+        .alloca_warning_limit_set = d->options.alloca_warning_limit_set,
+        .vla_warning_limit = d->options.vla_warning_limit,
+        .vla_warning_limit_set = d->options.vla_warning_limit_set,
+        .frame_warning_limit = d->options.frame_warning_limit,
+        .frame_warning_limit_set = d->options.frame_warning_limit_set,
+        .stack_warning_limit = d->options.stack_warning_limit,
+        .stack_warning_limit_set = d->options.stack_warning_limit_set,
+        .syntax_only = d->mode == CHECK, .stack_usage_report = stack_report,
         .ignored_attributes = d->options.ignored_attributes,
         .suppress_warnings = d->options.suppress_warnings,
         .force_pack = d->options.force_pack, .default_pack_alignment = d->options.default_pack_alignment,
@@ -332,7 +343,7 @@ static const char *basename_output(Driver *d, const char *path, const char *ext)
     return format(&d->options, "%.*s.%s", len, name, ext);
 }
 
-static const char *stage(Driver *d, const char *destination)
+static const char *stage_file(Driver *d, const char *destination, bool executable)
 {
     Context *c = &d->options;
     struct stat output;
@@ -358,7 +369,7 @@ static const char *stage(Driver *d, const char *destination)
     }
     mode_t mask = umask(0);
     umask(mask);
-    if (fchmod(fd, (d->mode == LINK ? 0777 : 0666) & ~mask) < 0) {
+    if (fchmod(fd, (executable ? 0777 : 0666) & ~mask) < 0) {
         error(c, (Loc){0}, "%s: %s", name, strerror(errno));
         close(fd);
         unlink(name);
@@ -369,6 +380,37 @@ static const char *stage(Driver *d, const char *destination)
     return name;
 }
 
+static const char *stage(Driver *d, const char *destination)
+{
+    return stage_file(d, destination, d->mode == LINK);
+}
+
+/* GCC derives auxiliary files from the requested final output, not from the
+   compiler driver's temporary assembly and object paths. */
+static const char *stack_report_output(Driver *d, const char *input, const char *destination)
+{
+    Context *c = &d->options;
+    if (!d->stack_usage)
+        return NULL;
+    if (d->mode == LINK) {
+        const char *output = d->output ? d->output : "a.out";
+        const char *name = strrchr(output, '/');
+        name = name ? name + 1 : output;
+        const char *source = basename_output(d, input, "su");
+        int length = (int)strlen(output);
+        if (equal(name, "a.out"))
+            length -= 4;
+        return format(c, "%.*s-%s", length, output, source);
+    }
+    if (!destination || equal(destination, "-"))
+        return basename_output(d, input, "su");
+    const char *name = strrchr(destination, '/');
+    name = name ? name + 1 : destination;
+    const char *dot = strrchr(name, '.');
+    size_t length = dot && dot != name ? (size_t)(dot - destination) : strlen(destination);
+    return format(c, "%.*s.su", (int)length, destination);
+}
+
 static bool publish(Driver *d, const char *path, const char *output)
 {
     if (rename(path, output) == 0)
@@ -377,7 +419,7 @@ static bool publish(Driver *d, const char *path, const char *output)
     return false;
 }
 
-static bool from_source(Driver *d, const char *path, const char *output)
+static bool from_source(Driver *d, const char *path, const char *output, const char *report_destination)
 {
     bool standard = output && equal(output, "-");
     FILE *file = standard ? stdout :
@@ -386,12 +428,30 @@ static bool from_source(Driver *d, const char *path, const char *output)
         error(&d->options, (Loc){0}, "cannot open compiler output: %s", strerror(errno));
         return false;
     }
-    bool ok = compile_source(d, path, file);
+    const char *report_stage = report_destination ? stage_file(d, report_destination, false) : NULL;
+    FILE *report = report_stage ? fopen(report_stage, "wb") : NULL;
+    if (report_destination && !report) {
+        if (report_stage)
+            error(&d->options, (Loc){0}, "cannot open stack usage output: %s", strerror(errno));
+        if (!standard)
+            fclose(file);
+        return false;
+    }
+    bool ok = compile_source(d, path, file, report);
+    if (report) {
+        bool failed = ferror(report) != 0;
+        if (fclose(report) == EOF)
+            failed = true;
+        if (failed) {
+            error(&d->options, (Loc){0}, "cannot finish stack usage output: %s", strerror(errno));
+            ok = false;
+        }
+    }
     if ((standard ? fflush(file) : fclose(file)) == EOF) {
         error(&d->options, (Loc){0}, "cannot finish compiler output: %s", strerror(errno));
         ok = false;
     }
-    return ok;
+    return ok && (!report_stage || publish(d, report_stage, report_destination));
 }
 
 static bool assemble(Driver *d, const char *input, const char *obj)
@@ -455,7 +515,7 @@ static bool link_objects(Driver *d, Strings objects)
 static bool run_driver(Driver *d)
 {
     Context *c = &d->options;
-    Strings objects = {0}, destinations = {0};
+    Strings objects = {0}, destinations = {0}, reports = {0};
     const char *combined = NULL;
     if (d->mode == PREPROCESS && d->output && !equal(d->output, "-")) {
         combined = stage(d, d->output);
@@ -474,11 +534,24 @@ static bool run_driver(Driver *d)
             return false;
         }
         if (d->mode == LINK || d->mode == ASSEMBLE) {
-            const char *assembly = source ? temporary(d, "s") : input;
-            if (!assembly || (source && !from_source(d, input, assembly)))
-                return false;
             const char *dest = NULL;
             if (d->mode == ASSEMBLE && !(dest = input_output(d, &destinations, input, "o")))
+                return false;
+            const char *report = source ? stack_report_output(d, input, dest) : NULL;
+            if (report) {
+                if (dest && equal(dest, report)) {
+                    error(c, (Loc){0}, "stack usage output aliases compiler output '%s'", dest);
+                    return false;
+                }
+                for (size_t j = 0; j < reports.len; j++)
+                    if (equal(reports.data[j], report)) {
+                        error(c, (Loc){0}, "multiple inputs map to stack usage output '%s'", report);
+                        return false;
+                    }
+                PUSH(c, reports, report);
+            }
+            const char *assembly = source ? temporary(d, "s") : input;
+            if (!assembly || (source && !from_source(d, input, assembly, report)))
                 return false;
             const char *object = dest ? stage(d, dest) : temporary(d, "o");
             if (!object || !assemble(d, assembly, object))
@@ -496,17 +569,22 @@ static bool run_driver(Driver *d)
             return false;
         }
         if (d->mode == CHECK) {
-            if (!from_source(d, input, NULL))
+            if (!from_source(d, input, NULL, NULL))
                 return false;
         } else if (d->mode == PREPROCESS) {
-            if (!from_source(d, input, combined ? combined : "-"))
+            if (!from_source(d, input, combined ? combined : "-", NULL))
                 return false;
         } else {
             const char *dest = input_output(d, &destinations, input, "s");
             if (!dest)
                 return false;
+            const char *report = stack_report_output(d, input, dest);
+            if (report && equal(dest, report)) {
+                error(c, (Loc){0}, "stack usage output aliases compiler output '%s'", dest);
+                return false;
+            }
             const char *output = equal(dest, "-") ? dest : stage(d, dest);
-            if (!output || !from_source(d, input, output) ||
+            if (!output || !from_source(d, input, output, report) ||
                 (!equal(dest, "-") && !publish(d, output, dest)))
                 return false;
         }

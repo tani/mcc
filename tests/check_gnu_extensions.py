@@ -97,6 +97,16 @@ VALUE
         assert re.findall(r"\w+|,", result.stdout) == expected.split(), result.stdout
 
 
+def register_probe_object(mcc, gcc, root, target, cc):
+    arch = (target if cc == mcc and target else os.uname().machine).split("-")[0]
+    fixture = Path(__file__).parent / "fixtures" / f"register-probes-{arch}.s"
+    obj = root / f"register-probes-{arch}-{"mcc" if cc == mcc else "gcc"}.o"
+    if not obj.exists():
+        flags = [f"--target={target}"] if cc == mcc and target else []
+        require(invoke([cc, *flags, "-c", fixture, "-o", obj]), f"{cc} assemble register probes")
+    return obj
+
+
 def compile_and_run(mcc, gcc, root, target, runner, later_dialects):
     cases = [
         ("gnu11", """
@@ -121,11 +131,10 @@ _Static_assert(_Minof(signed char) == -128 && _Maxof(unsigned char) == 255, "lim
 int main(void) { return example(3); }
 """),
         ("gnu11", r"""
-asm(".data\n.p2align 2\n.globl gnu_probe_value\ngnu_probe_value:\n.long 17\n.text");
+int gnu_probe_value = 17;
 extern int from_asm asm("gnu_probe_" "value");
 static int renamed(void) __asm__("gnu_probe_function");
 static int renamed(void) {
-    asm volatile ("nop");
     return from_asm;
 }
 int main(void) { return renamed() != 17; }
@@ -208,11 +217,6 @@ int main(void) {
 """),
     ]
     cases.append(("gnu11", r"""
-#if defined(__aarch64__)
-asm(".text\n.globl read_chain\nread_chain:\nldr w0, [x18]\nret");
-#else
-asm(".text\n.globl read_chain\nread_chain:\nmovl (%r10), %eax\nret");
-#endif
 extern int read_chain(void);
 int main(void) {
     int data[] = {3, 7};
@@ -306,7 +310,11 @@ int main(void) { return enclosing(3, 10) || activate(1, 0) || escape(6) || paral
             if mode != "gnu11":
                 flags += ["-pedantic-errors"]
             binary = root / "extension-probe"
-            require(invoke([cc, *flags, f"-std={mode}", "-ftrampoline-impl=heap", "-pthread", "-", "-o", binary],
+            extra = []
+            if "extern int read_chain(void);" in source:
+                extra = ["-x", "none", register_probe_object(mcc, gcc, root, target, cc)] if cc == gcc else [
+                    register_probe_object(mcc, gcc, root, target, cc)]
+            require(invoke([cc, *flags, f"-std={mode}", "-ftrampoline-impl=heap", "-pthread", "-", *extra, "-o", binary],
                            source), f"{cc} {mode}")
             prefix = runner if cc == mcc else []
             require(invoke([*prefix, binary]), f"{cc} {mode} executable")
@@ -600,6 +608,7 @@ int main(void) {
     require(invoke([gcc, "-std=c11", "-pedantic-errors", "-pthread", "-x", "c", "-", "-latomic",
                     "-o", binary], source), "atomic GCC build")
     require(invoke([binary]), "atomic GCC execution")
+    atomic_shared_libraries(mcc, gcc, root, target, runner)
     if target is None:
         atomic_abi(mcc, gcc, root)
     for invalid in (
@@ -611,6 +620,275 @@ int main(void) {
     ):
         require(invoke([mcc, "-std=c11", "-fsyntax-only", "-"], invalid),
                 invalid, success=False)
+
+
+def atomic_lock_free_alignment(mcc, gcc, root, target, runner):
+    source = root / "atomic-lock-free-alignment.c"
+    source.write_text("""
+#include <stddef.h>
+_Alignas(16) static unsigned char data[32];
+struct __attribute__((packed)) item { unsigned char tag; int value; };
+struct __attribute__((packed)) outer { unsigned char padding[3]; struct item item; };
+_Alignas(16) static struct item bad;
+_Alignas(16) static struct outer good;
+static unsigned calls;
+static void *allocate(unsigned alignment) __attribute__((alloc_align(1)));
+static void *allocate(unsigned alignment) { (void)alignment; ++calls; return data; }
+static int int_pointer(int *p, unsigned i) { return __atomic_always_lock_free(4, p + i); }
+static int char_cast(char *p, unsigned i) { return __atomic_always_lock_free(4, (int *)(p + 4*i)); }
+int main(int argc, char **argv) {
+    int objects[4];
+    int *p = objects;
+    int n = 0;
+    (void)argv;
+    if (!__atomic_always_lock_free(1, data + 1) || !__atomic_always_lock_free(4, 0) ||
+        __atomic_always_lock_free(16, 0)) return 1;
+    if (!int_pointer(objects, 2) || char_cast((char *)data, 1)) return 2;
+    if (!__atomic_always_lock_free(4, p++) || p != objects) return 3;
+    if (__atomic_always_lock_free(4, (int *)(data + n++)) || n) return 4;
+    if (__atomic_always_lock_free(4, (int *)(data + (_Bool)(argc * 8)))) return 5;
+#ifdef __MCC__
+    if (__atomic_always_lock_free(4, &bad.value) || __atomic_is_lock_free(4, &bad.value)) return 6;
+    if (!__atomic_always_lock_free(4, &good.item.value) || !__atomic_is_lock_free(4, &good.item.value)) return 7;
+    if (__atomic_always_lock_free(4, (int *)(data + 1)) ||
+        !__atomic_always_lock_free(4, (int *)(data + 4))) return 8;
+    if (!__atomic_always_lock_free(4, allocate(16)) ||
+        __atomic_always_lock_free(4, allocate(2)) ||
+        __atomic_always_lock_free(4, allocate(12)) || calls) return 9;
+    if (!__atomic_always_lock_free(4, argc ? data + 4 : data + 8) ||
+        __atomic_always_lock_free(4, argc ? data + 4 : data + 1)) return 10;
+#endif
+    return 0;
+}
+""")
+    binary = root / "atomic-lock-free-alignment"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O0"]
+        require(invoke([cc, *options, "-std=c11", "-pedantic-errors", source, "-o", binary]),
+                f"{cc} compile lock-free alignment cases")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} execute lock-free alignment cases")
+
+
+def atomic_hardware_lock_elision(mcc, gcc, root, target, runner):
+    arch = (target or os.uname().machine).split("-")[0]
+    flags = [f"--target={target}"] if target else []
+    if arch != "x86_64":
+        source = """
+#if defined(__ATOMIC_HLE_ACQUIRE) || defined(__ATOMIC_HLE_RELEASE)
+#error HLE macros must be target-specific
+#endif
+int f(int *p) { return __atomic_exchange_n(p, 1, 2 | 65536); }
+"""
+        result = invoke([mcc, *flags, "-std=c11", "-S", "-o", root / "hle-invalid.s", "-"], source)
+        require(result, "diagnose x86-only HLE on another target")
+        assert "[-Winvalid-memory-model]" in result.stderr, result.stderr
+        return
+
+    fixture = Path(__file__).parent / "fixtures"
+    runtime = fixture.parent.parent / "src" / "rt" / "atomic.c"
+    runtime_object = root / "atomic-hle-runtime.o"
+    binary = root / "atomic-hle"
+    require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", "-c", runtime, "-o", runtime_object]),
+            "compile instrumented HLE runtime")
+    require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", "-Werror=invalid-memory-model",
+                    fixture / "atomic-hle-dispatch.c", runtime_object, "-o", binary]),
+            "compile instrumented HLE dispatch")
+    require(invoke([*runner, binary]), "verify HLE dispatch and fallback")
+
+    source = fixture / "atomic-hle-threads.c"
+    require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", "-Werror=invalid-memory-model",
+                    "-pthread", source, "-o", binary]), "compile HLE threaded test")
+    require(invoke([*runner, binary]), "run HLE threaded test")
+    code = binary.read_bytes()
+    for prefix in (b"\xf2", b"\xf3"):
+        for instruction in (b"\xf0\x48\x0f\xb1\x17", b"\xf0\x0f\xb0\x17",
+                            b"\xf0\x66\x0f\xb1\x17", b"\xf0\x0f\xb1\x17",
+                            b"\x48\x87\x37", b"\x40\x86\x37",
+                            b"\x66\x87\x37", b"\x87\x37"):
+            assert prefix + instruction in code, (prefix, instruction)
+    if os.uname().machine == "x86_64":
+        require(invoke([gcc, "-std=c11", "-pedantic-errors", "-Werror=invalid-memory-model",
+                        "-pthread", source, "-o", binary]), "compile GCC HLE threaded reference")
+        require(invoke([binary]), "run GCC HLE threaded reference")
+
+    invalid = (
+        "__ATOMIC_RELEASE | __ATOMIC_HLE_ACQUIRE",
+        "__ATOMIC_ACQUIRE | __ATOMIC_HLE_RELEASE",
+        "__ATOMIC_SEQ_CST | __ATOMIC_HLE_ACQUIRE | __ATOMIC_HLE_RELEASE",
+        "__ATOMIC_SEQ_CST | 262144",
+    )
+    for order in invalid:
+        source = f"int f(int *p) {{ return __atomic_exchange_n(p, 1, {order}); }}"
+        command = [mcc, *flags, "-std=c11", "-S", "-o", root / "hle-invalid.s"]
+        result = invoke([*command, "-"], source)
+        require(result, f"diagnose HLE order {order}")
+        assert "[-Winvalid-memory-model]" in result.stderr, result.stderr
+        require(invoke([*command, "-Werror=invalid-memory-model", "-"], source),
+                f"promote invalid HLE order {order}", success=False)
+        result = invoke([*command, "-Wno-invalid-memory-model", "-"], source)
+        require(result, f"suppress invalid HLE order {order}")
+        assert not result.stderr, result.stderr
+
+    comparison = """
+int f(int *p, int *e) {
+    return __atomic_compare_exchange_n(p, e, 1, 0,
+        __ATOMIC_ACQUIRE | __ATOMIC_HLE_ACQUIRE, __ATOMIC_SEQ_CST);
+}
+"""
+    result = invoke([mcc, *flags, "-std=c11", "-S", "-o", root / "hle-invalid.s", "-"], comparison)
+    require(result, "diagnose stronger compare-exchange failure order")
+    assert "[-Winvalid-memory-model]" in result.stderr, result.stderr
+
+
+def atomic_shared_libraries(mcc, gcc, root, target, runner):
+    provider = root / "atomic-shared-provider.c"
+    provider.write_text("""
+#include <stdatomic.h>
+struct item { unsigned long a, b, c; };
+extern unsigned long __mcc_atomic_object_lock __attribute__((weak));
+static int *closed;
+__attribute__((visibility("default")))
+void *lock_address(void) { return &__mcc_atomic_object_lock; }
+__attribute__((visibility("default")))
+void set_closed(int *value) { closed = value; }
+__attribute__((destructor))
+static void close_plugin(void) { if (closed) ++*closed; }
+__attribute__((visibility("default")))
+void work(_Atomic(struct item) *p, unsigned long count) {
+    for (unsigned long i = 0; i < count; ++i) {
+        struct item value = atomic_load(p), next;
+        do {
+            next = (struct item){value.a + 1, value.b + 1, value.c + 1};
+        } while (!atomic_compare_exchange_weak(p, &value, next));
+    }
+}
+""")
+    main = root / "atomic-shared-main.c"
+    main.write_text("""
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdatomic.h>
+#include <dlfcn.h>
+#include <string.h>
+struct item { unsigned long a, b, c; };
+static _Atomic(struct item) shared;
+typedef void (*work_fn)(_Atomic(struct item) *, unsigned long);
+typedef void *(*address_fn)(void);
+typedef void (*set_closed_fn)(int *);
+static work_fn workers[2];
+static void *thread(void *i) {
+    unsigned index = *(unsigned *)i;
+    workers[index](&shared, 10000);
+    return 0;
+}
+#ifdef OWN
+extern unsigned long __mcc_atomic_object_lock;
+static void own(void) {
+    for (unsigned i = 0; i < 10000; ++i) {
+        struct item value = atomic_load(&shared), next;
+        do {
+            next = (struct item){value.a + 1, value.b + 1, value.c + 1};
+        } while (!atomic_compare_exchange_weak(&shared, &value, next));
+    }
+}
+#endif
+int main(int argc, char **argv) {
+    if (argc != 3) return 1;
+    void *handles[2], *locks[2];
+    int closed = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        handles[i] = dlopen(argv[i + 1], RTLD_NOW | RTLD_LOCAL);
+        if (!handles[i]) return 2;
+        union { void *object; work_fn function; } work;
+        union { void *object; address_fn function; } address;
+        union { void *object; set_closed_fn function; } set_closed;
+        work.object = dlsym(handles[i], "work");
+        address.object = dlsym(handles[i], "lock_address");
+        set_closed.object = dlsym(handles[i], "set_closed");
+        if (!work.object || !address.object || !set_closed.object) return 3;
+        workers[i] = work.function;
+        locks[i] = address.function();
+        set_closed.function(&closed);
+    }
+    if (locks[0] != locks[1]) return 4;
+#ifdef OWN
+    if (locks[0] != &__mcc_atomic_object_lock) return 5;
+#endif
+    pthread_t threads[6];
+    unsigned indices[6];
+    for (unsigned i = 0; i < 6; ++i) {
+        indices[i] = i % 2;
+        if (pthread_create(&threads[i], 0, thread, &indices[i])) return 6;
+    }
+#ifdef OWN
+    own();
+#endif
+    for (unsigned i = 0; i < 6; ++i)
+        if (pthread_join(threads[i], 0)) return 7;
+    struct item result;
+    memcpy(&result, (const void *)&shared, sizeof result);
+    unsigned long expected = 60000;
+#ifdef OWN
+    expected += 10000;
+#endif
+    if (result.a != expected || result.b != result.a || result.c != result.a) return 8;
+    if (dlclose(handles[0]) || dlclose(handles[1])) return 9;
+    return closed == 2 ? 0 : 10;
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    first, second = root / "atomic-first.so", root / "atomic-second.so"
+    binary = root / "atomic-shared-main"
+    for visibility in ([], ["-fvisibility=hidden"]):
+        require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", "-shared", "-fPIC",
+                        *visibility, provider, "-o", first]), "build atomic shared library")
+        second.write_bytes(first.read_bytes())
+        dynamic = invoke(["readelf", "--dyn-syms", "-W", first])
+        require(dynamic, "inspect shared atomic lock")
+        assert re.search(r"(?:NOTYPE|OBJECT)\s+WEAK\s+DEFAULT\s+UND\s+__mcc_atomic_object_lock",
+                         dynamic.stdout), dynamic.stdout
+        for own in (False, True):
+            options = ["-DOWN"] if own else []
+            require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", "-pthread",
+                            *options, main, "-o", binary]), "build atomic shared-library client")
+            dynamic = invoke(["readelf", "--dyn-syms", "-W", binary])
+            require(dynamic, "inspect executable atomic lock")
+            assert re.search(r"OBJECT\s+(?:UNIQUE|<OS specific>:\s*10)\s+DEFAULT\s+\S+\s+__mcc_atomic_object_lock",
+                             dynamic.stdout), dynamic.stdout
+            require(invoke([*runner, binary, first, second]), "share atomic lock across local libraries")
+    if target is None:
+        host = root / "atomic-shared-host.c"
+        host.write_text("""
+#include <dlfcn.h>
+#include <stdatomic.h>
+#include <string.h>
+struct item { unsigned long a, b, c; };
+typedef void (*work_fn)(_Atomic(struct item) *, unsigned long);
+typedef void (*set_closed_fn)(int *);
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return 2;
+    union { void *object; work_fn function; } work;
+    union { void *object; set_closed_fn function; } set_closed;
+    work.object = dlsym(handle, "work");
+    set_closed.object = dlsym(handle, "set_closed");
+    if (!work.object || !set_closed.object) return 3;
+    int closed = 0;
+    set_closed.function(&closed);
+    _Atomic(struct item) item = {0};
+    work.function(&item, 7);
+    struct item result;
+    memcpy(&result, (const void *)&item, sizeof result);
+    if (dlclose(handle) || closed != 1) return 4;
+    return result.a == 7 && result.b == 7 && result.c == 7 ? 0 : 5;
+}
+""")
+        require(invoke([gcc, "-std=c11", "-pedantic-errors", host, "-o", binary]),
+                "build external atomic shared-library host")
+        require(invoke([binary, first]), "load and unload atomic library in an external host")
 
 
 def atomic_abi(mcc, gcc, root):
@@ -1107,15 +1385,254 @@ int main(void)
 
         invalid = [*prefix, *(["-x", "c"] if cc == gcc else []), "-std=gnu11",
                    "-c", "-o", root / "invalid-padding.o", "-"]
-        for declaration in ("void f(void *p) { __builtin_clear_padding(p); }",
-                            "void f(int p) { __builtin_clear_padding(p); }",
-                            "void f(const int *p) { __builtin_clear_padding(p); }",
-                            "void f(_Atomic int *p) { __builtin_clear_padding(p); }",
-                            "struct S; void f(struct S *p) { __builtin_clear_padding(p); }",
-                            "struct S {int n; char tail[];}; "
-                            "void f(struct S *p) { __builtin_clear_padding(p); }",
-                            "void f(int n) { struct S {char c; int a[n];} s; __builtin_clear_padding(&s); }"):
+        declarations = ["void f(void *p) { __builtin_clear_padding(p); }",
+                        "void f(int p) { __builtin_clear_padding(p); }",
+                        "void f(const int *p) { __builtin_clear_padding(p); }",
+                        "void f(_Atomic int *p) { __builtin_clear_padding(p); }",
+                        "struct S; void f(struct S *p) { __builtin_clear_padding(p); }",
+                        "struct S {int n; char tail[];}; "
+                        "void f(struct S *p) { __builtin_clear_padding(p); }"]
+        if cc == gcc:
+            declarations.append(
+                "void f(int n) { struct S {char c; int a[n];} s; __builtin_clear_padding(&s); }")
+        for declaration in declarations:
             require(invoke(invalid, declaration), f"{cc} reject invalid object for clear padding", success=False)
+
+    variable_record = root / "variable-record-padding.c"
+    variable_record.write_text("""
+#include <stddef.h>
+#include <string.h>
+struct Element { char lead; int value; char tail; };
+static int check(int n) {
+    struct A { long lead; char tail[n]; } a;
+    memset(&a, 255, sizeof a);
+    struct A *p = &a;
+    __builtin_clear_padding(p++);
+    if (p != &a + 1) return 1;
+    unsigned char *bytes = (void *)&a;
+    for (unsigned long i = 0; i < sizeof a; ++i)
+        if (bytes[i] != (i < offsetof(struct A, tail) + (unsigned long)n ? 255 : 0))
+            return 2;
+
+    struct B { unsigned flag:3; unsigned :5; char lead; struct Element tail[n][2]; } b;
+    memset(&b, 255, sizeof b);
+    __builtin_clear_padding((volatile struct B *)&b);
+    bytes = (void *)&b;
+    for (unsigned long i = 0; i < sizeof b; ++i) {
+        unsigned long offset = offsetof(struct B, tail);
+        unsigned expected = i == 0 ? 7 : i == offsetof(struct B, lead) ? 255 : 0;
+        if (i >= offset && i < offset + (unsigned long)n * 2 * sizeof(struct Element)) {
+            unsigned long element = (i - offset) % sizeof(struct Element);
+            int live = element == 0 || (element >= offsetof(struct Element, value) &&
+                       element < offsetof(struct Element, value) + sizeof(int)) ||
+                       element == offsetof(struct Element, tail);
+            expected = live ? 255 : 0;
+        }
+        if (bytes[i] != expected) return 3;
+    }
+
+    struct C { int head; struct A rows[2]; } c;
+    memset(&c, 255, sizeof c);
+    __builtin_clear_padding(&c);
+    bytes = (void *)&c;
+    for (unsigned long i = 0; i < sizeof c; ++i) {
+        unsigned long offset = offsetof(struct C, rows);
+        int live = i < sizeof c.head;
+        if (i >= offset && i < offset + 2 * sizeof(struct A)) {
+            unsigned long element = (i - offset) % sizeof(struct A);
+            live = element < offsetof(struct A, tail) + (unsigned long)n;
+        }
+        if (bytes[i] != (live ? 255 : 0)) return 4;
+    }
+    union D { struct Element entries[n]; } d;
+    memset(&d, 255, sizeof d);
+    __builtin_clear_padding(&d);
+    bytes = (void *)&d;
+    for (unsigned long i = 0; i < sizeof d; ++i) {
+        unsigned long element = i % sizeof(struct Element);
+        int live = element == 0 || (element >= offsetof(struct Element, value) &&
+                   element < offsetof(struct Element, value) + sizeof(int)) ||
+                   element == offsetof(struct Element, tail);
+        if (bytes[i] != (live ? 255 : 0)) return 5;
+    }
+    struct E { char head; long double values[n]; } e;
+    memset(&e, 255, sizeof e);
+    __builtin_clear_padding(&e);
+    bytes = (void *)&e;
+    for (unsigned long i = 0; i < sizeof e; ++i) {
+        unsigned long offset = offsetof(struct E, values);
+        int live = i == 0;
+        if (i >= offset && i < offset + (unsigned long)n * sizeof(long double)) {
+#if defined(__x86_64__)
+            live = (i - offset) % sizeof(long double) < 10;
+#else
+            live = 1;
+#endif
+        }
+        if (bytes[i] != (live ? 255 : 0)) return 6;
+    }
+
+    int m = n + 2;
+    struct Record {
+        unsigned char head;
+        struct Element left[n];
+        unsigned low:3;
+        unsigned :5;
+        unsigned high:5;
+        unsigned long marker;
+        struct Element right[m];
+        unsigned char end;
+    } value, expected;
+    memset(&value, 255, sizeof value);
+    memset(&expected, 0, sizeof expected);
+    expected.head = 255;
+    expected.low = 7;
+    expected.high = 31;
+    expected.marker = ~0ul;
+    expected.end = 255;
+    for (int i = 0; i < n; ++i) {
+        expected.left[i].lead = (char)255;
+        expected.left[i].value = ~0u;
+        expected.left[i].tail = (char)255;
+    }
+    for (int i = 0; i < m; ++i) {
+        expected.right[i].lead = (char)255;
+        expected.right[i].value = ~0u;
+        expected.right[i].tail = (char)255;
+    }
+    struct Record *record = &value;
+    __builtin_clear_padding((volatile struct Record *)record++);
+    if (record != &value + 1 || memcmp(&value, &expected, sizeof value)) return 7;
+
+    union Overlap {
+        struct Element elements[n];
+        unsigned char bytes[m];
+        unsigned direct:3;
+        unsigned :5;
+        unsigned long wide;
+    } overlap, overlap_expected;
+    memset(&overlap, 255, sizeof overlap);
+    memset(&overlap_expected, 0, sizeof overlap_expected);
+    for (int i = 0; i < n; ++i) {
+        overlap_expected.elements[i].lead = (char)255;
+        overlap_expected.elements[i].value = ~0u;
+        overlap_expected.elements[i].tail = (char)255;
+    }
+    for (int i = 0; i < m; ++i) overlap_expected.bytes[i] = 255;
+    overlap_expected.wide = ~0ul;
+    __builtin_clear_padding(&overlap);
+    if (memcmp(&overlap, &overlap_expected, sizeof overlap)) return 8;
+
+    union Bits { unsigned direct:3; unsigned :5; unsigned char bytes[n]; } bits;
+    memset(&bits, 255, sizeof bits);
+    __builtin_clear_padding(&bits);
+    bytes = (void *)&bits;
+    for (unsigned long i = 0; i < sizeof bits; ++i)
+        if (bytes[i] != (i == 0 || i < (unsigned long)n ? 255 : 0)) return 9;
+
+    struct Nested { char head; union Overlap part; short tail; } nested, nested_expected;
+    memset(&nested, 255, sizeof nested);
+    memset(&nested_expected, 0, sizeof nested_expected);
+    nested_expected.head = (char)255;
+    for (int i = 0; i < n; ++i) {
+        nested_expected.part.elements[i].lead = (char)255;
+        nested_expected.part.elements[i].value = ~0u;
+        nested_expected.part.elements[i].tail = (char)255;
+    }
+    for (int i = 0; i < m; ++i) nested_expected.part.bytes[i] = 255;
+    nested_expected.part.wide = ~0ul;
+    nested_expected.tail = -1;
+    __builtin_clear_padding(&nested);
+    if (memcmp(&nested, &nested_expected, sizeof nested)) return 10;
+
+    struct Row { char head; short data[n]; unsigned bits:3; int tail; };
+    struct Outer { char head; struct Row rows[2]; char tail; } outer, outer_expected;
+    memset(&outer, 255, sizeof outer);
+    memset(&outer_expected, 0, sizeof outer_expected);
+    outer_expected.head = (char)255;
+    outer_expected.tail = (char)255;
+    for (int i = 0; i < 2; ++i) {
+        outer_expected.rows[i].head = (char)255;
+        for (int j = 0; j < n; ++j) outer_expected.rows[i].data[j] = -1;
+        outer_expected.rows[i].bits = 7;
+        outer_expected.rows[i].tail = -1;
+    }
+    __builtin_clear_padding(&outer);
+    if (memcmp(&outer, &outer_expected, sizeof outer)) return 11;
+
+    struct __attribute__((packed)) Packed {
+        char data[n];
+        unsigned low:3;
+        unsigned :2;
+        unsigned high:6;
+        long tail;
+    } packed, packed_expected;
+    memset(&packed, 255, sizeof packed);
+    memset(&packed_expected, 0, sizeof packed_expected);
+    for (int i = 0; i < n; ++i) packed_expected.data[i] = (char)255;
+    packed_expected.low = 7;
+    packed_expected.high = 63;
+    packed_expected.tail = -1;
+    __builtin_clear_padding(&packed);
+    if (memcmp(&packed, &packed_expected, sizeof packed)) return 12;
+
+    struct FloatAfter { char data[n]; long double value; char tail; } floating, floating_expected;
+    memset(&floating, 255, sizeof floating);
+    memset(&floating_expected, 0, sizeof floating_expected);
+    for (int i = 0; i < n; ++i) floating_expected.data[i] = (char)255;
+#if defined(__x86_64__)
+    memset(&floating_expected.value, 255, 10);
+#else
+    memset(&floating_expected.value, 255, sizeof floating_expected.value);
+#endif
+    floating_expected.tail = (char)255;
+    __builtin_clear_padding(&floating);
+    if (memcmp(&floating, &floating_expected, sizeof floating)) return 13;
+
+    int dimension = n;
+    struct Captured { char head; int data[dimension]; short tail; } saved, saved_expected;
+    memset(&saved, 255, sizeof saved);
+    memset(&saved_expected, 0, sizeof saved_expected);
+    saved_expected.head = (char)255;
+    for (int i = 0; i < n; ++i) saved_expected.data[i] = -1;
+    saved_expected.tail = -1;
+    dimension = 123;
+    __builtin_clear_padding(&saved);
+    if (memcmp(&saved, &saved_expected, sizeof saved)) return 14;
+
+    struct Empty {};
+    struct Zero { char head; struct Empty data[n]; int tail; } zero, zero_expected;
+    memset(&zero, 255, sizeof zero);
+    memset(&zero_expected, 0, sizeof zero_expected);
+    zero_expected.head = (char)255;
+    zero_expected.tail = -1;
+    __builtin_clear_padding(&zero);
+    if (memcmp(&zero, &zero_expected, sizeof zero)) return 15;
+
+    struct ComplexAfter { char data[n]; _Complex long double value; char tail; } complex, complex_expected;
+    memset(&complex, 255, sizeof complex);
+    memset(&complex_expected, 0, sizeof complex_expected);
+    for (int i = 0; i < n; ++i) complex_expected.data[i] = (char)255;
+#if defined(__x86_64__)
+    memset(&complex_expected.value, 255, 10);
+    memset((char *)&complex_expected.value + sizeof(long double), 255, 10);
+#else
+    memset(&complex_expected.value, 255, sizeof complex_expected.value);
+#endif
+    complex_expected.tail = (char)255;
+    __builtin_clear_padding(&complex);
+    if (memcmp(&complex, &complex_expected, sizeof complex)) return 16;
+    return 0;
+}
+int main(void) {
+    for (int n = 0; n <= 17; ++n)
+        if (check(n)) return n + 1;
+    return 0;
+}
+""")
+    require(invoke([mcc, *flags, "-std=gnu11", variable_record, "-o", binary]),
+            "build clear padding for variable-length records")
+    require(invoke([*runner, binary]), "clear padding for variable-length records")
 
     assembly = root / "large-padding-union.s"
     large_union = """
@@ -1132,29 +1649,8 @@ def nonlocal_builtins(mcc, gcc, root, target, runner):
     sources = {
         "main": """
 #include <stdint.h>
-int receive(int width);
-
-int main(void)
-{
-    uintptr_t before, after;
-#if defined(__aarch64__)
-    uint64_t fp_before, fp_after;
-    __asm__ volatile ("mov %0, x19" : "=r"(before));
-    __asm__ volatile ("str d8, %0" : "=m"(fp_before));
-#else
-    __asm__ volatile ("movq %%r12, %0" : "=r"(before));
-#endif
-    int result = receive(77);
-#if defined(__aarch64__)
-    __asm__ volatile ("mov %0, x19" : "=r"(after));
-    __asm__ volatile ("str d8, %0" : "=m"(fp_after));
-    if (fp_before != fp_after)
-        return 1;
-#else
-    __asm__ volatile ("movq %%r12, %0" : "=r"(after));
-#endif
-    return result || before!=after;
-}
+int mcc_test_verify_receive(void);
+int main(void) { return mcc_test_verify_receive(); }
 """,
         "save": """
 #include <stdint.h>
@@ -1163,11 +1659,8 @@ int main(void)
 #error missing nonlocal jump builtins
 #endif
 
-#if defined(__aarch64__)
-#define GET_STACK(output) __asm__ volatile ("mov %0, sp" : "=r"(output))
-#else
-#define GET_STACK(output) __asm__ volatile ("movq %%rsp, %0" : "=r"(output))
-#endif
+uintptr_t mcc_test_stack_pointer(void);
+#define GET_STACK(output) ((output) = mcc_test_stack_pointer())
 
 extern void escape(intptr_t *env, int depth);
 static unsigned cleanups;
@@ -1239,6 +1732,7 @@ void escape(intptr_t *env, int depth)
 {
     volatile unsigned char scratch[37+depth];
     scratch[depth] = (unsigned char)depth;
+#ifndef __MCC__
 #if defined(__aarch64__)
     uint64_t fp_sentinel = 501;
     __asm__ volatile ("mov x19, #501" ::: "x19");
@@ -1246,12 +1740,21 @@ void escape(intptr_t *env, int depth)
 #else
     __asm__ volatile ("movq $501, %%r12" ::: "r12");
 #endif
+#endif
     if (depth > 0)
         escape(env, depth-1);
     if (scratch[depth] != depth)
         __builtin_trap();
+#ifdef __MCC__
+    extern void mcc_test_perturb_and_jump(intptr_t *);
+    mcc_test_perturb_and_jump(env);
+#else
     __builtin_longjmp(env, 1.0);
+#endif
 }
+#ifdef __MCC__
+void mcc_test_longjmp(intptr_t *env) { __builtin_longjmp(env, 1.0); }
+#endif
 """,
     }
     flags = [f"--target={target}"] if target else []
@@ -1273,7 +1776,8 @@ void escape(intptr_t *env, int depth)
     for saver, jumper in combinations:
         cc = gcc if saver == jumper == "gcc" else mcc
         prefix = [cc, *(flags if cc == mcc else [])]
-        objects = [object_files["main", saver], object_files["save", saver], object_files["jump", jumper]]
+        objects = [object_files["main", saver], object_files["save", saver], object_files["jump", jumper],
+                   register_probe_object(mcc, gcc, root, target, cc)]
         require(invoke([*prefix, *objects, "-o", binary]), f"link {saver} setjmp with {jumper} longjmp")
         require(invoke([*(runner if cc == mcc else []), binary]),
                 f"run {saver} setjmp with {jumper} longjmp")
@@ -1300,6 +1804,7 @@ struct Frames {
 };
 void sample_middle(struct Frames *);
 void sample_leaf(struct Frames *);
+uintptr_t mcc_test_stack_pointer(void);
 """)
     sources = {
         "leaf": """
@@ -1325,11 +1830,7 @@ void sample_middle(struct Frames *s)
 {
     s->middle_frame = __builtin_frame_address(0);
     s->middle_return = __builtin_return_address(0);
-#if defined(__aarch64__)
-    __asm__ volatile ("mov %0, sp" : "=r"(s->caller_sp));
-#else
-    __asm__ volatile ("movq %%rsp, %0" : "=r"(s->caller_sp));
-#endif
+    s->caller_sp = mcc_test_stack_pointer();
     sample_leaf(s);
 }
 """,
@@ -1391,7 +1892,7 @@ int main(void)
         options = ["-DEXPECT_ANCESTOR_RETURN"] if cc == mcc else [
             "-fno-omit-frame-pointer", "-fno-optimize-sibling-calls"
         ]
-        require(invoke([*prefix, *options, "-std=gnu11", *paths, "-o", binary]),
+        require(invoke([*prefix, *options, "-std=gnu11", *paths, register_probe_object(mcc, gcc, root, target, cc), "-o", binary]),
                 f"{cc} build frame queries")
         require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} run frame queries")
 
@@ -1433,11 +1934,8 @@ def explicit_stack_builtins(mcc, gcc, root, target, runner):
 #if !__has_builtin(__builtin_stack_save) || !__has_builtin(__builtin_stack_restore)
 #error missing stack builtins
 #endif
-#if defined(__aarch64__)
-#define STACK(out) __asm__ volatile ("mov %0, sp" : "=r"(out))
-#else
-#define STACK(out) __asm__ volatile ("movq %%rsp, %0" : "=r"(out))
-#endif
+uintptr_t mcc_test_stack_pointer(void);
+#define STACK(out) ((out) = mcc_test_stack_pointer())
 
 static int dynamic_allocations(unsigned width)
 {
@@ -1553,7 +2051,7 @@ int main(void)
     for cc in (mcc, gcc):
         prefix = [cc, *(flags if cc == mcc else [])]
         options = ["-DMCC_CHECK_EXPLICIT_RECLAIM"] if cc == mcc else ["-fno-optimize-sibling-calls"]
-        require(invoke([*prefix, *options, "-std=gnu11", source, "-o", binary]),
+        require(invoke([*prefix, *options, "-std=gnu11", source, register_probe_object(mcc, gcc, root, target, cc), "-o", binary]),
                 f"{cc} build explicit stack checkpoints")
         require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} restore explicit stack checkpoints")
         input_options = [] if cc == mcc else ["-x", "c"]
@@ -1700,6 +2198,12 @@ def attribute_queries(mcc, gcc, root, target, runner):
 #if !__has_builtin(__builtin_has_attribute)
 #error missing attribute query
 #endif
+#if !__has_attribute(leaf) || !__has_attribute(__leaf__)
+#error missing leaf attribute
+#endif
+#if !__has_attribute(hot) || !__has_attribute(__cold__)
+#error missing hot or cold attribute
+#endif
 #define HAS(subject, ...) __builtin_has_attribute(subject, __VA_ARGS__)
 #define CHECK(test) _Static_assert(test, #test)
 
@@ -1778,6 +2282,28 @@ static void finish(void) __attribute__((destructor(200)));
 static void start(void) {}
 static void finish(void) {}
 extern void *reserve(int, int) __attribute__((alloc_size(1, 2)));
+extern int leaf_function(int) __attribute__((leaf));
+extern int leaf_function(int);
+extern int leaf_empty(int) __attribute__((__leaf__()));
+extern int plain_function(int);
+typedef int LeafType(int) __attribute__((leaf));
+static int leaf_local(int) __attribute__((leaf));
+extern int leaf_object __attribute__((leaf));
+extern int hot_function(int) __attribute__((hot));
+extern int hot_function(int);
+extern int cold_function(int) __attribute__((__cold__()));
+static int local_hot(void) __attribute__((hot));
+static int local_cold(void) __attribute__((cold));
+static int local_hot(void) { return 1; }
+static int local_cold(void) { return 2; }
+extern int hot_first(void) __attribute__((hot, cold));
+extern int cold_first(void) __attribute__((cold, hot));
+extern int redeclared_hot(void) __attribute__((hot));
+extern int redeclared_hot(void) __attribute__((cold));
+__attribute__((hot)) int suffix_cold(void) __attribute__((cold));
+__attribute__((cold)) int suffix_hot(void) __attribute__((hot));
+typedef int HotType(int) __attribute__((hot));
+extern int cold_object __attribute__((cold));
 
 CHECK(HAS(aliased, alias("reference_object")) && !HAS(aliased, alias("other")));
 CHECK(HAS(weak_object, weak) && HAS(weak_reference, weakref));
@@ -1790,6 +2316,18 @@ CHECK(HAS(start, constructor) && !HAS(start, constructor(65535)));
 CHECK(HAS(finish, destructor(200)) && !HAS(finish, destructor(201)));
 CHECK(HAS(reserve, alloc_size) && HAS(reserve, alloc_size(2)) && HAS(reserve, alloc_size(1, 2)));
 CHECK(!HAS(&reserve, alloc_size));
+CHECK(HAS(leaf_function, leaf) && HAS(leaf_empty, __leaf__));
+CHECK(!HAS(plain_function, leaf) && !HAS(LeafType, leaf));
+CHECK(!HAS(leaf_local, leaf) && !HAS(leaf_object, leaf));
+CHECK(HAS(hot_function, hot) && !HAS(hot_function, cold));
+CHECK(HAS(cold_function, cold) && !HAS(cold_function, hot));
+CHECK(HAS(local_hot, hot) && HAS(local_cold, cold));
+CHECK(HAS(hot_first, hot) && !HAS(hot_first, cold));
+CHECK(HAS(cold_first, cold) && !HAS(cold_first, hot));
+CHECK(HAS(redeclared_hot, hot) && !HAS(redeclared_hot, cold));
+CHECK(HAS(suffix_hot, hot) && !HAS(suffix_hot, cold));
+CHECK(HAS(suffix_cold, cold) && !HAS(suffix_cold, hot));
+CHECK(!HAS(HotType, hot) && !HAS(cold_object, cold));
 
 typedef int MachineByte __attribute__((mode(QI)));
 CHECK(!HAS(MachineByte, mode(QI)));
@@ -1820,7 +2358,15 @@ int main(void)
                      "int x = __builtin_has_attribute(int, packed(1));",
                      "int x = __builtin_has_attribute(int, aligned(3));",
                      "int x = __builtin_has_attribute(int, visibility(1));",
-                     "int x = __builtin_has_attribute(int, mode(BAD_MACHINE_MODE));"):
+                     "int x = __builtin_has_attribute(int, mode(BAD_MACHINE_MODE));",
+                     "int f(void) __attribute__((leaf(1)));",
+                     "int x __attribute__((leaf));",
+                     "struct S { int x __attribute__((leaf)); };",
+                     "void f(int x __attribute__((leaf)));",
+                     "int f(void) __attribute__((hot(1)));",
+                     "int x __attribute__((cold));",
+                     "struct S { int x __attribute__((hot)); };",
+                     "void f(int x __attribute__((cold)));"):
             require(invoke(invalid, code), f"{cc} reject {code}", success=False)
 
 
@@ -3700,6 +4246,154 @@ void test(void) {
             "mcc compile a long chain of pointer assignments")
 
 
+def access_address_taken(mcc, gcc, root, target):
+    source = root / "access-address-taken.c"
+    source.write_text("""
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+void write_bytes(void *, size_t) __attribute__((access(write_only, 1, 2)));
+void read_bytes(const void *, size_t) __attribute__((access(read_only, 1, 2)));
+void alter(char **);
+char **save;
+
+void local_alias(void) {
+    char small[4] = {0}, large[16] = {0};
+    char *p = small;
+    char **alias = &p;
+    read_bytes(p, 5);                       /* mcc-overread */
+    *alias = large;
+    read_bytes(p, 5);
+}
+void later_address(void) {
+    char small[4];
+    char *p = small;
+    write_bytes(p, 5);                      /* mcc-overflow */
+    save = &p;
+}
+void reset_after_alias(void) {
+    char small[4], large[16];
+    char *p = small;
+    char **alias = &p;
+    *alias = large;
+    p = small;
+    write_bytes(p, 5);                      /* mcc-overflow */
+}
+void maybe_alias(int flag) {
+    char small[4], large[16];
+    char *p = small;
+    char **alias = &p;
+    if (flag) *alias = large;
+    write_bytes(p, 5);
+}
+void unknown_call(void) {
+    char small[4];
+    char *p = small;
+    alter(&p);
+    write_bytes(p, 5);
+}
+void reassign_after_call(void) {
+    char small[4];
+    char *p = small;
+    alter(&p);
+    p = small;
+    write_bytes(p, 5);                      /* mcc-overflow */
+}
+void other_local(void) {
+    char small[4];
+    char *p = small;
+    char **alias = &p;
+    int another = 7;
+    another++;
+    if (!alias || !another) return;
+    write_bytes(p, 5);                      /* mcc-overflow */
+}
+void unknown_store(void **unknown, void *value) {
+    char small[4];
+    char *p = small;
+    save = &p;
+    *unknown = value;
+    write_bytes(p, 5);
+}
+void indirect_copy(void) {
+    char small[4], large[16];
+    char *p = small, *other = large;
+    char **alias = &p;
+    memcpy(alias, &other, sizeof p);
+    write_bytes(p, 5);
+}
+void allocated(void) {
+    char *p = malloc(4);
+    char **alias = &p;
+    if (!alias) return;
+    write_bytes(p, 5);                      /* mcc-overflow */
+    free(p);
+}
+""")
+    check_access_warning_lines(mcc, gcc, source, target, 4)
+
+
+def access_variable_arrays(mcc, gcc, root, target):
+    source = root / "access-variable-arrays.c"
+    source.write_text("""
+void write_bytes(void *, unsigned long) __attribute__((access(write_only, 1, 2)));
+void direct(unsigned n) {
+    if (n > 0 && n <= 8) {
+        char a[n];
+        write_bytes(a, 9);                /* overflow */
+        write_bytes(a, 8);
+        n = 40;
+        write_bytes(a, 9);                /* mcc-overflow */
+    }
+}
+void alias(unsigned n) {
+    if (n > 0 && n <= 8) {
+        char a[n];
+        char *p = a + 2;
+        n = 20;
+        write_bytes(p, 7);                /* mcc-overflow */
+        write_bytes(p, 6);
+    }
+}
+void unknown(unsigned n) {
+    if (n) {
+        char a[n];
+        write_bytes(a, 9);
+    }
+}
+void later_bounds(unsigned n) {
+    if (n) {
+        char a[n];
+        if (n <= 8)
+            write_bytes(a, 9);
+    }
+}
+void typed(unsigned n) {
+    if (n > 0 && n <= 8) {
+        int a[n];
+        write_bytes(a, 33);               /* mcc-overflow */
+        write_bytes(a, 32);
+    }
+}
+void dimensions(unsigned n, unsigned m) {
+    if (n > 0 && n <= 3 && m > 0 && m <= 4) {
+        char a[n][m];
+        n = 20;
+        m = 20;
+        write_bytes(a, 13);               /* mcc-overflow */
+        write_bytes(a, 12);
+    }
+}
+void unknown_dimension(unsigned n, unsigned m) {
+    if (n > 0 && n <= 3 && m > 0) {
+        char a[n][m];
+        write_bytes(a, 13);
+    }
+}
+""")
+    check_access_warning_lines(mcc, gcc, source, target, 8)
+
+
 def system_register_builtins(mcc, gcc, root, target, runner):
     source = root / "system-register-builtins.c"
     source.write_text("""
@@ -3723,12 +4417,8 @@ static void *observe(void *opaque)
 {
     struct observations *out = opaque;
     void *actual = __builtin_thread_pointer();
-    void *expected;
-#if defined(__aarch64__)
-    __asm__("mrs %0, tpidr_el0" : "=r"(expected));
-#else
-    __asm__("movq %%fs:0, %0" : "=r"(expected));
-#endif
+    extern void *mcc_test_thread_pointer(void);
+    void *expected = mcc_test_thread_pointer();
     out->thread = actual;
     out->displacement = (uintptr_t)&local - (uintptr_t)actual;
     out->valid = actual != 0 && actual == expected && local == 42;
@@ -3809,7 +4499,7 @@ int main(void)
         prefix = [cc, *(flags if cc == mcc else [])]
         rounding = [] if cc == mcc else ["-frounding-math"]
         require(invoke([*prefix, *rounding, "-std=c11", "-pedantic-errors", "-fno-builtin", "-pthread", source,
-                        "-o", binary]), f"{cc} compile thread pointer and floating-point register test")
+                        register_probe_object(mcc, gcc, root, target, cc), "-o", binary]), f"{cc} compile thread pointer and floating-point register test")
         require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} thread pointer and FP register semantics")
         input_flags = [] if cc == mcc else ["-x", "c"]
         invalid = [*prefix, *input_flags, "-std=gnu11", "-Werror", "-c", "-o", root / "invalid-sysreg.o", "-"]
@@ -3901,6 +4591,1451 @@ int main(void) {
         "int f(void *p) { return __builtin_dynamic_object_size(p); }",
     ):
         require(invoke([mcc, "-std=gnu11", "-fsyntax-only", "-"], source), source, success=False)
+
+
+def static_pointer_object_sizes(mcc, gcc, root, target, runner):
+    source = root / "static-pointer-object-sizes.c"
+    source.write_text(r"""
+#include <stdio.h>
+struct R { char a[5], b[9]; };
+static struct R r;
+static char *const p = {r.a + 1};
+static char *const end = r.b + 7;
+static char *const text = "abcde";
+static char *const self = (char *)&self;
+int main(int argc, char **argv) {
+    static char *const local = r.b + 2;
+    unsigned x = argc + 1;
+    (void)argv;
+    printf("%lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
+           __builtin_object_size(p, 0), __builtin_object_size(p, 1),
+           __builtin_object_size(p + 1, 0), __builtin_object_size(p + 1, 1),
+           __builtin_object_size(end, 1), __builtin_object_size(text, 1),
+           __builtin_object_size(self, 0), __builtin_dynamic_object_size(p + x, 0),
+           __builtin_dynamic_object_size(p + x, 1), __builtin_object_size(p, 2),
+           __builtin_object_size(local, 1));
+#ifdef __MCC__
+    if (__builtin_object_size(p, 3) != 4 || __builtin_object_size(p + 1, 2) != 12 ||
+        __builtin_dynamic_object_size(p + x, 3) != 2)
+        return 1;
+#endif
+}
+""")
+    binary = root / "static-pointer-object-sizes"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=c11", "-pedantic-errors", source, "-o", binary]),
+                f"{cc} build static pointer object-size tests")
+        result = invoke([*(runner if cc == mcc else []), binary])
+        require(result, f"{cc} evaluate static pointer object sizes")
+        assert result.stdout == "13 4 12 3 2 6 8 11 2 13 7\n", result.stdout
+
+    unknown = root / "static-pointer-unknown.c"
+    unknown.write_text("""
+static char data[8];
+static char *mutable = data;
+static char *const volatile observed = data;
+extern char *const external;
+int main(void) {
+    return __builtin_object_size(mutable, 0) != (unsigned long)-1 ||
+           __builtin_dynamic_object_size(observed, 2) != 0 ||
+           __builtin_object_size(external, 0) != (unsigned long)-1;
+}
+""")
+    require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", unknown, "-o", binary]),
+            "compile unknown static pointer sizes")
+    require(invoke([*runner, binary]), "preserve unknown mutable and external pointer sizes")
+
+    access = root / "access-static-pointers.c"
+    access.write_text("""
+#include <stddef.h>
+struct R { char a[5], b[9]; };
+static struct R r;
+static char *const p = r.a + 1;
+static char *const end = r.b + 7;
+static char *mutable = r.a;
+void write_bytes(char *, size_t) __attribute__((access(write_only, 1, 2)));
+void f(void) {
+    write_bytes(p + 1, 4);               /* mcc-overflow */
+    write_bytes(p + 1, 3);
+    write_bytes(end, 3);                 /* mcc-overflow */
+    write_bytes(mutable, 10);
+}
+""")
+    check_access_warning_lines(mcc, gcc, access, target, 3)
+
+
+def local_pointer_object_sizes(mcc, gcc, root, target, runner):
+    source = root / "local-pointer-object-sizes.c"
+    source.write_text(r"""
+struct R { char first[10]; int middle; char last[10]; };
+__attribute__((noinline)) static int check(int choose) {
+    struct R value;
+    char small[4];
+    char *pointer = &value.first[1];
+    char *copy = pointer;
+    if (__builtin_object_size(pointer, 0) != sizeof(value) - 1 ||
+        __builtin_object_size(pointer, 1) != sizeof(value.first) - 1 ||
+        __builtin_object_size(copy, 1) != sizeof(value.first) - 1 ||
+        __builtin_object_size(copy + 1, 0) != sizeof(value) - 2 ||
+        __builtin_dynamic_object_size(pointer, 0) != sizeof(value) - 1 ||
+        __builtin_dynamic_object_size(copy, 1) != sizeof(value.first) - 1)
+        return 1;
+    char *selected = small;
+    if (choose) selected = value.first;
+    if (__builtin_object_size(selected, 0) != sizeof(value) ||
+        __builtin_object_size(selected, 1) != sizeof(value.first) ||
+        __builtin_object_size(selected, 2) != sizeof(small) ||
+        __builtin_object_size(selected, 3) != sizeof(small))
+        return 2;
+    return 0;
+}
+__attribute__((noinline)) static int unknown(char *incoming, int choose) {
+    char local[8];
+    char *pointer = local;
+    if (choose) pointer = incoming;
+    return __builtin_object_size(pointer, 0) != (unsigned long)-1 ||
+           __builtin_object_size(pointer, 2) != 0;
+}
+int main(int argc, char **argv) {
+    return check(0) || check(1) || unknown(*argv, argc > 1);
+}
+""")
+    binary = root / "local-pointer-object-sizes"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=c11", "-pedantic-errors", source, "-o", binary]),
+                f"{cc} compile local pointer object sizes")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} evaluate local pointer object sizes")
+
+
+def dynamic_ordinary_object_sizes(mcc, gcc, root, target, runner):
+    source = root / "dynamic-ordinary-object-size.c"
+    source.write_text("""
+#include <stddef.h>
+#define DOS __builtin_dynamic_object_size
+__attribute__((noinline)) static int exercise(size_t n, int choose) {
+    char small[8], large[32], variable[n];
+    char *p = small;
+    if (choose == 1) p = large;
+    if (choose == 2) p = variable;
+    size_t expected = choose == 0 ? sizeof small : choose == 1 ? sizeof large : n;
+    if (DOS(p,0) != expected || DOS(p,1) != expected || DOS(p,2) != expected || DOS(p,3) != expected) return 1;
+    char *q = p + 2;
+    if (DOS(q,0) != expected-2 || DOS(q,1) != expected-2) return 2;
+    q++;
+    if (DOS(q,2) != expected-3) return 3;
+    p = choose ? small + 3 : large + 5;
+    expected = choose ? 5 : 27;
+    if (DOS(p,0) != expected) return 4;
+    return 0;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    for (int i = 0; i < 3; ++i) { int r=exercise((size_t)argc+39, i); if (r) return r; }
+    return 0;
+}
+""")
+    binary = root / "dynamic-ordinary-object-size"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=gnu11", source, "-o", binary]),
+                f"{cc} compile ordinary object dynamic sizes")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} evaluate ordinary object dynamic sizes")
+
+
+def dynamic_member_object_sizes(mcc, gcc, root, target, runner):
+    source = root / "dynamic-member-object-size.c"
+    source.write_text("""
+#include <stddef.h>
+#define DOS __builtin_dynamic_object_size
+struct R { char first[8]; char second[16]; };
+__attribute__((noinline)) static int check(int choice) {
+    struct R value;
+    char buffer[32];
+    char *p = choice == 0 ? value.first : choice == 1 ? value.second : buffer;
+    size_t whole = choice == 0 ? sizeof value : choice == 1 ? sizeof value.second : sizeof buffer;
+    size_t part = choice == 0 ? sizeof value.first : choice == 1 ? sizeof value.second : sizeof buffer;
+    if (DOS(p, 0) != whole || DOS(p, 1) != part || DOS(p, 2) != whole || DOS(p, 3) != part) return 1;
+    char *q = p + 3;
+    if (DOS(q, 0) != whole - 3 || DOS(q, 1) != part - 3) return 2;
+    q -= 2;
+    if (DOS(q, 0) != whole - 1 || DOS(q, 1) != part - 1) return 3;
+    q = choice ? value.first + 4 : value.second + 2;
+    whole = choice ? sizeof value - 4 : sizeof value.second - 2;
+    part = choice ? sizeof value.first - 4 : sizeof value.second - 2;
+    if (DOS(q, 0) != whole) return 4;
+#ifdef __MCC__
+    /* GCC 16 merges this conditional's subobject sizes conservatively. */
+    if (DOS(q, 1) != part) return 5;
+#endif
+    return 0;
+}
+int main(void) { for (int i=0; i<3; i++) { int r=check(i); if(r) return r; } return 0; }
+""")
+    binary = root / "dynamic-member-object-size"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=gnu11", source, "-o", binary]),
+                f"{cc} compile member dynamic sizes")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} evaluate member dynamic sizes")
+
+
+def dynamic_variable_member_object_sizes(mcc, gcc, root, target, runner):
+    source = root / "dynamic-variable-member-object-size.c"
+    source.write_text("""
+#include <stddef.h>
+#define DOS __builtin_dynamic_object_size
+__attribute__((noinline)) static int run(int n, int choose) {
+    int evaluations = 0;
+    struct Item { char first[n + (++evaluations)]; char tail[8]; };
+    struct Item item;
+    size_t first = (size_t)n + 1;
+    n = 1; /* The layout must keep the earlier bound. */
+    char *p = choose ? item.first : item.tail;
+    size_t whole = choose ? sizeof item : sizeof item - first;
+    size_t part = choose ? first : sizeof item.tail;
+    if (evaluations != 1) return 1;
+#ifdef __MCC__
+    if (DOS(p,0) != whole || DOS(p,1) != part) return 1;
+#endif
+    int step = 2;
+    p += step++;
+    if (evaluations != 1 || step != 3) return 2;
+#ifdef __MCC__
+    if (DOS(p,0) != whole-2 || DOS(p,1) != part-2) return 2;
+#endif
+    p = choose ? item.tail : item.first;
+    whole = choose ? sizeof item - first : sizeof item;
+    part = choose ? sizeof item.tail : first;
+    if (evaluations != 1) return 3;
+#ifdef __MCC__
+    if (DOS(p,0) != whole || DOS(p,1) != part) return 3;
+#endif
+    return 0;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    int n = argc+5;
+    return run(n,0) || run(n,1);
+}
+""")
+    binary = root / "dynamic-variable-member-object-size"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=gnu11", source, "-o", binary]),
+                f"{cc} compile variable member dynamic sizes")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} evaluate variable member dynamic sizes")
+
+
+def dynamic_offset_object_sizes(mcc, gcc, root, target, runner):
+    cases = (
+        r"""
+#include <stddef.h>
+#include <stdlib.h>
+#define DOS __builtin_dynamic_object_size
+#define BOS __builtin_object_size
+static int test(size_t n) {
+    size_t amount = n, shift = 3;
+    char *root = malloc(amount++);
+    char *p = root;
+    char *q = p + shift++;
+    amount = shift = 0;
+    if (DOS(q,0) != n-3 || DOS(q,1) != n-3 || BOS(q,0) != (size_t)-1) return 1;
+    q += 2;
+    if (DOS(q,0) != n-5) return 2;
+    q -= 1;
+    if (DOS(q,0) != n-4) return 3;
+    p++;
+    if (DOS(p,0) != n-1 || DOS(q,0) != n-4) return 4;
+    q = p - 1;
+    if (DOS(q,0) != n) return 5;
+    p -= 1;
+    q = (p += 2, p) + 2;
+    if (DOS(p,0) != n-2 || DOS(q,0) != n-4) return 6;
+    q = (p = root + 4, p) + 1;
+    if (DOS(p,0) != n-4 || DOS(q,0) != n-5) return 7;
+    q = root + n;
+    if (DOS(q,0) != 0) return 8;
+    q -= n;
+    if (DOS(q,0) != n) return 9;
+    size_t first = 2, second = 4;
+    q = (root + first++) + second++;
+    first = second = 0;
+    if (DOS(q,0) != n-6 || DOS(root,0) != n) return 14;
+    q = ((root + 8) - 5) + 1;
+    if (DOS(q,0) != n-4) return 15;
+    q = (p = root + 2, p + 3) - 1;
+    if (DOS(q,0) != n-4 || DOS(p,0) != n-2) return 16;
+    q = ((root + n) - n) + 1;
+    if (DOS(q,0) != n-1) return 17;
+    free(root);
+    return 0;
+}
+static int stack_allocation(size_t n) {
+    char *root = __builtin_alloca(n);
+    char *p = root + 3;
+    if (DOS(p,0) != n-3) return 10;
+    p -= 2;
+    return DOS(p,0) != n-1 ? 11 : 0;
+}
+static int product_allocation(size_t n) {
+    size_t count = n, width = 2;
+    char *root = calloc(count++, width++);
+    char *p = root + 5;
+    count = width = 0;
+    int result = DOS(p,0) != n*2-5;
+    free(root);
+    return result ? 12 : 0;
+}
+static int direct_allocation(size_t n) {
+    size_t amount = n, offset = 3;
+    char *p = (char *)malloc(amount++) + offset++;
+    if (amount != n+1 || offset != 4 || DOS(p,0) != n-3) return 18;
+    p -= 2;
+    if (DOS(p,0) != n-1) return 19;
+    free(p-1);
+    size_t count = n, width = 2;
+    p = ((char *)calloc(count++, width++) + 7) - 2;
+    if (count != n+1 || width != 3 || DOS(p,0) != n*2-5) return 20;
+    free(p-5);
+    p = ((char *)__builtin_alloca(n) + 4) + 2;
+    if (DOS(p,0) != n-6) return 21;
+    p -= 6;
+    if (DOS(p,0) != n) return 22;
+    return 0;
+}
+static int scaled_allocation(size_t n) {
+    int *root = malloc(n * sizeof *root);
+    int *p = root + 3;
+    int *q = p - 1;
+    int result = DOS(p,0) != (n-3)*sizeof *root || DOS(q,0) != (n-2)*sizeof *root;
+    free(root);
+    return result ? 13 : 0;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    size_t n = (size_t)argc + 39;
+    int result = test(n);
+    if (result) return result;
+    result = stack_allocation(n);
+    if (result) return result;
+    result = product_allocation(n);
+    if (result) return result;
+    result = direct_allocation(n);
+    return result ? result : scaled_allocation(n);
+}
+""",
+        r"""
+#include <stdlib.h>
+#include <stddef.h>
+#define DOS __builtin_dynamic_object_size
+static char buffer[32];
+static char *fake(size_t n) __attribute__((alloc_size(1)));
+static char *fake(size_t n) { (void)n; return buffer; }
+static int run(size_t n, int choose, char *opaque) {
+    char *p = opaque;
+    char *q = p + 1;
+#ifdef __MCC__
+    if (DOS(q,0) != (size_t)-1 || DOS(q,2) != 0) return 1;
+    q = (p + 1) + 2;
+    if (DOS(q,0) != (size_t)-1 || DOS(q,2) != 0) return 7;
+#endif
+    p = malloc(n);
+    char *root = p;
+    if (choose) q = p + 2;
+    else q = p + 4;
+    if (DOS(q,0) != n - (choose ? 2 : 4)) return 2;
+    size_t step = 1;
+    q = p + step++;
+    step = 19;
+    if (DOS(q,0) != n-1) return 3;
+    for (unsigned i=0; i<3; ++i) {
+        q += 1;
+        if (DOS(q,0) != n - 2 - i) return 4;
+    }
+    q = (p = root + 5, p) - 2;
+    if (DOS(q,0) != n-3 || DOS(p,0) != n-5) return 5;
+    free(root);
+    p = fake((size_t)-1);
+    q = p + 1;
+#ifdef __MCC__
+    if (DOS(q,0) != (size_t)-1 || DOS(q,2) != 0) return 6;
+    q = (fake((size_t)-1) + 1) + 2;
+    if (DOS(q,0) != (size_t)-1 || DOS(q,2) != 0) return 8;
+#endif
+    size_t requested = 20, offset = 2;
+    q = (fake(requested++) + offset++) + 3;
+    if (requested != 21 || offset != 3) return 9;
+#ifdef __MCC__
+    if (DOS(q,0) != 15) return 10;
+#endif
+    return 0;
+}
+int main(int argc,char **argv) {
+    (void)argv;
+    int status = run((size_t)argc + 39,0,buffer);
+    return status ? status : run((size_t)argc + 39,1,buffer);
+}
+""",
+    )
+    flags = [f"--target={target}"] if target else []
+    binary = root / "dynamic-offset-object-size"
+    for source in cases:
+        for cc in (mcc, gcc):
+            options = flags if cc == mcc else ["-x", "c", "-O2"]
+            require(invoke([cc, *options, "-std=c11", "-pedantic-errors", "-", "-o", binary], source),
+                    f"{cc} compile dynamic offset object sizes")
+            require(invoke([*(runner if cc == mcc else []), binary]),
+                    f"{cc} evaluate dynamic offset object sizes")
+
+    checked = root / "dynamic-offset-checked.c"
+    checked.write_text("""
+#include <stddef.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    (void)argv;
+    size_t n = (size_t)argc + 7, offset = 3;
+    char *root = malloc(n);
+    char *p = root + offset++;
+    offset = 0;
+    __builtin___memset_chk(p, 0x5a, n - 3 + (argc > 1),
+                           __builtin_dynamic_object_size(p, 0));
+    int result = p[0] != 0x5a;
+    free(root);
+    return result;
+}
+""")
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        run = runner if cc == mcc else []
+        require(invoke([cc, *options, "-std=c11", "-pedantic-errors", checked, "-o", binary]),
+                f"{cc} compile checked offset allocation")
+        require(invoke([*run, binary]), f"{cc} accept an in-bounds offset write")
+        result = invoke([*run, binary, "excess"])
+        require(result, f"{cc} reject an out-of-bounds offset write", success=False)
+        assert result.returncode == -signal.SIGABRT, result
+
+
+def control_flow_dynamic_object_sizes(mcc, gcc, root, target, runner):
+    source = root / "control-flow-dynamic-object-size.c"
+    source.write_text(r"""
+#include <stddef.h>
+#include <stdlib.h>
+#define DOS __builtin_dynamic_object_size
+static char opaque[64];
+static int exercise(size_t n, int choice) {
+    char *a = malloc(n), *b = malloc(n + 8);
+    char *p = opaque;
+    char *q = p + 1;
+#ifdef __MCC__
+    if (DOS(q,0) != sizeof opaque - 1 || DOS(q,2) != sizeof opaque - 1) return 1;
+#endif
+    switch (choice) {
+    case 0: p = a; q = p + 2; break;
+    case 1: p = b; q = p + 3; break;
+    default: p = a; q = p + 4; break;
+    }
+    size_t expected = choice == 0 ? n - 2 : choice == 1 ? n + 5 : n - 4;
+    if (DOS(q,0) != expected) return 2;
+    int count = 0;
+again:
+    if (DOS(q,0) != expected - (size_t)count) return 3;
+    if (++count < 3) { q++; goto again; }
+    static void *const destinations[] = { &&first, &&second, &&third };
+    goto *destinations[choice];
+first: q = a + 1; expected = n - 1; goto done;
+second: q = b + 2; expected = n + 6; goto done;
+third: q = a + 3; expected = n - 3;
+done:
+    if (DOS(q,0) != expected) return 4;
+    q = opaque + 1;
+#ifdef __MCC__
+    if (DOS(q,0) != sizeof opaque - 1 || DOS(q,2) != sizeof opaque - 1) return 6;
+#endif
+    goto skip_init;
+    char *skipped = malloc(n);
+skip_init:
+    skipped = (char *)malloc(n + 4) + 2;
+    if (DOS(skipped,0) != n + 2) return 5;
+    free(skipped - 2);
+    free(a); free(b);
+    return 0;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    size_t n = (size_t)argc + 39;
+    for (int i = 0; i < 3; ++i) {
+        int result = exercise(n, i);
+        if (result) return result;
+    }
+    return 0;
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    binary = root / "control-flow-dynamic-object-size"
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=gnu11", source, "-o", binary]),
+                f"{cc} compile control-flow dynamic object sizes")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} evaluate control-flow dynamic object sizes")
+
+
+def conditional_dynamic_object_sizes(mcc, gcc, root, target, runner):
+    source = root / "conditional-dynamic-object-size.c"
+    source.write_text(r"""
+#include <stddef.h>
+#include <stdlib.h>
+#define DOS __builtin_dynamic_object_size
+static char opaque[64];
+static int exercise(size_t n, int choose) {
+    char *a = malloc(n), *b = malloc(n + 10);
+    if (!a || !b) return 20;
+    int test = choose;
+    char *p = test++ ? a + 2 : b + 3;
+    if (test != choose+1 || DOS(p,0) != (choose ? n-2 : n+7)) return 1;
+    char *q = (choose ? a : b) + 4;
+    if (DOS(q,0) != (choose ? n-4 : n+6)) return 2;
+    p = choose ? p : a;
+    if (DOS(p,0) != (choose ? n-2 : n)) return 3;
+    size_t amount = n, offset = 2;
+    char *r = choose ? (char *)malloc(amount++) + offset++ :
+                       (char *)malloc(amount++ + 5) + offset++;
+    if (amount != n+1 || offset != 3 || DOS(r,0) != (choose ? n-2 : n+3)) return 4;
+    free(r-2);
+    q = (choose ? (choose > 1 ? b : a) : b) + 1;
+    if (DOS(q,0) != (choose ? n-1 : n+9)) return 5;
+    char *maybe = choose ? a : (char *)0;
+    q = maybe ?: b;
+    if (DOS(q,0) != (choose ? n : n+10)) return 6;
+    size_t once = n;
+    q = (char *)malloc(once++) ?: b;
+    if (once != n+1 || DOS(q,0) != (q == b ? n+10 : n)) return 9;
+    if (q != b) free(q);
+    size_t step = 2;
+    q = (a + step++) ?: b;
+    if (step != 3 || DOS(q,0) != n-2) return 10;
+    q = choose ? a : opaque;
+#ifdef __MCC__
+    if (DOS(q,0) != (choose ? n : sizeof opaque)) return 7;
+    if (!choose && DOS(q,2) != sizeof opaque) return 8;
+#endif
+    free(a); free(b);
+    return 0;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    size_t n = (size_t)argc + 39;
+    int status = exercise(n, 0);
+    return status ? status : exercise(n, 1);
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    binary = root / "conditional-dynamic-object-size"
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=gnu11", source, "-o", binary]),
+                f"{cc} compile conditional dynamic object sizes")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} evaluate conditional dynamic object sizes")
+
+
+def alloca_warning(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "alloca-warning.c"
+    source.write_text(r"""
+void use(void *);
+void f(int n) {
+    (void)sizeof(__builtin_alloca(n));
+    if (0) use(__builtin_alloca(n));
+    use(__builtin_alloca(n));
+    use(__builtin_alloca_with_align(n, 64));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Walloca"
+    use(__builtin_alloca_with_align_and_max(n, 64, 128));
+#pragma GCC diagnostic pop
+    use(__builtin_alloca(32));
+}
+""")
+    object_file = root / "alloca-warning.o"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        def compile_with(*warning_options):
+            return invoke([cc, *options, "-std=gnu11", *warning_options, "-c", source, "-o", object_file])
+        default = compile_with("-Wall")
+        require(default, f"{cc} compile without alloca warning")
+        assert "[-Walloca]" not in default.stderr, default.stderr
+        warnings = compile_with("-Walloca")
+        require(warnings, f"{cc} compile with alloca warning")
+        warning_lines = re.findall(rf"{re.escape(str(source))}:(\d+):\d+:.*\[-Walloca\]", warnings.stderr)
+        assert set(warning_lines) == {"6", "7", "12"}, warnings.stderr
+        errors = compile_with("-Werror=alloca")
+        require(errors, f"{cc} make alloca warnings errors", success=False)
+        error_lines = re.findall(rf"{re.escape(str(source))}:(\d+):\d+:.*\[-Werror=alloca\]", errors.stderr)
+        assert set(error_lines) == {"6", "7", "12"}, errors.stderr
+        disabled = compile_with("-Walloca", "-Wno-alloca")
+        require(disabled, f"{cc} disable alloca warning")
+        assert "[-Walloca]" not in disabled.stderr, disabled.stderr
+        syntax = invoke([cc, *options, "-std=gnu11", "-Walloca", "-fsyntax-only", source])
+        require(syntax, f"{cc} check syntax without alloca code generation")
+        assert "[-Walloca]" not in syntax.stderr, syntax.stderr
+        pragma = root / "alloca-warning-pragma.c"
+        pragma.write_text("""
+void use(void *);
+void f(int n) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Walloca"
+    use(__builtin_alloca(n));
+#pragma GCC diagnostic pop
+    use(__builtin_alloca(n));
+}
+""")
+        result = invoke([cc, *options, "-std=gnu11", "-c", pragma, "-o", object_file])
+        require(result, f"{cc} enable alloca error with diagnostic pragma", success=False)
+        error_lines = re.findall(rf"{re.escape(str(pragma))}:(\d+):\d+:.*\[-Werror=alloca\]", result.stderr)
+        assert set(error_lines) == {"6"}, result.stderr
+
+
+def alloca_size_warning(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "alloca-size-warning.c"
+    source.write_text("""void use(void *);
+void f(unsigned n, int s) {
+  use(__builtin_alloca(0));
+  use(__builtin_alloca(64));
+  use(__builtin_alloca(65));
+  use(__builtin_alloca(n));
+  if (n <= 64) use(__builtin_alloca(n));
+  for (unsigned i=0; i<n; i++) use(__builtin_alloca(4));
+  if (s < 65) use(__builtin_alloca(s));
+  if (s >= 0 && s <= 64) use(__builtin_alloca(s));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Walloca-larger-than="
+  use(__builtin_alloca(100));
+#pragma GCC diagnostic pop
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    obj = root / "alloca-size-warning.o"
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        def compile_with(*args):
+            return invoke([cc, *options, "-std=gnu11", *args, "-c", source, "-o", obj])
+        warnings = compile_with("-Walloca-larger-than=64")
+        require(warnings, f"{cc} warn about large stack allocations")
+        lines = re.findall(rf"{re.escape(str(source))}:(\d+):\d+:.*\[-Walloca-larger-than=\]", warnings.stderr)
+        assert set(lines) == {"3", "5", "6", "8", "9"}, warnings.stderr
+        errors = compile_with("-Werror=alloca-larger-than=64")
+        require(errors, f"{cc} make alloca size warnings errors", success=False)
+        assert "[-Werror=alloca-larger-than=]" in errors.stderr, errors.stderr
+        suppressed = compile_with("-Walloca-larger-than=64", "-Wno-alloca-larger-than")
+        require(suppressed, f"{cc} suppress alloca size warnings")
+        assert "[-Walloca-larger-than=]" not in suppressed.stderr, suppressed.stderr
+        downgraded = compile_with("-Werror", "-Walloca-larger-than=64", "-Wno-error=alloca-larger-than=")
+        require(downgraded, f"{cc} downgrade alloca size errors")
+        assert "[-Walloca-larger-than=]" in downgraded.stderr, downgraded.stderr
+        units = compile_with("-Walloca-larger-than=1KiB")
+        require(units, f"{cc} accept binary unit in alloca warning threshold")
+        assert f"{source}:5:" not in units.stderr, units.stderr
+        invalid = compile_with("-Walloca-larger-than=0x40")
+        require(invalid, f"{cc} reject invalid alloca warning threshold", success=False)
+
+
+def vla_warning(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "vla-warning.c"
+    source.write_text("""void decl(int n, int a[n], int b[*]);
+void f(int n, int m) {
+ typedef int T[n];
+ T a;
+ int b[n][m];
+ int (*p)[n] = &b[0];
+ (void)sizeof(int[n]);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvla"
+ int ignored[n];
+#pragma GCC diagnostic pop
+ (void)a; (void)p; (void)ignored;
+}
+""")
+    c90 = root / "vla-warning-c90.c"
+    c90.write_text("void f(int n) { int a[n]; (void)a; }\n")
+    extension = root / "vla-warning-extension.c"
+    extension.write_text("void f(int n) { __extension__ int a[n]; (void)a; }\n")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        def syntax(path, *args):
+            return invoke([cc, *options, *args, "-fsyntax-only", path])
+        quiet = syntax(source, "-std=c11", "-Wall")
+        require(quiet, f"{cc} leave VLA warning off by default")
+        assert "[-Wvla]" not in quiet.stderr, quiet.stderr
+        warnings = syntax(source, "-std=c11", "-Wvla")
+        require(warnings, f"{cc} warn about variable length arrays")
+        lines = re.findall(rf"{re.escape(str(source))}:(\d+):\d+:.*\[-Wvla\]", warnings.stderr)
+        assert set(lines) == {"1", "3", "5", "6", "7"} and lines.count("5") >= 2, warnings.stderr
+        errors = syntax(source, "-std=c11", "-Werror=vla")
+        require(errors, f"{cc} make VLA warnings errors", success=False)
+        assert "[-Werror=vla]" in errors.stderr, errors.stderr
+        disabled = syntax(source, "-std=c11", "-Wvla", "-Wno-vla")
+        require(disabled, f"{cc} disable VLA warning")
+        assert "[-Wvla]" not in disabled.stderr, disabled.stderr
+        pedantic = syntax(c90, "-std=c90", "-pedantic-errors")
+        require(pedantic, f"{cc} reject VLA in pedantic C90", success=False)
+        suppressed = syntax(c90, "-std=c90", "-pedantic-errors", "-Wno-vla")
+        require(suppressed, f"{cc} suppress C90 VLA diagnostic")
+        permissive = syntax(extension, "-std=gnu90", "-pedantic-errors")
+        require(permissive, f"{cc} allow extension-marked VLA")
+        explicit = syntax(extension, "-std=gnu90", "-pedantic-errors", "-Wvla")
+        require(explicit, f"{cc} warn on extension-marked VLA when explicitly requested")
+        assert "[-Wvla]" in explicit.stderr, explicit.stderr
+
+
+def vla_size_warning(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "vla-size-warning.c"
+    source.write_text("""void use(void *);
+void f(unsigned n, int s) {
+  if (n <= 16) { int a[n]; use(a); }
+  if (n <= 17) { int b[n]; use(b); }
+  { char c[n]; use(c); }
+  if (s > 0 && s <= 16) { int d[s]; use(d); }
+  if (n <= 4) { int e[n][n]; use(e); }
+  if (n <= 5) { int g[n][n]; use(g); }
+  if (n <= 16) { typedef int T[n]; n = 999; T x; use(x); }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvla-larger-than="
+  { char ignored[n]; use(ignored); }
+#pragma GCC diagnostic pop
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    obj = root / "vla-size-warning.o"
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        def compile_with(*args):
+            return invoke([cc, *options, "-std=gnu11", *args, "-c", source, "-o", obj])
+        warnings = compile_with("-Wvla-larger-than=64")
+        require(warnings, f"{cc} warn about large variable length arrays")
+        lines = re.findall(rf"{re.escape(str(source))}:(\d+):\d+:.*\[-Wvla-larger-than=\]", warnings.stderr)
+        assert set(lines) == {"4", "5", "8"}, warnings.stderr
+        errors = compile_with("-Werror=vla-larger-than=64")
+        require(errors, f"{cc} make VLA size warnings errors", success=False)
+        assert "[-Werror=vla-larger-than=]" in errors.stderr, errors.stderr
+        suppressed = compile_with("-Wvla-larger-than=64", "-Wno-vla-larger-than")
+        require(suppressed, f"{cc} suppress VLA size warnings")
+        assert "[-Wvla-larger-than=]" not in suppressed.stderr, suppressed.stderr
+        downgraded = compile_with("-Werror", "-Wvla-larger-than=64", "-Wno-error=vla-larger-than=")
+        require(downgraded, f"{cc} downgrade VLA size errors")
+        assert "[-Wvla-larger-than=]" in downgraded.stderr, downgraded.stderr
+        units = compile_with("-Wvla-larger-than=1KiB")
+        require(units, f"{cc} accept binary unit in VLA warning threshold")
+        assert f"{source}:4:" not in units.stderr, units.stderr
+        invalid = compile_with("-Wvla-larger-than=0x40")
+        require(invalid, f"{cc} reject invalid VLA warning threshold", success=False)
+
+
+def frame_size_warning(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "frame-size-warning.c"
+    source.write_text("""void use(void *);
+void big(void) { char buf[2048]; use(buf); }
+void dynamic(int n) { char buf[n]; use(buf); }
+void suppressed(void);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-larger-than="
+void suppressed(void) { char buf[2048]; use(buf); }
+#pragma GCC diagnostic pop
+void small(void) { char buf[16]; use(buf); }
+""")
+    flags = [f"--target={target}"] if target else []
+    obj = root / "frame-size-warning.o"
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        def compile_with(*args):
+            return invoke([cc, *options, "-std=gnu11", *args, "-c", source, "-o", obj])
+        quiet = compile_with("-Wall")
+        require(quiet, f"{cc} leave frame warnings off without a small threshold")
+        assert "[-Wframe-larger-than=]" not in quiet.stderr, quiet.stderr
+        warnings = compile_with("-Wframe-larger-than=512")
+        require(warnings, f"{cc} warn about large fixed frames")
+        lines = re.findall(rf"{re.escape(str(source))}:(\d+):\d+:.*\[-Wframe-larger-than=\]", warnings.stderr)
+        assert set(lines) == {"2"}, warnings.stderr
+        errors = compile_with("-Werror=frame-larger-than=512")
+        require(errors, f"{cc} make frame warnings errors", success=False)
+        assert "[-Werror=frame-larger-than=]" in errors.stderr, errors.stderr
+        disabled = compile_with("-Wframe-larger-than=512", "-Wno-frame-larger-than")
+        require(disabled, f"{cc} disable frame warnings")
+        assert "[-Wframe-larger-than=]" not in disabled.stderr, disabled.stderr
+        downgraded = compile_with("-Werror", "-Wframe-larger-than=512", "-Wno-error=frame-larger-than=")
+        require(downgraded, f"{cc} downgrade frame errors")
+        assert "[-Wframe-larger-than=]" in downgraded.stderr, downgraded.stderr
+        units = compile_with("-Wframe-larger-than=4KiB")
+        require(units, f"{cc} accept binary units for frame threshold")
+        assert "[-Wframe-larger-than=]" not in units.stderr, units.stderr
+        invalid = compile_with("-Wframe-larger-than=0x200")
+        require(invalid, f"{cc} reject invalid frame threshold", success=False)
+        syntax = invoke([cc, *options, "-std=gnu11", "-Wframe-larger-than=512", "-fsyntax-only", source])
+        require(syntax, f"{cc} check syntax without frame warnings")
+        assert "[-Wframe-larger-than=]" not in syntax.stderr, syntax.stderr
+        scoped = root / "frame-warning-scoped.c"
+        scoped.write_text("""void use(void *);
+void hidden(void) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-larger-than="
+  char a[2048]; use(a);
+}
+#pragma GCC diagnostic pop
+void visible(void) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-larger-than="
+  char b[2048]; use(b);
+#pragma GCC diagnostic pop
+}
+""")
+        result = invoke([cc, *options, "-std=gnu11", "-Wframe-larger-than=512", "-c", scoped, "-o", obj])
+        require(result, f"{cc} apply frame warning state at function end")
+        scoped_lines = re.findall(rf"{re.escape(str(scoped))}:(\d+):\d+:.*\[-Wframe-larger-than=\]", result.stderr)
+        if cc == mcc:
+            assert set(scoped_lines) == {"13"}, result.stderr
+        else:
+            assert set(scoped_lines) <= {"13"}, result.stderr
+
+
+def stack_usage_warning(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "stack-usage-warning.c"
+    source.write_text("""#include <stddef.h>
+void use(void *);
+void big(void) { char buf[2048]; use(buf); }
+void unknown(size_t n) { use(__builtin_alloca(n)); }
+void bounded(size_t n) { if (n <= 64) use(__builtin_alloca(n)); }
+void maximum(size_t n) { use(__builtin_alloca_with_align_and_max(n, 128, 64)); }
+void vla(size_t n) { int a[n]; use(a); }
+void loop(unsigned n) { for (unsigned i=0; i<n; i++) use(__builtin_alloca(16)); }
+void small(void) { char buf[16]; use(buf); }
+void restored(size_t n, unsigned k) { for (unsigned i=0; i<k; i++) if (n<=16) { char a[n]; use(a); } }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstack-usage="
+void ignored(size_t n) { use(__builtin_alloca(n)); }
+#pragma GCC diagnostic pop
+""")
+    hint = root / "stack-usage-max.c"
+    hint.write_text("""void use(void *);
+void f(unsigned long n) { use(__builtin_alloca_with_align_and_max(n, 128, 64)); }
+void g(void) { use(__builtin_alloca_with_align_and_max(128, 128, 64)); }
+""")
+    flags = [f"--target={target}"] if target else []
+    obj = root / "stack-usage-warning.o"
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        def compile_with(*args):
+            return invoke([cc, *options, "-std=gnu11", *args, "-c", source, "-o", obj])
+        warnings = compile_with("-Wstack-usage=512")
+        require(warnings, f"{cc} warn about stack usage")
+        lines = re.findall(rf"{re.escape(str(source))}:(\d+):\d+:.*\[-Wstack-usage=\]", warnings.stderr)
+        assert {"3", "4", "7", "8"} <= set(lines), warnings.stderr
+        assert "9" not in lines and "13" not in lines, warnings.stderr
+        if cc == mcc:
+            assert not {"5", "6", "10"} & set(lines), warnings.stderr
+        errors = compile_with("-Werror=stack-usage=512")
+        require(errors, f"{cc} make stack usage warnings errors", success=False)
+        assert "[-Werror=stack-usage=]" in errors.stderr, errors.stderr
+        disabled = compile_with("-Wstack-usage=512", "-Wno-stack-usage")
+        require(disabled, f"{cc} disable stack usage warnings")
+        assert "[-Wstack-usage=]" not in disabled.stderr, disabled.stderr
+        downgraded = compile_with("-Werror", "-Wstack-usage=512", "-Wno-error=stack-usage=")
+        require(downgraded, f"{cc} downgrade stack usage errors")
+        assert "[-Wstack-usage=]" in downgraded.stderr, downgraded.stderr
+        units = compile_with("-Wstack-usage=4KiB")
+        require(units, f"{cc} accept stack usage size units")
+        assert f"{source}:3:" not in units.stderr, units.stderr
+        invalid = compile_with("-Wstack-usage=0x200")
+        require(invalid, f"{cc} reject invalid stack usage threshold", success=False)
+        syntax = invoke([cc, *options, "-std=gnu11", "-Wstack-usage=512", "-fsyntax-only", source])
+        require(syntax, f"{cc} skip stack usage warnings in syntax-only mode")
+        assert "[-Wstack-usage=]" not in syntax.stderr, syntax.stderr
+        maximum = invoke([cc, *options, "-std=gnu11", "-Walloca-larger-than=64", "-c", hint, "-o", obj])
+        require(maximum, f"{cc} use alloca max size in diagnostics")
+        lines = re.findall(rf"{re.escape(str(hint))}:(\d+):\d+:.*\[-Walloca-larger-than=\]", maximum.stderr)
+        assert set(lines) == {"3"}, maximum.stderr
+        if cc == mcc:
+            outgoing = root / "stack-usage-outgoing.c"
+            outgoing.write_text("""extern void many(long,long,long,long,long,long,long,long,long,long,long,long,long,long,long,long,long,long,long,long);
+void call_many(void) { many(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20); }
+""")
+            result = invoke([cc, *options, "-std=gnu11", "-Wframe-larger-than=0", "-Wstack-usage=0",
+                             "-c", outgoing, "-o", obj])
+            require(result, f"{cc} include outgoing arguments in stack use")
+            frame = re.search(r"frame size of (\d+) bytes", result.stderr)
+            usage = re.search(r"stack usage is (\d+) bytes", result.stderr)
+            assert frame and usage and int(usage.group(1)) > int(frame.group(1)) + 16, result.stderr
+
+
+def stack_usage_file(mcc, gcc, root, target, runner):
+    del runner
+    directory = root / "stack-usage-files"
+    directory.mkdir()
+    source = directory / "usage.c"
+    source.write_text("""#include <stddef.h>
+void sink(void *p) { (void)p; }
+void fixed(void);
+void fixed(void) { char buf[2048]; sink(buf); }
+void unknown(size_t n) { sink(__builtin_alloca(n)); }
+void bounded(size_t n) { if (n <= 32) sink(__builtin_alloca(n)); }
+void maximum(size_t n) { sink(__builtin_alloca_with_align_and_max(n,128,32)); }
+void many(long a,long b,long c,long d,long e,long f,long g,long h,long i,long j,long k,long l) {
+ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;
+}
+void outgoing(void) { many(1,2,3,4,5,6,7,8,9,10,11,12); }
+int main(void) { return 0; }
+""")
+    other = directory / "other.c"
+    other.write_text("int other(void) { return 7; }\n")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        def run(*args):
+            return subprocess.run([str(cc), *options, *map(str, args)], cwd=directory,
+                                  text=True, capture_output=True, timeout=30)
+        obj = directory / ("mcc-output.o" if cc == mcc else "gcc-output.o")
+        report = obj.with_suffix(".su")
+        result = run("-fstack-usage", "-c", source, "-o", obj)
+        require(result, f"{cc} produce stack usage report for object")
+        rows = {}
+        for line in report.read_text().splitlines():
+            columns = line.split("\t")
+            assert len(columns) == 3, line
+            name = columns[0].rsplit(":", 1)[-1]
+            assert columns[1].isdigit(), line
+            assert columns[2] in ("static", "dynamic", "dynamic,bounded"), line
+            rows[name] = (int(columns[1]), columns[2])
+        assert {"sink", "fixed", "unknown", "bounded", "maximum", "many", "outgoing", "main"} <= rows.keys(), rows
+        assert any(line.startswith(f"{source}:4:") and ":fixed\t" in line for line in report.read_text().splitlines()), report.read_text()
+        assert rows["fixed"][0] >= 2048 and rows["fixed"][1] == "static", rows
+        if cc == mcc:
+            assert rows["unknown"][1] == "dynamic", rows
+            assert rows["bounded"][1] == "dynamic,bounded", rows
+            assert rows["maximum"][1] == "dynamic,bounded", rows
+            assert rows["outgoing"][1] == "dynamic,bounded", rows
+        default_report = directory / "usage.su"
+        default_report.unlink(missing_ok=True)
+        result = run("-fstack-usage", "-S", source, "-o", "-")
+        require(result, f"{cc} write report when assembly goes to stdout")
+        assert default_report.is_file(), default_report
+        default_report.unlink()
+        result = run("-fstack-usage", "-fsyntax-only", source)
+        require(result, f"{cc} omit report in syntax-only mode")
+        assert not default_report.exists(), default_report
+        result = run("-fstack-usage", "-E", source)
+        require(result, f"{cc} omit report in preprocessing mode")
+        assert not default_report.exists(), default_report
+        if cc == mcc:
+            obj = directory / "mcc-disabled.o"
+            result = run("-fstack-usage", "-fno-stack-usage", "-c", source, "-o", obj)
+            require(result, f"{cc} disable stack usage report")
+            assert not obj.with_suffix(".su").exists(), obj
+        executable = directory / ("mcc-program" if cc == mcc else "gcc-program")
+        result = run("-fstack-usage", source, "-o", executable)
+        require(result, f"{cc} produce stack usage report while linking")
+        assert (directory / (executable.name + "-usage.su")).is_file(), executable
+        result = run("-fstack-usage", "-c", source, other)
+        require(result, f"{cc} produce one report per input")
+        assert (directory / "usage.su").is_file() and (directory / "other.su").is_file()
+        (directory / "usage.su").unlink()
+        (directory / "other.su").unlink()
+        if cc == mcc:
+            broken = directory / "broken.c"
+            broken.write_text("invalid C source\n")
+            preserved = directory / "preserved.su"
+            preserved.write_text("keep\n")
+            result = run("-fstack-usage", "-c", broken, "-o", directory / "preserved.o")
+            require(result, f"{cc} reject invalid source with stack report", success=False)
+            assert preserved.read_text() == "keep\n"
+            conflict = directory / "conflict.su"
+            result = run("-fstack-usage", "-c", source, "-o", conflict)
+            require(result, f"{cc} reject colliding object and report paths", success=False)
+            assert not conflict.exists()
+
+
+def undefined_macro_warning(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "undefined-macro-warning.c"
+    source.write_text("""#define VALUE 3
+#define INDIRECT INDIRECT_MISSING
+#define FN(x) (x)
+#define CAT(a,b) a ## b
+#if DIRECT_MISSING
+#endif
+#if VALUE == 3 && INDIRECT
+#endif
+#if FN
+#endif
+#if CAT(PASTED_,MISSING)
+#endif
+#if defined(DEFINED_MISSING)
+#endif
+#ifdef IFDEF_MISSING
+#endif
+#if 0 && SHORT_AND
+#endif
+#if 1 || SHORT_OR
+#endif
+#if 1 ? 1 : SHORT_TERNARY
+#endif
+#if 0
+#if INACTIVE_NESTED
+#endif
+#elif ELIF_MISSING
+#endif
+#if 1
+#elif INACTIVE_ELIF
+#endif
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wundef"
+#if IGNORED_MISSING
+#endif
+#pragma GCC diagnostic pop
+#if REPEATED + REPEATED
+#endif
+""")
+    flags = [f"--target={target}"] if target else []
+    expected = {"DIRECT_MISSING", "INDIRECT_MISSING", "FN", "PASTED_MISSING", "ELIF_MISSING", "REPEATED"}
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        def preprocess(path, *args):
+            return invoke([cc, *options, "-std=gnu11", *args, "-E", path])
+        quiet = preprocess(source, "-Wall")
+        require(quiet, f"{cc} leave undefined macro warnings disabled by default")
+        assert "[-Wundef]" not in quiet.stderr, quiet.stderr
+        warnings = preprocess(source, "-Wundef")
+        require(warnings, f"{cc} warn on evaluated undefined macros")
+        names = re.findall(r'warning: ["‘]([^"’\n]+)["’] is not defined', warnings.stderr)
+        assert set(names) == expected and names.count("REPEATED") == 2, warnings.stderr
+        errors = preprocess(source, "-Werror=undef")
+        require(errors, f"{cc} make undefined macro warnings errors", success=False)
+        assert "[-Werror=undef]" in errors.stderr, errors.stderr
+        disabled = preprocess(source, "-Wundef", "-Wno-undef")
+        require(disabled, f"{cc} disable undefined macro warnings")
+        assert "[-Wundef]" not in disabled.stderr, disabled.stderr
+        downgraded = preprocess(source, "-Werror", "-Wundef", "-Wno-error=undef")
+        require(downgraded, f"{cc} downgrade undefined macro errors")
+        assert "[-Wundef]" in downgraded.stderr, downgraded.stderr
+        suppressed = preprocess(source, "-Wundef", "-w")
+        require(suppressed, f"{cc} suppress undefined macro warnings")
+        assert "[-Wundef]" not in suppressed.stderr, suppressed.stderr
+        pragma = root / "undefined-macro-pragma.c"
+        pragma.write_text("""#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wundef"
+#if PRAGMA_MISSING
+#endif
+#pragma GCC diagnostic pop
+#if AFTER_PRAGMA
+#endif
+""")
+        result = preprocess(pragma)
+        require(result, f"{cc} enable undefined macro error via pragma", success=False)
+        assert "PRAGMA_MISSING" in result.stderr and "AFTER_PRAGMA" not in result.stderr, result.stderr
+        system = root / "undefined-macro-system"
+        system.mkdir(exist_ok=True)
+        (system / "header.h").write_text("""#define SYS_BARE SYSTEM_MACRO
+#define ID(x) x
+#define SYS_NEST USER_WRAPPED
+#define CAT_SYS(a,b) a ## b
+#define SYS_GEN CAT_SYS(SYS_,PASTED)
+#define PRE(x) SYS_ ## x
+#define SUF(x) x ## _SYS
+#if DIRECT_SYSTEM
+#endif
+""")
+        mixed = root / "undefined-macro-mixed.c"
+        mixed.write_text("""#define USER_WRAPPED USER_NESTED
+#include <header.h>
+#if SYS_BARE
+#endif
+#if ID(USER_ARG)
+#endif
+#if SYS_NEST
+#endif
+#if SYS_GEN
+#endif
+#if CAT_SYS(USER_,PASTED)
+#endif
+#if PRE(USER)
+#endif
+#if SUF(USER)
+#endif
+""")
+        result = preprocess(mixed, "-Wundef", "-isystem", str(system))
+        require(result, f"{cc} classify macro origin in system headers")
+        names = re.findall(r'warning: ["‘]([^"’\n]+)["’] is not defined', result.stderr)
+        assert set(names) == {"USER_ARG", "USER_NESTED", "USER_PASTED", "USER_SYS"}, result.stderr
+        result = preprocess(mixed, "-Wundef", "-Wsystem-headers", "-isystem", str(system))
+        require(result, f"{cc} enable system header macro warnings")
+        names = re.findall(r'warning: ["‘]([^"’\n]+)["’] is not defined', result.stderr)
+        assert set(names) == {"USER_ARG", "USER_NESTED", "USER_PASTED", "USER_SYS", "SYSTEM_MACRO", "DIRECT_SYSTEM", "SYS_PASTED", "SYS_USER"}, result.stderr
+        boolean = root / "undefined-macro-c23.c"
+        boolean.write_text("#if true\n#endif\n#if false\n#endif\n")
+        result = invoke([cc, *options, "-std=c2x", "-Werror=undef", "-E", boolean])
+        require(result, f"{cc} accept C23 boolean constants in preprocessor conditions")
+
+
+def import_and_once_identity(mcc, gcc, root, target, runner):
+    del runner
+    directory = root / "import-once"
+    directory.mkdir()
+    (directory / "plain.h").write_text("int plain;\n")
+    (directory / "recursive.h").write_text('#include "recursive-link.h"\nint recursive;\n')
+    (directory / "once.h").write_text('#pragma once\n#include "once-link.h"\nint once;\n')
+    (directory / "plain-link.h").hardlink_to(directory / "plain.h")
+    (directory / "recursive-link.h").hardlink_to(directory / "recursive.h")
+    (directory / "once-link.h").hardlink_to(directory / "once.h")
+    source = directory / "main.c"
+    source.write_text("""#define HEADER "plain.h"
+#include HEADER
+#import "plain-link.h"
+#include "plain.h"
+#import "recursive.h"
+#include "recursive-link.h"
+#include "once.h"
+#include "once-link.h"
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        command = [cc, *options, "-std=gnu11", "-E", "-P", source]
+        result = invoke(command)
+        require(result, f"{cc} import and once identity")
+        for name in ("plain", "recursive", "once"):
+            assert len(re.findall(r"\bint\s+" + name + r"\s*;", result.stdout)) == 1, result.stdout
+        assert result.stderr.count("[-Wdeprecated]") == 2, result.stderr
+        quiet = invoke([cc, *options, "-std=gnu11", "-Wno-deprecated", "-E", "-P", source])
+        require(quiet, f"{cc} suppress import warning")
+        assert "[-Wdeprecated]" not in quiet.stderr, quiet.stderr
+        strict = invoke([cc, *options, "-std=gnu11", "-Werror=deprecated", "-E", source])
+        require(strict, f"{cc} promote import warning", success=False)
+        assert "[-Werror=deprecated]" in strict.stderr, strict.stderr
+        pedantic = invoke([cc, *options, "-std=c11", "-pedantic-errors", "-Wno-deprecated", "-E", source])
+        require(pedantic, f"{cc} reject import in pedantic mode", success=False)
+        assert "#import" in pedantic.stderr, pedantic.stderr
+    source.write_text('#import "recursive.h"\n#import "recursive-link.h"\n')
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        result = invoke([cc, *options, "-std=gnu11", "-Wno-deprecated", "-E", "-P", source])
+        require(result, f"{cc} recursive import")
+        assert len(re.findall(r"\bint\s+recursive\s*;", result.stdout)) == 1, result.stdout
+
+
+def expanded_defined_operator(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "expanded-defined.c"
+    source.write_text("""#define FOO 1
+#define DIRECT defined(FOO)
+#define NAME FOO
+#define INDIRECT defined NAME
+#define OP defined
+#define IS(x) defined(x)
+#define PASS(x) x
+#define PASTE(a,b) a ## b
+#if defined(FOO) && DIRECT && INDIRECT && OP(FOO) && !IS(ABSENT) && PASTE(def,ined)(FOO)
+int selected;
+#else
+#error defined results are wrong
+#endif
+#if 0 && DIRECT
+#endif
+#if 1 || DIRECT
+#endif
+#if 1 ? 1 : DIRECT
+#endif
+#if PASS(defined(UNDEFINED))
+#error missing name reported as defined
+#endif
+#if 0
+#if DIRECT
+#endif
+#endif
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wexpansion-to-defined"
+#if DIRECT
+#endif
+#pragma GCC diagnostic pop
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        def preprocess(*args):
+            return invoke([cc, *options, "-std=gnu11", *args, "-E", source])
+        quiet = preprocess("-Wall", "-Wundef")
+        require(quiet, f"{cc} evaluate macro-generated defined")
+        assert "int selected" in quiet.stdout and "[-Wexpansion-to-defined]" not in quiet.stderr, quiet.stderr
+        warnings = preprocess("-Wexpansion-to-defined", "-Wundef")
+        require(warnings, f"{cc} warn on macro-generated defined")
+        assert warnings.stderr.count("[-Wexpansion-to-defined]") == 9, warnings.stderr
+        assert "[-Wundef]" not in warnings.stderr, warnings.stderr
+        extra = preprocess("-Wextra")
+        require(extra, f"{cc} enable expanded defined warnings with -Wextra")
+        assert extra.stderr.count("[-Wexpansion-to-defined]") == 9, extra.stderr
+        errors = preprocess("-pedantic-errors")
+        require(errors, f"{cc} reject expanded defined in pedantic mode", success=False)
+        assert "[-Wexpansion-to-defined]" in errors.stderr or "[-Werror=expansion-to-defined]" in errors.stderr
+        suppressed = preprocess("-pedantic-errors", "-Wno-expansion-to-defined")
+        require(suppressed, f"{cc} suppress expanded defined diagnostics")
+        assert "expansion-to-defined" not in suppressed.stderr, suppressed.stderr
+        error_option = preprocess("-Werror=expansion-to-defined")
+        require(error_option, f"{cc} promote expanded defined warnings", success=False)
+        assert "[-Werror=expansion-to-defined]" in error_option.stderr, error_option.stderr
+        for bad in ("#define FOO 1\n#define IS(x) defined(x)\n#if IS(FOO)\n#endif\n",
+                    "#define FOO 1\n#define PASS(x) x\n#if PASS(defined(FOO))\n#endif\n",
+                    "#define D defined\n#if D()\n#endif\n",
+                    "#define defined 1\n", "#undef defined\n"):
+            result = invoke([cc, *options, "-std=gnu11", "-E", "-"], bad)
+            require(result, f"{cc} reject invalid expanded defined expression", success=False)
+        for option in ("-Ddefined=1", "-Udefined"):
+            result = invoke([cc, *options, "-std=gnu11", option, "-E", "-"], "\n")
+            require(result, f"{cc} reject reserved defined macro option", success=False)
+
+
+def assume_aligned_attribute(mcc, gcc, root, target, runner):
+    source = root / "assume-aligned.c"
+    source.write_text("""
+#if !__has_attribute(assume_aligned) || !__has_attribute(__assume_aligned__)
+#error attribute lookup failed
+#endif
+typedef void *allocator(void) __attribute__((assume_aligned(16,8)));
+extern allocator allocate;
+extern void *offset(void) __attribute__((assume_aligned(16,4)));
+extern void *late(void);
+extern void *late(void) __attribute__((assume_aligned(32)));
+struct callbacks { void *(*fn)(void) __attribute__((assume_aligned(16,8))); };
+typedef void *(*pointer)(void) __attribute__((assume_aligned(16,8)));
+_Static_assert(__builtin_has_attribute(allocator, assume_aligned(16)), "typedef");
+_Static_assert(__builtin_has_attribute(allocate, assume_aligned(16,2)), "offset query");
+_Static_assert(__builtin_has_attribute(late, assume_aligned(32)), "late");
+_Static_assert(__builtin_has_attribute(__typeof__(*(((struct callbacks *)0)->fn)), assume_aligned(16)), "member");
+_Static_assert(__builtin_has_attribute(__typeof__(*((pointer)0)), assume_aligned(16)), "pointer");
+#ifdef __MCC__
+_Static_assert(__atomic_always_lock_free(8, allocate()), "alignment");
+_Static_assert(!__atomic_always_lock_free(8, offset()), "offset");
+_Static_assert(__atomic_always_lock_free(8, late()), "late alignment");
+#endif
+int main(void) { return 0; }
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        require(invoke([cc, *options, "-std=gnu11", "-fsyntax-only", source]),
+                f"{cc} check assume_aligned declarations")
+    for declaration in (
+        "int f(void) __attribute__((assume_aligned(16)));",
+        "void *f(void) __attribute__((assume_aligned(3)));",
+        "void *f(void) __attribute__((assume_aligned(16,-1)));",
+    ):
+        result = invoke([mcc, *flags, "-std=gnu11", "-Werror=attributes", "-fsyntax-only", "-"], declaration)
+        require(result, f"diagnose invalid assume_aligned: {declaration}", success=False)
+    conflicting = """void *f(void) __attribute__((assume_aligned(16)));
+void *f(void) __attribute__((assume_aligned(32)));
+_Static_assert(__builtin_has_attribute(f, assume_aligned(16)), "first declaration");
+"""
+    result = invoke([mcc, *flags, "-std=gnu11", "-fsyntax-only", "-"], conflicting)
+    require(result, "merge conflicting assume_aligned declarations")
+    assert "assume_aligned" in result.stderr and "[-Wattributes]" in result.stderr, result.stderr
+    definition = """void *f(void) __attribute__((assume_aligned(16)));
+__attribute__((assume_aligned(32))) void *f(void) { return 0; }
+_Static_assert(__builtin_has_attribute(f, assume_aligned(16)), "definition retains first declaration");
+"""
+    require(invoke([mcc, *flags, "-std=gnu11", "-fsyntax-only", "-"], definition),
+            "merge assume_aligned on function definition")
+
+
+def returns_twice_attribute(mcc, gcc, root, target, runner):
+    source = root / "returns-twice.c"
+    source.write_text("""
+#include <setjmp.h>
+#if !__has_attribute(returns_twice) || !__has_attribute(__returns_twice__)
+#error missing returns_twice
+#endif
+extern int save(jmp_buf) __asm__("_setjmp") __attribute__((returns_twice));
+extern int save(jmp_buf);
+_Static_assert(__builtin_has_attribute(save, returns_twice), "redeclaration");
+static jmp_buf state;
+static int run(void) {
+    volatile int value = 1;
+    if ((&save)(state) == 0) { value = 7; longjmp(state, 1); }
+    return value == 7 ? 0 : 1;
+}
+int main(void) { return run(); }
+""")
+    binary = root / "returns-twice"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=gnu11", source, "-o", binary]),
+                f"{cc} compile returns_twice")
+        require(invoke([*(runner if cc == mcc else []), binary]),
+                f"{cc} run returns_twice with longjmp")
+    for declaration in (
+        "int object __attribute__((returns_twice));",
+        "typedef int function(void) __attribute__((returns_twice));",
+        "int (*pointer)(void) __attribute__((returns_twice));",
+    ):
+        for cc in (mcc, gcc):
+            options = flags if cc == mcc else []
+            require(invoke([cc, *options, "-std=gnu11", "-Werror=attributes", "-fsyntax-only", "-"], declaration),
+                    f"{cc} diagnose invalid returns_twice: {declaration}", success=False)
+    require(invoke([mcc, *flags, "-std=gnu11", "-fsyntax-only", "-"],
+                   "int f(void) __attribute__((returns_twice(1)));"),
+            "reject returns_twice arguments", success=False)
+    flow = root / "returns-twice-flow.c"
+    flow.write_text("""
+void sink(const char *, unsigned) __attribute__((access(read_only,1,2)));
+#ifdef TWICE
+int marker(void) __attribute__((returns_twice));
+#else
+int marker(void);
+#endif
+void test(void) {
+  char data[4];
+  const char *p = data;
+  unsigned n = 12;
+  (&marker)();
+  sink(p, n);
+}
+""")
+    output = root / "returns-twice-flow.o"
+    command = [mcc, *flags, "-std=gnu11", "-Werror=stringop-overread", "-c", flow, "-o", output]
+    require(invoke(command), "diagnose ordinary call's known access bound", success=False)
+    require(invoke([*command, "-DTWICE"]), "avoid stale access facts after returns_twice")
+
+
+def allocation_alignment_attribute(mcc, gcc, root, target, runner):
+    source = root / "allocation-alignment.c"
+    source.write_text("""
+#include <stddef.h>
+#if !__has_attribute(alloc_align) || !__has_attribute(__alloc_align__)
+#error missing alloc_align
+#endif
+typedef void *allocator(size_t, size_t) __attribute__((alloc_size(1), alloc_align(2)));
+extern allocator allocate;
+extern void *wrapped(size_t, size_t) __attribute__((__alloc_align__(2)));
+extern void *wrapped(size_t, size_t);
+extern void *late(size_t, size_t);
+extern void *late(size_t, size_t) __attribute__((alloc_align(2)));
+struct callbacks { void *(*fn)(size_t, size_t) __attribute__((alloc_align(2))); };
+typedef void *(*pointer)(size_t, size_t) __attribute__((alloc_align(2)));
+void *(* __attribute__((alloc_align(1), alloc_size(2))) nested)(size_t, size_t);
+_Static_assert(__builtin_has_attribute(*nested, alloc_align(1)), "nested pointer alignment");
+_Static_assert(__builtin_has_attribute(*nested, alloc_size(2)), "nested pointer size");
+_Static_assert(__builtin_has_attribute(allocator, alloc_align(2)), "typedef");
+_Static_assert(__builtin_has_attribute(allocate, alloc_align(2)), "declaration");
+_Static_assert(__builtin_has_attribute(wrapped, alloc_align(2)), "redeclaration");
+_Static_assert(__builtin_has_attribute(late, alloc_align(2)), "late");
+_Static_assert(__builtin_has_attribute(__typeof__(*(((struct callbacks *)0)->fn)), alloc_align(2)), "member");
+_Static_assert(__builtin_has_attribute(__typeof__(*((pointer)0)), alloc_align(2)), "pointer");
+_Static_assert(__builtin_has_attribute(allocator, alloc_size(1)), "size coexists");
+_Alignas(64) static unsigned char data[128];
+void *allocate(size_t size, size_t alignment) { (void)size; (void)alignment; return data; }
+int main(void) {
+    pointer p = allocate;
+    char *memory = p(16, 32);
+    nested = allocate;
+    char *sized = nested(32, 16);
+#ifdef __MCC__
+    if (__builtin_object_size(sized, 0) != 16) return 1;
+#endif
+    return memory != (char *)data || sized != (char *)data || ((unsigned long)memory & 31) != 0;
+}
+""")
+    binary = root / "allocation-alignment"
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-O2"]
+        require(invoke([cc, *options, "-std=c11", "-pedantic-errors", source, "-o", binary]),
+                f"{cc} compile alloc_align attributes")
+        require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} run aligned allocator")
+
+    invalid = (
+        "int f(unsigned) __attribute__((alloc_align(1)));",
+        "void *f(double) __attribute__((alloc_align(1)));",
+        "void *f(unsigned) __attribute__((alloc_align(2)));",
+        "void *f(unsigned) __attribute__((alloc_align(0)));",
+        "extern int position; void *f(unsigned) __attribute__((alloc_align(position)));",
+    )
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-x", "c"]
+        for declaration in invalid:
+            command = [cc, *options, "-std=c11", "-fsyntax-only", "-"]
+            result = invoke(command, declaration)
+            require(result, f"{cc} diagnose {declaration}")
+            assert "alloc_align" in result.stderr and "[-Wattributes]" in result.stderr, result.stderr
+            require(invoke([*command[:-1], "-Werror=attributes", "-"], declaration),
+                    f"{cc} promote alloc_align warning", success=False)
+            result = invoke([*command[:-1], "-Wno-attributes", "-"], declaration)
+            require(result, f"{cc} suppress alloc_align warning")
+            assert not result.stderr, result.stderr
+
+    muted = """#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+void *f(double) __attribute__((alloc_align(1)));
+#pragma GCC diagnostic pop
+"""
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-x", "c"]
+        result = invoke([cc, *options, "-std=c11", "-Werror", "-fsyntax-only", "-"], muted)
+        require(result, f"{cc} honor diagnostic pragmas for alloc_align")
+        assert not result.stderr, result.stderr
+
+    conflict = """
+void *f(int, int) __attribute__((alloc_align(1)));
+void *f(int, int) __attribute__((alloc_align(2)));
+_Static_assert(__builtin_has_attribute(f, alloc_align(1)), "first declaration wins");
+"""
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-x", "c"]
+        result = invoke([cc, *options, "-std=c11", "-fsyntax-only", "-"], conflict)
+        require(result, f"{cc} merge conflicting alloc_align attributes")
+        assert "alloc_align" in result.stderr and "[-Wattributes]" in result.stderr, result.stderr
+
+    definition = """
+void *f(int, int) __attribute__((alloc_align(1)));
+__attribute__((alloc_align(2))) void *f(int a, int b) { (void)a; (void)b; return 0; }
+_Static_assert(__builtin_has_attribute(f, alloc_align(1)), "definition retains original contract");
+"""
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-x", "c"]
+        result = invoke([cc, *options, "-std=c11", "-fsyntax-only", "-"], definition)
+        require(result, f"{cc} merge alloc_align on definition")
+        assert "[-Wattributes]" in result.stderr, result.stderr
+
+    c23 = """#if !__has_c_attribute(gnu::alloc_align)
+#error missing C23 alloc_align query
+#endif
+[[gnu::alloc_align(1)]] void *f(unsigned);
+static_assert(__builtin_has_attribute(f, alloc_align(1)));
+"""
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-x", "c"]
+        require(invoke([cc, *options, "-std=c23", "-pedantic-errors", "-fsyntax-only", "-"], c23),
+                f"{cc} check C23 alloc_align syntax")
+
+    for declaration in (
+        "void *f(int) __attribute__((alloc_align));",
+        "void *f(int) __attribute__((alloc_align()));",
+        "void *f(int) __attribute__((alloc_align(1, 2)));",
+    ):
+        require(invoke([mcc, *flags, "-std=c11", "-fsyntax-only", "-"], declaration),
+                f"reject invalid alloc_align arity: {declaration}", success=False)
 
 
 def allocation_sizes(mcc, gcc, root, target, runner):
@@ -4955,155 +7090,720 @@ int main(void) {
         assert "libgcc_s.so" not in dynamic.stdout
 
 
-def extended_assembly(mcc, gcc, root, target, runner):
-    source = r"""
-#if defined(__x86_64__)
-#define ADD "addq %[input], %[out]"
-#define MOVE "movq %1, %0"
-#define LOAD_MEMORY "movq %1, %0"
-#define INC_MEMORY "addq $4, %0"
-#define ADDFP "addsd %1, %0"
-#define FP "x"
-#define FLAGS "=@cce"
-#define COMPARE "cmpq %2, %1"
-#define BRANCH "cmpq %1, %0\nje %l3\naddq $5, %0"
-#define TOUCH_SAVE "movq $123, %%rbx"
-#define SAVED "rbx"
-#define WRITE_BITS "movl $7, %0"
-#define HARD_REGISTER "r12"
-#define READ_HARD "movq %%r12, %0"
-#define WRITE_HARD "movq $42, %%r12"
-#define TIED_HARD "addq $5, %0"
-#define VERIFY ".text\n.globl verify_save\nverify_save:\n" \
-  "pushq %rbx\nmovq $29,%rbx\ncall touch_saved\ncmpq $29,%rbx\n" \
-  "sete %al\nmovzbl %al,%eax\npopq %rbx\nret"
-#else
-#define ADD "add %x[out], %x[out], %x[input]"
-#define MOVE "mov %x0, %x1"
-#define LOAD_MEMORY "ldr %x0, %1"
-#define INC_MEMORY "ldr x10, %0\nadd x10, x10, #4\nstr x10, %0"
-#define ADDFP "fadd %d0, %d0, %d1"
-#define FP "w"
-#define FLAGS "=@cceq"
-#define COMPARE "cmp %x1, %2"
-#define BRANCH "cmp %x0, %x1\nb.eq %l3\nadd %x0, %x0, #5"
-#define TOUCH_SAVE "mov x19, #123"
-#define SAVED "x19"
-#define WRITE_BITS "mov %w0, #7"
-#define HARD_REGISTER "x20"
-#define READ_HARD "mov %x0, x20"
-#define WRITE_HARD "mov x20, #42"
-#define TIED_HARD "add %x0, %x0, #5"
-#define MOVE_WIDE_ZERO "mov %0, %x1"
-#define VERIFY ".text\n.globl verify_save\nverify_save:\n" \
-  "stp x29,x30,[sp,#-16]!\nmov x29,sp\nstp x19,xzr,[sp,#-16]!\n" \
-  "mov x19,#29\nbl touch_saved\ncmp x19,#29\ncset w0,eq\n" \
-  "ldp x19,xzr,[sp],#16\nldp x29,x30,[sp],#16\nret"
+def printf_format_attributes(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "printf-format.c"
+    source.write_text(r"""
+#if !__has_attribute(format) || !__has_attribute(__format__)
+#error missing format attribute
 #endif
-__asm__(VERIFY);
-__asm__(".data\n.global asm_constant\n.balign 8\nasm_constant:\n.quad %c0\n.text"
-        :: "i"(23 * 2));
-extern long asm_constant;
-int verify_save(void);
-void touch_saved(void) {
-    __asm__ volatile(TOUCH_SAVE ::: SAVED);
+int logfn(const char *, ...);
+int logfn(const char *, ...) __attribute__((format(printf, 1, 2)));
+int logfn(const char *, ...);
+typedef int (*logger)(const char *, ...) __attribute__((format(printf, 1, 2)));
+_Static_assert(__builtin_has_attribute(logfn, format), "format attribute");
+_Static_assert(__builtin_has_attribute(logfn, format(printf, 1, 2)), "format argument");
+_Static_assert(!__builtin_has_attribute(logfn, format(scanf, 1, 2)), "different format");
+void good(logger p, const char *unknown) {
+    signed char a; short b; int c; long d; long long e;
+    logfn("%hhn %hn %n %ln %lln", &a, &b, &c, &d, &e);
+    logfn("%*.*f %s %zu %%", 2, 3, 1.0, "ok", (unsigned long)4);
+    logfn("%2$d %1$d", 1, 2);
+    p(unknown, 1);
 }
-static long sum(long a, long b) {
-    long value;
-    __asm__ inline (ADD : [out] "=&r"(value) : "[out]"(a), [input] "r"(b) : "cc");
-    return value;
+void bad(logger p) {
+    logfn("%d %s", "bad", 1);
+    p("%f", 3);
+    logfn("%d %d", 1);
+    logfn("%d", 1, 2);
+    logfn("%*d", "bad", 1);
 }
-static long transferred(long x) {
-    long count = x;
-    {
-        volatile char vla[10 + x];
-        vla[0] = 7;
-        __asm__ goto (BRANCH : "+r"(count) : "r"(0L) : "cc", "memory" : zero);
-        return count + vla[0];
-    }
-zero:
-    return count - 10;
-}
-static long memory_operand(long *p) {
-    long loaded;
-    __asm__ volatile(LOAD_MEMORY : "=r"(loaded) : "m"(*p) : "memory");
-#if defined(__x86_64__)
-    __asm__ volatile(INC_MEMORY : "+m"(*p++) :: "cc", "memory");
-#else
-    __asm__ volatile(INC_MEMORY : "+m"(*p++) :: "x10", "memory");
-#endif
-    return loaded + p[-1];
-}
-static long register_values(long n) {
-    register long bound __asm__(HARD_REGISTER) = n;
-    long observed, advanced;
-    __asm__(READ_HARD : "=&r"(observed) : "r"(bound));
-    __asm__(TIED_HARD : "=r"(advanced) : "0"(bound));
-    __asm__(WRITE_HARD : "=r"(bound));
-    return observed + advanced + bound;
-}
-int main(void) {
-    long copied;
-    __asm__(MOVE : "=r"(copied) : "i"(7 + 2));
-    if (copied != 9 || asm_constant != 46 || sum(19, 23) != 42 || !verify_save())
-        return 1;
-    long storage = 10;
-    if (memory_operand(&storage) != 24 || storage != 14)
-        return 2;
-    if (transferred(0) != -10 || transferred(12) != 24)
-        return 3;
-    double fp = 2.5;
-    __asm__(ADDFP : "+" FP(fp) : FP(1.75));
-    unsigned condition;
-    __asm__(COMPARE : FLAGS(condition) : "r"(12L), "i"(12));
-    if (fp != 4.25 || condition != 1)
-        return 4;
-    struct { unsigned member : 3; } b = {0};
-    __asm__(WRITE_BITS : "=r"(b.member));
-    if (b.member != 7)
-        return 5;
-    if (register_values(123) != 123 + 128 + 42)
-        return 7;
-#if defined(__aarch64__)
-    unsigned narrow;
-    __asm__(MOVE_WIDE_ZERO : "=r"(narrow) : "i"(0));
-    if (narrow != 0)
-        return 8;
-#endif
-#if defined(__x86_64__)
-    __asm__(MOVE : "=a,r"(copied) : "r,r"(storage) : "rax");
-    __asm__("{addq $7,%0|add %0,7}" : "+r"(copied));
-    if (copied != 21)
-        return 6;
-#endif
-    __asm__ volatile(".Ltest%=:\nnop" ::: "memory");
-    __asm__ volatile(".Ltest%=:\nnop" ::: "memory");
-    return 0;
-}
-"""
-    binary = root / "extended-assembly"
-    for cc in (mcc, gcc):
-        flags = ["-x", "c"] if cc == gcc else [f"--target={target}"] if target else []
-        require(invoke([cc, *flags, "-std=c11", "-pedantic-errors", "-", "-o", binary], source),
-                f"{cc} extended asm compilation")
-        require(invoke([*([] if cc == gcc else runner), binary]), f"{cc} extended asm execution")
-    register = "rax" if (target or os.uname().machine).startswith("x86_64") else "x0"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat"
+void suppressed(void) { logfn("%d", "ignored"); }
+#pragma GCC diagnostic pop
+""")
     flags = [f"--target={target}"] if target else []
-    for source in (
-        'void f(void) { __asm__("" : "=r"(1)); }',
-        'void f(int n) { __asm__("" : "r"(n)); }',
-        'void f(int n) { __asm__("" : "=r"(n) : "i"(n)); }',
-        'void f(int n) { __asm__("bad %4" :: "r"(n)); }',
-        'void f(void) { __asm__("" ::: "invalid_register"); }',
-        'void f(int n) { __asm__("" : [x] "=r"(n) : [x] "r"(n)); }',
-        'void f(int n) { __asm__("" : "=r,r"(n) : "r"(n)); }',
-        'void f(void) { __asm__ goto ("" :::: missing); }',
-        'void f(int n) { __asm__ goto ("" :::: inside); { int v[n]; inside: (void)v; } }',
-        'void f(void) { register int n __asm__("invalid_register"); }',
-        f'void f(void) {{ register int n __asm__("{register}"); (void)&n; }}',
-        f'void f(void) {{ register int n __asm__("{register}"); __asm__("" :: "m"(n)); }}',
-    ):
-        require(invoke([mcc, *flags, "-std=c11", "-fsyntax-only", "-"], source), source, success=False)
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        obj = root / "printf-format.o"
+        command = [cc, *options, "-std=gnu11", "-c", source, "-o", obj]
+        quiet = invoke([*command, "-Wno-format-security", "-Wno-format"] if cc == gcc else [*command, "-Wno-format"])
+        require(quiet, f"{cc} suppress printf format warnings")
+        assert "[-Wformat" not in quiet.stderr, quiet.stderr
+        warned = invoke([*command, "-Wformat"])
+        require(warned, f"{cc} diagnose printf formats")
+        assert len(re.findall(r"\[-Wformat(?:-extra-args|=)?\]", warned.stderr)) == 6, warned.stderr
+        error = invoke([*command, "-Werror=format"])
+        require(error, f"{cc} promote format warnings", success=False)
+        assert "Werror=format" in error.stderr, error.stderr
+        for bad in (
+            'int f(int, ...) __attribute__((format(printf,1,2)));',
+            'int f(const unsigned char *, ...) __attribute__((format(printf,1,2)));',
+            'int f(const char *, ...) __attribute__((format(printf,1,3)));',
+        ):
+            language = [] if cc == mcc else ["-x", "c"]
+            result = invoke([cc, *options, *language, "-std=gnu11", "-c", "-", "-o", obj], bad)
+            require(result, f"{cc} reject invalid format attribute", success=False)
+        invalid_index = 'int f(const char *, ...) __attribute__((format(printf,2,2)));'
+        language = [] if cc == mcc else ["-x", "c"]
+        result = invoke([cc, *options, *language, "-std=gnu11", "-c", "-", "-o", obj], invalid_index)
+        require(result, f"{cc} warn about invalid format index")
+        assert "[-Wattributes]" in result.stderr, result.stderr
+
+
+def scanf_and_positional_formats(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "scanf-positional-formats.c"
+    source.write_text(r"""
+int scan(const char *, ...) __attribute__((format(scanf, 1, 2)));
+int print(const char *, ...) __attribute__((format(printf, 1, 2)));
+typedef int (*scanner)(const char *, ...) __attribute__((format(gnu_scanf, 1, 2)));
+_Static_assert(__builtin_has_attribute(scan, format(scanf, 1, 2)), "scanf attribute");
+void good(scanner callback) {
+    int i; unsigned u; float f; double d; char c[20]; char *allocated; void *p;
+    scan("%d %u %f %lf %19s %ms %p %*d", &i, &u, &f, &d, c, &allocated, &p);
+    scan("%2$d %1$f", &f, &i);
+    callback("%[abc] %*[^ ] %n", c, &i);
+    print("%3$*1$.*2$f", 4, 2, 1.0);
+    print("$%2$d %1$s", "hi", 3);
+}
+void bad(scanner callback) {
+    int i; float f; char *c; const char *ro = "x";
+    scan("%d", &f);
+    scan("%f", &i);
+    scan("%lf", &f);
+    scan("%ms", c);
+    callback("%s", ro);
+    scan("%d %d", &i);
+    print("%2$d %1$s", 3, "x");
+    print("%2$*1$d", "bad", 3);
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        obj = root / "scanf-positional-formats.o"
+        command = [cc, *options, "-std=gnu11", "-c", source, "-o", obj]
+        result = invoke([*command, "-Wformat"])
+        require(result, f"{cc} check scanf and positional formats")
+        assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == 9, result.stderr
+        suppressed = invoke([*command, "-Wno-format-security", "-Wno-format"] if cc == gcc else [*command, "-Wno-format"])
+        require(suppressed, f"{cc} suppress scanf and positional warnings")
+        assert "[-Wformat" not in suppressed.stderr, suppressed.stderr
+        failed = invoke([*command, "-Werror=format"])
+        require(failed, f"{cc} promote scanf and positional warnings", success=False)
+        assert "Werror=format" in failed.stderr, failed.stderr
+
+
+def format_argument_attributes(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "format-argument.c"
+    source.write_text(r"""
+#if !__has_attribute(format_arg) || !__has_attribute(__format_arg__)
+#error format_arg unavailable
+#endif
+enum { FIRST = 1 };
+const char *one(const char *);
+const char *one(const char *) __attribute__((format_arg(FIRST)));
+const char *one(const char *);
+const char *both(const char *, const char *, int) __attribute__((format_arg(1), format_arg(2)));
+typedef const char *(*translator)(const char *) __attribute__((format_arg(1)));
+int output(const char *, ...) __attribute__((format(printf, 1, 2)));
+int input(const char *, ...) __attribute__((format(scanf, 1, 2)));
+_Static_assert(__builtin_has_attribute(both, format_arg), "format_arg exists");
+_Static_assert(__builtin_has_attribute(both, format_arg(1)), "format_arg first");
+_Static_assert(__builtin_has_attribute(both, format_arg(2)), "format_arg second");
+void good(translator tr, int choose) {
+    int number;
+    output(one("%d"), 1);
+    output(both("%d", "%x", 1), 1);
+    output(tr("%s"), "valid");
+    output(choose ? one("%d") : one("%x"), 1);
+    input(one("%d"), &number);
+}
+void bad(translator tr) {
+    float floating;
+    output(one("%s"), 1);
+    output(both("%d", "%s", 1), 1);
+    output(one(one("%f")), 1);
+    output(tr("%s"), 1);
+    input(one("%d"), &floating);
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        obj = root / "format-argument.o"
+        command = [cc, *options, "-std=gnu11", "-Wformat", "-c", source, "-o", obj]
+        result = invoke(command)
+        require(result, f"{cc} check format_arg attributes")
+        assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == 5, result.stderr
+        result = invoke([*command, "-fno-builtin"])
+        require(result, f"{cc} preserve explicit format_arg with -fno-builtin")
+        assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == 5, result.stderr
+        for bad in (
+            'void *f(const char *) __attribute__((format_arg(1)));',
+            'char *f(int) __attribute__((format_arg(1)));',
+        ):
+            language = [] if cc == mcc else ["-x", "c"]
+            result = invoke([cc, *options, *language, "-std=gnu11", "-c", "-", "-o", obj], bad)
+            require(result, f"{cc} reject invalid format_arg", success=False)
+        language = [] if cc == mcc else ["-x", "c"]
+        noninteger = 'char *f(const char *) __attribute__((format_arg(1.5)));'
+        result = invoke([cc, *options, *language, "-std=gnu11", "-c", "-", "-o", obj], noninteger)
+        require(result, f"{cc} warn on invalid format_arg index")
+        assert "[-Wattributes]" in result.stderr, result.stderr
+
+    gettext = root / "format-gettext.c"
+    gettext.write_text(r"""
+extern char *gettext(const char *);
+extern char *dgettext(const char *, const char *);
+extern char *dcgettext(const char *, const char *, int);
+int output(const char *, ...) __attribute__((format(printf, 1, 2)));
+void f(void) {
+    output(gettext("%s"), 1);
+    output(dgettext("domain", "%d"), "wrong");
+    output(dcgettext("domain", "%f", 1), 1);
+}
+""")
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        for dialect, extra, count in (("gnu11", [], 3), ("c11", [], 0),
+                                       ("gnu11", ["-ffreestanding"], 0),
+                                       ("gnu11", ["-fno-builtin-gettext"], 2),
+                                       ("gnu11", ["-fno-builtin-dgettext"], 2),
+                                       ("gnu11", ["-fno-builtin-dcgettext"], 2)):
+            result = invoke([cc, *options, f"-std={dialect}", "-Wformat", *extra,
+                             "-c", gettext, "-o", root / "format-gettext.o"])
+            require(result, f"{cc} check gettext format handling")
+            assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == count, result.stderr
+
+
+def multiple_format_attributes(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "multiple-format-attributes.c"
+    source.write_text(r"""
+void pair(const char *, const char *, ...) __attribute__((format(printf,1,3)));
+void pair(const char *, const char *, ...) __attribute__((format(printf,2,3), format(printf,1,3)));
+typedef void (*pair_pointer)(const char *, const char *, ...)
+    __attribute__((format(printf,1,3), format(printf,2,3)));
+void mixed(const char *, const char *, ...)
+    __attribute__((format(printf,1,3), format(scanf,2,3)));
+_Static_assert(!__builtin_has_attribute(mixed, format(printf,1,3)), "most recent format");
+_Static_assert(__builtin_has_attribute(mixed, format(scanf,2,3)), "scanf format");
+void good(pair_pointer p) {
+    int value;
+    pair("%d", "%x", 1);
+    p("%d", "%x", 1);
+    mixed("%p", "%d", &value);
+}
+void bad(pair_pointer p) {
+    int value;
+    pair("%s", "%f", 1);
+    p("%s", "%f", 1);
+    mixed("%d", "%d", &value);
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        result = invoke([cc, *options, "-std=gnu11", "-Wformat", "-c", source,
+                         "-o", root / "multiple-format-attributes.o"])
+        require(result, f"{cc} check multiple format attributes")
+        assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == 5, result.stderr
+
+
+def library_format_diagnostics(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "library-format.c"
+    source.write_text(r"""
+typedef struct _IO_FILE FILE;
+extern int printf(const char *, ...);
+extern int fprintf(FILE *, const char *, ...);
+extern int sprintf(char *, const char *, ...);
+extern int snprintf(char *, unsigned long, const char *, ...);
+extern int scanf(const char *, ...);
+extern int fscanf(FILE *, const char *, ...);
+extern int sscanf(const char *, const char *, ...);
+void invalid(FILE *file, char *buffer) {
+    float value;
+    printf("%d", "bad");
+    fprintf(file, "%d", "bad");
+    sprintf(buffer, "%s", 1);
+    snprintf(buffer, 10, "%f", 1);
+    scanf("%d", &value);
+    fscanf(file, "%d", &value);
+    sscanf(buffer, "%d", &value);
+    __builtin___printf_chk(1, "%s", 1);
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        for mode, extra, count in (("c11", [], 8), ("c90", [], 7),
+                                   ("gnu11", ["-fno-builtin"], 1),
+                                   ("gnu11", ["-ffreestanding"], 1),
+                                   ("gnu11", ["-fno-builtin-printf"], 7),
+                                   ("gnu11", ["-fno-builtin-scanf"], 7)):
+            result = invoke([cc, *options, f"-std={mode}", "-Wformat", *extra,
+                             "-c", source, "-o", root / "library-format.o"])
+            require(result, f"{cc} check library format diagnostics")
+            assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == count, result.stderr
+        explicit = r"""
+extern int printf(const char *, ...) __attribute__((format(gnu_printf, 1, 2)));
+void f(void) { printf("%d", "bad"); }
+"""
+        language = [] if cc == mcc else ["-x", "c"]
+        for extra in ([], ["-fno-builtin"], ["-ffreestanding"]):
+            result = invoke([cc, *options, *language, "-std=gnu11", "-Wformat", *extra,
+                             "-c", "-", "-o", root / "library-format.o"], explicit)
+            require(result, f"{cc} preserve explicitly annotated standard function")
+            count = len(re.findall(r"\[-Wformat=?\]", result.stderr))
+            # GCC 13 diagnoses both its built-in and the explicit gnu_printf attribute.
+            assert count == 1 or (cc == gcc and not extra and count == 2), result.stderr
+        header = root / "stdio-format.c"
+        header.write_text('#include <stdio.h>\nvoid f(void) { printf("%d", "bad"); }\n')
+        result = invoke([cc, *options, "-std=gnu11", "-Wformat", "-c", header,
+                         "-o", root / "stdio-format.o"])
+        require(result, f"{cc} check format diagnostics through stdio.h")
+        assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == 1, result.stderr
+
+
+def va_list_format_diagnostics(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "va-list-format.c"
+    source.write_text(r"""
+#include <stdarg.h>
+extern int vprintf(const char *, va_list);
+extern int vscanf(const char *, va_list);
+extern int custom_print(const char *, va_list) __attribute__((format(printf, 1, 0)));
+extern int custom_scan(const char *, va_list) __attribute__((format(scanf, 1, 0)));
+extern int custom_output(const char *, ...) __attribute__((format(printf, 1, 2)));
+extern int custom_input(const char *, ...) __attribute__((format(scanf, 1, 2)));
+void extensions(_Decimal32 a, _Decimal64 b, _Decimal128 c, long long q, long z,
+                _Decimal32 *pa, _Decimal64 *pb, _Decimal128 *pc) {
+    custom_output("%Hf %Df %DDf %qd %Zd %b %B %C %S", a, b, c, q, z, 1, 2, 65u, L"wide");
+    custom_input("%Hf %Df %DDf", pa, pb, pc);
+}
+void good(va_list args) {
+    vprintf("%*.*f %2$d %1$s", args);
+    vscanf("%d %s %*u", args);
+    custom_print("%d %s", args);
+    custom_scan("%d %s", args);
+}
+void bad(va_list args) {
+    vprintf("%Q", args);
+    vprintf("%", args);
+    vscanf("%[abc", args);
+    vscanf("%*n", args);
+    custom_print("%Q", args);
+    __builtin___vprintf_chk(1, "%Q", args);
+}
+""")
+    # The good printf call must use either positional or sequential arguments throughout.
+    text = source.read_text().replace('%*.*f %2$d %1$s', '%3$*1$.*2$f')
+    source.write_text(text)
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        for mode, extra, count in (("gnu11", [], 6), ("c90", [], 4),
+                                   ("gnu11", ["-fno-builtin"], 2),
+                                   ("gnu11", ["-ffreestanding"], 2),
+                                   ("gnu11", ["-fno-builtin-vprintf"], 4)):
+            result = invoke([cc, *options, f"-std={mode}", "-Wformat", *extra,
+                             "-c", source, "-o", root / "va-list-format.o"])
+            require(result, f"{cc} check va_list format diagnostics")
+            assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == count, result.stderr
+        failed = invoke([cc, *options, "-std=gnu11", "-Werror=format", "-c", source,
+                         "-o", root / "va-list-format.o"])
+        require(failed, f"{cc} promote va_list format diagnostics", success=False)
+        assert "Werror=format" in failed.stderr, failed.stderr
+
+
+def nonliteral_format_diagnostics(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "nonliteral-format.c"
+    source.write_text(r"""
+#include <stdarg.h>
+int out(const char *, ...) __attribute__((format(printf, 1, 2)));
+int scan(const char *, ...) __attribute__((format(scanf, 1, 2)));
+int vout(const char *, va_list) __attribute__((format(printf, 1, 0)));
+const char *translate(const char *) __attribute__((format_arg(1)));
+void f(const char *fmt, int i, int *p, va_list ap) {
+    out(fmt);
+    out(fmt, i);
+    scan(fmt);
+    scan(fmt, p);
+    vout(fmt, ap);
+    out(translate(fmt));
+    out(translate("%s"), 1);
+    out(i ? "safe" : fmt);
+    out((const char *)0);
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    cases = (
+        (["-Wformat=2"], 4, 2, 1),
+        (["-Wformat=2", "-Wno-format-security"], 0, 6, 1),
+        (["-Wformat=2", "-Wno-format-nonliteral"], 4, 0, 1),
+        (["-Wformat", "-Wformat-nonliteral", "-Wno-format-security"], 0, 6, 1),
+        (["-Wformat", "-Wformat-security", "-Wno-format-nonliteral"], 4, 0, 1),
+        (["-Wformat=2", "-Wformat=1", "-Wno-format-security"], 0, 0, 1),
+    )
+    pragma = root / "nonliteral-format-pragma.c"
+    pragma.write_text(r"""
+int out(const char *, ...) __attribute__((format(printf, 1, 2)));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+void a(const char *p) { out(p); }
+#pragma GCC diagnostic pop
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+void b(const char *p) { out(p, 1); }
+#pragma GCC diagnostic pop
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat"
+#pragma GCC diagnostic warning "-Wformat-security"
+void c(const char *p) { out(p); }
+#pragma GCC diagnostic pop
+""")
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-Wno-error=format-security"]
+        for extra, security, nonliteral, regular in cases:
+            result = invoke([cc, *options, "-std=gnu11", *extra, "-c", source,
+                             "-o", root / "nonliteral-format.o"])
+            require(result, f"{cc} check nonliteral format diagnostics")
+            assert result.stderr.count("[-Wformat-security]") == security, result.stderr
+            assert result.stderr.count("[-Wformat-nonliteral]") == nonliteral, result.stderr
+            assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == regular, result.stderr
+        result = invoke([cc, *options, "-std=gnu11", "-Wformat=2", "-c", pragma,
+                         "-o", root / "nonliteral-format.o"])
+        require(result, f"{cc} check nonliteral diagnostic pragmas")
+        assert result.stderr.count("[-Wformat-security]") == 1, result.stderr
+        assert "[-Wformat-nonliteral]" not in result.stderr, result.stderr
+        result = invoke([cc, *options, "-std=gnu11", "-Wformat", "-Werror=format-security",
+                         "-c", source, "-o", root / "nonliteral-format.o"])
+        require(result, f"{cc} promote format-security warning", success=False)
+        assert "Werror=format-security" in result.stderr, result.stderr
+        result = invoke([cc, *options, "-std=gnu11", "-Wformat=2", "-Werror=format", "-Wno-format-security",
+                         "-c", source, "-o", root / "nonliteral-format.o"])
+        require(result, f"{cc} reset format level when enabling format errors", success=False)
+        assert "Werror=format=" in result.stderr or "Werror=format]" in result.stderr, result.stderr
+        assert "format-nonliteral" not in result.stderr and "format-security" not in result.stderr, result.stderr
+        result = invoke([cc, *options, "-std=gnu11", "-Werror=format", "-Wformat=2", "-Wno-format-security",
+                         "-c", source, "-o", root / "nonliteral-format.o"])
+        require(result, f"{cc} enable level two format errors", success=False)
+        assert "Werror=format-nonliteral" in result.stderr, result.stderr
+
+
+def format_signedness_diagnostics(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "format-signedness.c"
+    source.write_text(r"""
+int p(const char *, ...) __attribute__((format(printf, 1, 2)));
+int s(const char *, ...) __attribute__((format(scanf, 1, 2)));
+void f(int si, unsigned int ui, signed char sc, unsigned char uc, short sh, unsigned short us,
+       long sl, unsigned long ul, int *pi, unsigned int *pu, signed char *ps, unsigned char *pc) {
+    p("%u", si);       /* mismatch */
+    p("%d", ui);       /* mismatch */
+    p("%u", 1);        /* mismatch */
+    p("%d", 1u);       /* mismatch */
+    p("%u", sc);       /* mismatch */
+    p("%u", uc);
+    p("%u", sh);       /* mismatch */
+    p("%u", us);
+    p("%u", (int)uc);
+    p("%hhu", sc);
+    p("%hhu", uc);
+    p("%hhu", ui);     /* mismatch */
+    p("%hhd", ui);     /* mismatch */
+    p("%lu", sl);      /* mismatch */
+    p("%ld", ul);      /* mismatch */
+    p("%2$u %1$d", si, si); /* mismatch */
+    p("%2$d %1$u", ui, ui); /* mismatch */
+    p("%*d", ui, si);  /* mismatch */
+    p("%lc", si);      /* mismatch */
+    p("%n", pu);       /* mismatch */
+    s("%u", pi);       /* mismatch */
+    s("%d", pu);       /* mismatch */
+    s("%hhu", ps);     /* mismatch */
+    s("%hhd", pc);     /* mismatch */
+    s("%c", pc);
+}
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-signedness"
+void ignored(int x) { p("%u", x); } /* mismatch */
+#pragma GCC diagnostic pop
+""")
+    expected_lines = {i for i, line in enumerate(source.read_text().splitlines(), 1) if "/* mismatch */" in line}
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        command = [cc, *options, "-std=gnu11", "-Wformat", "-c", source,
+                   "-o", root / "format-signedness.o"]
+        result = invoke([*command, "-Wformat-signedness"])
+        require(result, f"{cc} warn on format signedness")
+        actual_lines = {int(line) for line in re.findall(r"format-signedness\.c:(\d+):\d+: warning:", result.stderr)}
+        assert actual_lines == expected_lines, result.stderr
+        suppressed = invoke([*command, "-Wformat-signedness", "-Wno-format-signedness"])
+        require(suppressed, f"{cc} suppress format signedness")
+        assert not re.search(r"\[-Wformat=?\]", suppressed.stderr), suppressed.stderr
+        child_error = invoke([*command, "-Werror=format-signedness"])
+        require(child_error, f"{cc} treat signedness diagnostics as format warnings")
+        assert len(re.findall(r"\[-Wformat=?\]", child_error.stderr)) == len(expected_lines), child_error.stderr
+        parent_error = invoke([*command, "-Wformat-signedness", "-Werror=format"])
+        require(parent_error, f"{cc} promote format signedness diagnostics", success=False)
+        assert "Werror=format" in parent_error.stderr, parent_error.stderr
+        pragma_source = r"""
+int p(const char *, ...) __attribute__((format(printf, 1, 2)));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic warning "-Wformat-signedness"
+void f(int value) { p("%u", value); }
+#pragma GCC diagnostic pop
+"""
+        language = [] if cc == mcc else ["-x", "c"]
+        pragma = invoke([cc, *options, *language, "-std=gnu11", "-Wformat", "-Wno-format-signedness",
+                         "-c", "-", "-o", root / "format-signedness.o"], pragma_source)
+        require(pragma, f"{cc} enable format signedness through pragma")
+        assert len(re.findall(r"\[-Wformat=?\]", pragma.stderr)) == 1, pragma.stderr
+
+
+def strftime_format_diagnostics(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "strftime-format.c"
+    source.write_text(r"""
+#include <stddef.h>
+struct tm;
+size_t strftime(char *, size_t, const char *, const struct tm *);
+int custom(const char *) __attribute__((format(strftime, 1, 0)));
+const char *translate(const char *) __attribute__((format_arg(1)));
+_Static_assert(__builtin_has_attribute(custom, format(strftime, 1, 0)), "strftime format");
+void f(char *out, size_t size, const char *unknown, const struct tm *tm) {
+    custom("%y"); custom("%g"); custom("%D"); custom("%x"); custom("%c");
+    custom("%Ey"); custom("%Oy"); custom(translate("%y"));
+    custom("%Y %G %C %F %T %%");
+    strftime(out, size, "%y", tm);
+    strftime(out, size, "%Q", tm);
+    strftime(out, size, "%", tm);
+    strftime(out, size, unknown, tm);
+}
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-y2k"
+void ignored(void) { custom("%y"); }
+#pragma GCC diagnostic pop
+""")
+    flags = [f"--target={target}"] if target else []
+    cases = (
+        (["-Wformat=2"], 9, 2, 1),
+        (["-Wformat", "-Wformat-y2k", "-Wno-format-nonliteral"], 9, 2, 0),
+        (["-Wformat=2", "-Wno-format-y2k"], 0, 2, 1),
+        (["-Wformat=2", "-fno-builtin-strftime"], 8, 0, 0),
+        (["-Wformat=2", "-ffreestanding"], 8, 0, 0),
+    )
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else ["-Wno-error=format-security"]
+        for extra, y2k, regular, nonliteral in cases:
+            result = invoke([cc, *options, "-std=gnu11", *extra, "-c", source,
+                             "-o", root / "strftime-format.o"])
+            require(result, f"{cc} check strftime format diagnostics")
+            assert result.stderr.count("[-Wformat-y2k]") == y2k, result.stderr
+            assert len(re.findall(r"\[-Wformat=?\]", result.stderr)) == regular, result.stderr
+            assert result.stderr.count("[-Wformat-nonliteral]") == nonliteral, result.stderr
+        bad = 'int f(const char *, ...) __attribute__((format(strftime,1,2)));'
+        language = [] if cc == mcc else ["-x", "c"]
+        result = invoke([cc, *options, *language, "-std=gnu11", "-c", "-",
+                         "-o", root / "strftime-format.o"], bad)
+        require(result, f"{cc} reject strftime arguments", success=False)
+        result = invoke([cc, *options, "-std=gnu11", "-Wformat", "-Werror=format-y2k",
+                         "-c", source, "-o", root / "strftime-format.o"])
+        require(result, f"{cc} promote format-y2k warnings", success=False)
+        assert "Werror=format-y2k" in result.stderr, result.stderr
+
+
+def strfmon_format_diagnostics(mcc, gcc, root, target, runner):
+    del runner
+    source = root / "strfmon-format.c"
+    source.write_text(r"""
+#include <stddef.h>
+typedef long ssize_t;
+extern ssize_t strfmon(char *, size_t, const char *, ...);
+int money(const char *, ...) __attribute__((format(strfmon, 1, 2)));
+typedef int (*money_callback)(const char *, ...) __attribute__((format(__strfmon__, 1, 2)));
+const char *translate(const char *) __attribute__((format_arg(1)));
+_Static_assert(__builtin_has_attribute(money, format(strfmon, 1, 2)), "strfmon attribute");
+void good(money_callback callback, double d, long double ld) {
+    money("%n %i %Ln %%", d, d, ld);
+    money("%=*^!12#3.2n", d);
+    callback("%i", d);
+}
+void bad(money_callback callback, char *buffer, size_t size, double d, long double ld) {
+    money("%n", 1);
+    money("%Ln", d);
+    money("%n", ld);
+    money("%q", d);
+    money("%", d);
+    money("%#n", d);
+    money("%.n", d);
+    money("%++n", d);
+    money("%+(!n", d);
+    money(translate("%n"), 1);
+    callback("%i", 1);
+    strfmon(buffer, size, "%n", 1);
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        for mode, extra, count in (("gnu11", [], 14), ("c11", [], 13),
+                                   ("gnu11", ["-fno-builtin-strfmon"], 13),
+                                   ("gnu11", ["-ffreestanding"], 13)):
+            result = invoke([cc, *options, f"-std={mode}", "-Wformat", *extra,
+                             "-c", source, "-o", root / "strfmon-format.o"])
+            require(result, f"{cc} check strfmon format diagnostics")
+            assert len(re.findall(r":\d+:\d+: warning:", result.stderr)) == count, result.stderr
+        failed = invoke([cc, *options, "-std=gnu11", "-Werror=format", "-c", source,
+                         "-o", root / "strfmon-format.o"])
+        require(failed, f"{cc} promote strfmon format diagnostics", success=False)
+        assert "Werror=format" in failed.stderr, failed.stderr
+
+
+def alias_type_diagnostics(mcc, gcc, root, target, runner):
+    del runner
+    obj = root / "alias-type-diagnostic.o"
+    wrong = """static long (*resolver(void))(int) { return 0; }
+int selected(int) __attribute__((ifunc("resolver")));
+int original(int value) { return value; }
+extern long wrong_alias(long) __attribute__((alias("original")));
+"""
+    quiet = """#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+static long (*resolver(void))(int) { return 0; }
+int selected(int) __attribute__((ifunc("resolver")));
+int original(int value) { return value; }
+extern long wrong_alias(long) __attribute__((alias("original")));
+#pragma GCC diagnostic pop
+"""
+    good = """static void *generic(void) { return 0; }
+static int (*typed(void))(int) { return 0; }
+int a(int) __attribute__((ifunc("generic")));
+int b(int) __attribute__((ifunc("typed")));
+int original(int value) { return value; }
+extern int right_alias(int) __attribute__((alias("original")));
+"""
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        def compile_text(text, *args):
+            language = [] if cc == mcc else ["-x", "c"]
+            return invoke([cc, *options, *language, "-std=gnu11", *args, "-c", "-", "-o", obj], text)
+        result = compile_text(wrong)
+        require(result, f"{cc} diagnose incompatible aliases")
+        assert len(re.findall(r"\[-Wattribute-alias=?\]", result.stderr)) == 2, result.stderr
+        for option in ("-Wno-attribute-alias", "-Wattribute-alias=0"):
+            result = compile_text(wrong, option)
+            require(result, f"{cc} suppress incompatible alias warning")
+            assert "attribute-alias" not in result.stderr, result.stderr
+        for option in ("-Wattribute-alias=1", "-Wattribute-alias=2", "-Wno-attributes"):
+            result = compile_text(wrong, option)
+            require(result, f"{cc} enable incompatible alias warning")
+            assert len(re.findall(r"\[-Wattribute-alias=?\]", result.stderr)) == 2, result.stderr
+        result = compile_text(wrong, "-Werror=attribute-alias")
+        require(result, f"{cc} make incompatible alias warnings errors", success=False)
+        assert "Werror=attribute-alias" in result.stderr, result.stderr
+        for text in (quiet, good):
+            result = compile_text(text, "-Werror=attribute-alias")
+            require(result, f"{cc} accept suppressed or compatible aliases")
+
+
+def indirect_functions(mcc, gcc, root, target, runner):
+    provider = root / "ifunc-provider.c"
+    provider.write_text(r"""
+#if !__has_attribute(ifunc) || !__has_attribute(__ifunc__)
+#error ifunc attribute unavailable
+#endif
+static int implementation(int value) { return value + 4; }
+static int (*resolver(void))(int) { return implementation; }
+int selected(int) __attribute__((ifunc("resolver")));
+extern int selected_alias(int) __attribute__((alias("selected")));
+static int local_selected(int) __attribute__((ifunc("resolver")));
+int call_local(int value) { return local_selected(value); }
+_Static_assert(__builtin_has_attribute(selected, ifunc), "ifunc query");
+_Static_assert(__builtin_has_attribute(selected, ifunc("resolver")), "ifunc target query");
+_Static_assert(!__builtin_has_attribute(selected, ifunc("other")), "ifunc target mismatch");
+""")
+    consumer = root / "ifunc-consumer.c"
+    consumer.write_text("""
+int selected(int), selected_alias(int), call_local(int);
+int main(void) {
+    int (*pointer)(int) = selected;
+    return selected(1) != 5 || pointer(2) != 6 || selected_alias(3) != 7 || call_local(4) != 8;
+}
+""")
+    flags = [f"--target={target}"] if target else []
+    for cc in (mcc, gcc):
+        options = flags if cc == mcc else []
+        prefix = [cc, *options, "-std=gnu11"]
+        obj = root / "ifunc.o"
+        lib = root / "libifunc-check.so"
+        binary = root / "ifunc-check"
+        require(invoke([*prefix, "-fPIC", "-c", provider, "-o", obj]), f"{cc} compile ifunc")
+        symbols = invoke(["readelf", "-sW", obj])
+        require(symbols, f"inspect {cc} ifunc symbols")
+        for name in ("selected", "selected_alias"):
+            assert re.search(r"\bIFUNC\s+GLOBAL\s+\S+\s+\S+\s+" + name + r"$", symbols.stdout, re.M), symbols.stdout
+        require(invoke([*prefix, obj, consumer, "-o", binary]), f"{cc} link ifunc executable")
+        require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} execute ifunc")
+        require(invoke([*prefix, "-static", obj, consumer, "-o", binary]), f"{cc} link static ifunc")
+        require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} execute static ifunc")
+        require(invoke([*prefix, "-shared", obj, "-o", lib]), f"{cc} link ifunc shared library")
+        dynamic_symbols = invoke(["readelf", "--dyn-syms", "-W", lib])
+        require(dynamic_symbols, f"inspect {cc} shared ifunc symbols")
+        for name in ("selected", "selected_alias"):
+            assert re.search(r"\bIFUNC\s+GLOBAL\s+\S+\s+\S+\s+" + name + r"$", dynamic_symbols.stdout, re.M), dynamic_symbols.stdout
+        require(invoke([*prefix, consumer, f"-L{root}", "-lifunc-check", f"-Wl,-rpath,{root}", "-o", binary]),
+                f"{cc} link ifunc shared consumer")
+        require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} execute shared ifunc")
+        require(invoke([*prefix, "-fvisibility=hidden", "-c", provider, "-o", obj]),
+                f"{cc} compile hidden ifunc")
+        hidden = invoke(["readelf", "-sW", obj])
+        require(hidden, f"inspect {cc} hidden ifunc")
+        assert re.search(r"\bIFUNC\s+GLOBAL\s+HIDDEN\s+\S+\s+selected$", hidden.stdout, re.M), hidden.stdout
+        for bad in (
+            'int f(void) __attribute__((ifunc("missing")));',
+            'int f(void) __attribute__((ifunc("resolver"), weak)); void *resolver(void) { return 0; }',
+            'int f(void) __attribute__((ifunc("resolver"))); int f(void) { return 1; } void *resolver(void) { return 0; }',
+            'static int resolver(void) { return 0; } int f(void) __attribute__((ifunc("resolver")));',
+        ):
+            result = invoke([*prefix, "-c", "-", "-o", obj], bad)
+            require(result, f"{cc} reject invalid ifunc", success=False)
+
+    if not target:
+        mcc_obj, gcc_obj = root / "mcc-ifunc.o", root / "gcc-ifunc.o"
+        binary = root / "ifunc-mixed"
+        for cc, obj in ((mcc, mcc_obj), (gcc, gcc_obj)):
+            require(invoke([cc, "-std=gnu11", "-fPIC", "-c", provider, "-o", obj]),
+                    f"{cc} compile ifunc interoperability object")
+        for cc, obj in ((mcc, gcc_obj), (gcc, mcc_obj)):
+            require(invoke([cc, obj, consumer, "-o", binary]), f"{cc} link foreign ifunc object")
+            require(invoke([binary]), f"{cc} execute foreign ifunc object")
+
+
+def unsupported_inline_assembly(mcc, root, target):
+    flags = [f"--target={target}"] if target else []
+    cases = (
+        '__asm__("nop");',
+        'asm("nop");',
+        'void f(void) { __asm__("nop"); }',
+        'void f(void) { __asm__ volatile("nop"); }',
+        'void f(int x) { __asm__("" : "+r"(x)); }',
+        'void f(void) { __asm__ goto("" : : : : done); done:; }',
+    )
+    for source in cases:
+        for options in (["-fsyntax-only"], ["-S", "-o", root / "unsupported-inline.s"]):
+            result = invoke([mcc, *flags, "-std=gnu11", *options, "-"], source)
+            require(result, f"reject inline assembly: {source}", success=False)
+            assert "inline assembly is not supported" in result.stderr, result.stderr
 
 
 def global_register_variables(mcc, gcc, root, target, runner):
@@ -5112,16 +7812,10 @@ def global_register_variables(mcc, gcc, root, target, runner):
 #define WORD_REGISTER "r12"
 #define BYTE_REGISTER "r13"
 #define POINTER_REGISTER "r14"
-#define ADD_FOUR "addq $4, %0"
-#define DOUBLE "movq %1, %0\\naddq %2, %0"
-#define ADD_ONE "addq $1, %0"
 #else
 #define WORD_REGISTER "x19"
 #define BYTE_REGISTER "x20"
 #define POINTER_REGISTER "x21"
-#define ADD_FOUR "add %0, %0, #4"
-#define DOUBLE "add %0, %1, %2"
-#define ADD_ONE "add %0, %0, #1"
 #endif
 long word;
 __extension__ register long word __asm__(WORD_REGISTER);
@@ -5150,16 +7844,14 @@ static int check(void) {
     if (before != 3 || changed != 9 || parsed != 17 || word != 9)
         return 1;
     word *= 3;
-    __asm__(ADD_FOUR : "+r"(word) : : "cc");
-    long twice, next;
-    __asm__(DOUBLE : "=&r"(twice) : "r"(word), "r"(word) : "cc");
-    __asm__(ADD_ONE : "=r"(next) : "0"(word) : "cc");
+    word += 4;
+    long twice = word + word, next = word + 1;
     if (twice != 62 || next != 32 || word != 31)
         return 2;
     if (++byte != -3 || *ptr++ != 12 || *ptr != 34)
         return 3;
 #if defined(__aarch64__)
-    __asm__("fadd %d0, %d0, %d1" : "+w"(fp) : "w"(2.5));
+    fp += 2.5;
     if (fp != 4.25)
         return 4;
 #endif
@@ -5187,9 +7879,106 @@ int main(void) { _Exit(check()); }
         (declaration + "; long *address(void) { return &state; }", ["-std=gnu11"]),
         ("extern long state; long *address(void) { return &state; } " + declaration + ";",
          ["-std=gnu11"]),
-        (declaration + '; void f(void) { __asm__("" :: "m"(state)); }', ["-std=gnu11"]),
     ):
         require(invoke([mcc, *flags, *dialect, "-fsyntax-only", "-"], source), source, success=False)
+
+
+def global_vector_registers(mcc, gcc, root, target, runner):
+    bindings = r"""
+typedef int vector __attribute__((vector_size(16)));
+typedef short small_vector __attribute__((vector_size(8)));
+typedef int tiny_vector __attribute__((vector_size(4)));
+typedef struct { vector data; } wrapped_vector;
+#if defined(__aarch64__)
+#define VREG "v8"
+#define WREG "v9"
+#define SREG "v10"
+#define TREG "v11"
+#define GREG "x19"
+#else
+#define VREG "xmm8"
+#define WREG "xmm9"
+#define SREG "xmm10"
+#define TREG "xmm11"
+#define GREG "r12"
+#endif
+register vector state __asm__(VREG);
+register wrapped_vector wrapped __asm__(WREG);
+register small_vector narrow __asm__(GREG);
+register small_vector simd_small __asm__(SREG);
+register tiny_vector simd_tiny __asm__(TREG);
+"""
+    primary = root / "global-vector-main.c"
+    secondary = root / "global-vector-other.c"
+    primary.write_text(bindings + r"""
+extern void alter(void);
+extern void _Exit(int);
+#ifdef __MCC__
+static int change_index(void) { state[3] = 200; return 1; }
+static int change_rhs(void) { state[0] = 100; return 3; }
+#endif
+static int check(void) {
+    state = (vector){1,2,3,4};
+    wrapped = (wrapped_vector){(vector){10,20,30,40}};
+    narrow = (small_vector){5,6,7,8};
+    simd_small = (small_vector){11,12,13,14};
+    simd_tiny = (tiny_vector){42};
+    state += (vector){2,3,4,5};
+    vector before = state;
+    small_vector short_copy = narrow;
+    small_vector simd_copy = simd_small;
+    tiny_vector tiny_copy = simd_tiny;
+    if (before[0]!=3 || before[1]!=5 || before[2]!=7 || before[3]!=9 ||
+        short_copy[0]!=5 || short_copy[3]!=8 || simd_copy[0]!=11 || simd_copy[3]!=14 ||
+        tiny_copy[0]!=42) return 1;
+    alter();
+    vector after = state;
+    vector wrapped_copy = wrapped.data;
+    if (after[0]!=4 || after[1]!=7 || after[2]!=10 || after[3]!=13 ||
+        wrapped_copy[0]!=10 || wrapped_copy[3]!=40) return 2;
+#ifdef __MCC__
+    int i = 1;
+    int old = state[i++]++;
+    if (old!=7 || i!=2 || state[1]!=8) return 3;
+    state[i] += 9;
+    if (state[2]!=19) return 4;
+    wrapped.data[i++] += 5;
+    if (i!=3 || wrapped.data[2]!=35) return 5;
+    narrow[2] = 22;
+    simd_small[1] += 10;
+    simd_tiny[0]++;
+    if (narrow[2]!=22 || simd_small[1]!=22 || simd_tiny[0]!=43) return 6;
+    state = (vector){1,2,3,4};
+    state[change_index()] = 9;
+    if (state[1]!=9 || state[3]!=200) return 8;
+    state[1] += change_rhs();
+    if (state[0]!=100 || state[1]!=12 || state[3]!=200) return 9;
+    register vector local __asm__(VREG);
+    local = (vector){7,8,9,10};
+    i = 0;
+    local[i++] += 4;
+    if (i!=1 || local[0]!=11) return 7;
+#endif
+    return 0;
+}
+int main(void) { _Exit(check()); }
+""")
+    secondary.write_text(bindings + r"""
+void alter(void) { state += (vector){1,2,3,4}; }
+""")
+    flags = [f"--target={target}"] if target else []
+    binary = root / "global-vector-register"
+    for cc in (mcc, gcc):
+        require(invoke([cc, *([] if cc == gcc else flags), "-std=gnu11", primary, secondary, "-o", binary]),
+                f"{cc} compile global vector registers")
+        require(invoke([*(runner if cc == mcc else []), binary]), f"{cc} execute global vector registers")
+    register = "xmm8" if (target or os.uname().machine).startswith("x86_64") else "v8"
+    for expr in ("&state", "&state[1]", "&state[index]", "&state[99]"):
+        source = (f'typedef int vector __attribute__((vector_size(16))); '
+                  f'register vector state __asm__("{register}"); '
+                  f'void *f(int index) {{ return {expr}; }}')
+        require(invoke([mcc, *flags, "-std=gnu11", "-fsyntax-only", "-"], source),
+                f"reject address of global vector register: {expr}", success=False)
 
 
 def call_clobbered_global_registers(mcc, gcc, root, target, runner):
@@ -5198,16 +7987,10 @@ def call_clobbered_global_registers(mcc, gcc, root, target, runner):
 #define WORD_REGISTER "r10"
 #define FRAME_REGISTER "r9"
 #define FP_REGISTER "xmm10"
-#define FP_CONSTRAINT "x"
-#define ADD_AND_JUMP "addq $3, %0\njmp %l2"
-#define ADD_FP "addsd %1, %0"
 #else
 #define WORD_REGISTER "x14"
 #define FRAME_REGISTER "x15"
 #define FP_REGISTER "d16"
-#define FP_CONSTRAINT "w"
-#define ADD_AND_JUMP "add %0, %0, #3\nb %l2"
-#define ADD_FP "fadd %d0, %d0, %d1"
 #endif
 __extension__ register long word __asm__(WORD_REGISTER);
 __extension__ register long frame_word __asm__(FRAME_REGISTER);
@@ -5226,10 +8009,8 @@ static int check(void) {
     long value = update(7, 0.5);
     if (value != 18 || word != 18 || fp != 4.75)
         return 2;
-    __asm__(ADD_FP : "+" FP_CONSTRAINT(fp) : FP_CONSTRAINT(2.0));
-    __asm__ goto (ADD_AND_JUMP : "+r"(word) : : "cc" : jumped);
-    return 3;
-jumped:
+    fp += 2.0;
+    word += 3;
     return word != 21 || fp != 6.75 ? 4 : 0;
 }
 int main(void) { _Exit(check()); }
@@ -5264,18 +8045,13 @@ long use_large_frame(void) {
 #define ARG_REGISTER "rdi"
 #define RESULT_REGISTER "rax"
 #define FP_RESULT_REGISTER "xmm0"
-#define RAW_CALL_BODY "addq $4,%rax\naddsd %xmm0,%xmm0\nret"
-#define ADD_INPUT "addq %1,%0"
 __extension__ register long arg_model __asm__(ARG_REGISTER);
 #else
 #define RESULT_REGISTER "x0"
 #define FP_RESULT_REGISTER "d0"
-#define RAW_CALL_BODY "add x0,x0,#4\nfadd d0,d0,d0\nret"
-#define ADD_INPUT "add %0,%0,%1"
 #endif
 __extension__ register long result_model __asm__(RESULT_REGISTER);
 __extension__ register double fp_model __asm__(FP_RESULT_REGISTER);
-__asm__(".text\n.globl raw_call\nraw_call:\n" RAW_CALL_BODY);
 extern void raw_call(void);
 typedef struct { long n; double d; } mixed;
 extern void _Exit(int);
@@ -5319,16 +8095,13 @@ static int check(void) {
     raw_call();
     if (result_model != 34 || fp_model != 12.5)
         return 4;
-    __asm__(ADD_INPUT : "=r"(result_model) : "r"(11L), "0"(23L) : "cc");
-    if (result_model != 34)
-        return 7;
     local = 73;
     if (local != 73)
         return 5;
 #if defined(__aarch64__)
     __extension__ long double expected = 13.5L;
     extern long double wide;
-    __asm__("ldr %q0, %1" : "=w"(wide) : "m"(expected));
+    wide = expected;
     long double actual = wide;
     if (actual != expected)
         return 6;
@@ -5340,7 +8113,8 @@ __extension__ register long double wide __asm__("d8");
 #endif
 int main(void) { _Exit(check()); }
 """
-    require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", "-", "-o", binary], source),
+    require(invoke([mcc, *flags, "-std=c11", "-pedantic-errors", "-",
+                    register_probe_object(mcc, gcc, root, target, mcc), "-o", binary], source),
             "global register ABI compilation")
     require(invoke([*runner, binary]), "global register ABI execution")
 
@@ -5358,10 +8132,6 @@ typedef struct { signed first:5; unsigned other:3; } Bits;
 #define SIMD_REG "xmm11"
 #define LOCAL_REG "r15"
 #define BITS_REG "rbx"
-#define COPY_WORD "movq %1,%0"
-#define ADD_MEMBER "addl $5,%0"
-#define COPY_SIMD "movaps %1,%0"
-#define SIMD_CONSTRAINT "x"
 #else
 #define PAIR_REG "x19"
 #define ARRAY_REG "x20"
@@ -5369,10 +8139,6 @@ typedef struct { signed first:5; unsigned other:3; } Bits;
 #define SIMD_REG "d8"
 #define LOCAL_REG "x22"
 #define BITS_REG "x23"
-#define COPY_WORD "mov %x0,%x1"
-#define ADD_MEMBER "add %w0,%w0,#5"
-#define COPY_SIMD "ldr %q0,%1"
-#define SIMD_CONSTRAINT "m"
 #endif
 __extension__ register Pair pair __asm__(PAIR_REG);
 __extension__ register int elements[2] __asm__(ARRAY_REG);
@@ -5394,8 +8160,9 @@ static int check(void) {
     Pair copy = read_pair();
     if (copy.first != -7 || copy.second != 64)
         return 2;
-    __asm__(ADD_MEMBER : "+r"(pair.first) : : "cc");
-    __asm__(COPY_WORD : "=r"(elements) : "r"((10UL << 32) | 9));
+    pair.first += 5;
+    __extension__ (elements[0] = 9);
+    __extension__ (elements[1] = 10);
     __extension__ (elements[1] += 2);
     int array_ok = __extension__ (elements[0] == 9 && elements[1] == 12);
     if (pair.first != -2 || pair.second != 64 || !array_ok)
@@ -5414,20 +8181,14 @@ static int check(void) {
         snapshot.number != 0x102030405060708L)
         return 5;
     Wide input = {{7, 11}, -2};
-#if defined(__x86_64__)
-    __asm__(COPY_SIMD : "=x"(wide) : SIMD_CONSTRAINT(input));
-#else
-    __asm__(COPY_SIMD : "=w"(wide) : SIMD_CONSTRAINT(input));
-#endif
+    wide = input;
     if (wide.pair.second != 11 || wide.number != -2)
         return 6;
     register Pair local __asm__(LOCAL_REG) = {101, 202};
-    __asm__(COPY_WORD : "=r"(local) : "r"(pair));
+    local = pair;
     if (local.first != -2 || local.second != 64)
         return 7;
-    int bytes[2];
-    __asm__(COPY_WORD : "=r"(bytes) : "r"((5UL << 32) | 3));
-    return bytes[0] != 3 || bytes[1] != 5 ? 9 : 0;
+    return 0;
 }
 int main(void) { _Exit(check()); }
 """)
@@ -5450,9 +8211,6 @@ Pair read_pair(void) { return pair; }
         f'register int v[2] __asm__("{register}"); int f(void) {{ return (v + 1)[0]; }}',
         f'register int v[2] __asm__("{register}"); int *f(void) {{ return &v[1]; }}',
         f'register struct {{ long a, b; }} v __asm__("{register}");',
-        f'register struct {{ int n; }} v __asm__("{register}"); void f(void) '
-        '{ __asm__("" : "+m"(v.n)); }',
-        'void f(void) { int data[16] = {0}; __asm__("" : "+r"(data)); }',
     ):
         require(invoke([mcc, *flags, "-std=gnu11", "-fsyntax-only", "-"], bad), bad, success=False)
     strict = f'__extension__ register int v[2] __asm__("{register}"); int f(void) {{ return v[1]; }}'
@@ -7391,11 +10149,6 @@ int main(void) {
     gnu = root / "cleanup-gnu.c"
     gnu.write_text("""
 #define CLEAN(f) __attribute__((cleanup(f)))
-#if defined(__aarch64__)
-# define JUMP "b "
-#else
-# define JUMP "jmp "
-#endif
 int putchar(int);
 static void record(int *value) { putchar(*value); }
 static void indirect(int choose) {
@@ -7434,20 +10187,11 @@ static int expression(void) {
     struct packet p = ({ struct packet inner CLEAN(wipe) = {{'E'}}; inner; });
     return p.words[0] != 'E';
 }
-static void assembly_jump(void) {
-    {
-        int x CLEAN(record) = 'U';
-        __asm__ goto(JUMP "%l0" : : : : end);
-    }
-end:
-    putchar('Z');
-}
 int main(void) {
     indirect(1); indirect(0); putchar('|');
     nonlocal(); putchar('|');
     nested(); putchar('|');
     if (expression()) return 1;
-    putchar('|'); assembly_jump();
     return 0;
 }
 """)
@@ -7457,7 +10201,7 @@ int main(void) {
         run = runner if cc == mcc else []
         for file, dialect, expected in (
             (source, "-std=c11", "Ncba|12L|Red|ugGv|JxSx|VYW|xQP"),
-            (gnu, "-std=gnu11", "OICO|TA|F|E|UZ"),
+            (gnu, "-std=gnu11", "OICO|TA|F|E"),
         ):
             options = ["-pedantic-errors"] if file == source else []
             require(invoke([cc, *flags, dialect, *options, file, "-o", binary]),
@@ -9368,6 +12112,8 @@ def main():
         diagnostics(mcc)
         diagnostic_pragmas(mcc, gcc, root, args.target)
         atomics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        atomic_lock_free_alignment(mcc, gcc, root, args.target, shlex.split(args.runner))
+        atomic_hardware_lock_elision(mcc, gcc, root, args.target, shlex.split(args.runner))
         inline_linkage(mcc, gcc, root, args.target, shlex.split(args.runner))
         raw_strings(mcc, gcc, root, args.target, shlex.split(args.runner))
         checked_arithmetic(mcc, gcc, root, args.target, shlex.split(args.runner))
@@ -9394,8 +12140,31 @@ def main():
         access_pointer_offsets(mcc, gcc, root, args.target)
         access_allocation_ranges(mcc, gcc, root, args.target)
         access_pointer_assignments(mcc, gcc, root, args.target)
+        access_address_taken(mcc, gcc, root, args.target)
+        access_variable_arrays(mcc, gcc, root, args.target)
         system_register_builtins(mcc, gcc, root, args.target, shlex.split(args.runner))
         object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        static_pointer_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        local_pointer_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        dynamic_ordinary_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        dynamic_member_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        dynamic_variable_member_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        dynamic_offset_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        control_flow_dynamic_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        conditional_dynamic_object_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        alloca_warning(mcc, gcc, root, args.target, shlex.split(args.runner))
+        alloca_size_warning(mcc, gcc, root, args.target, shlex.split(args.runner))
+        vla_warning(mcc, gcc, root, args.target, shlex.split(args.runner))
+        vla_size_warning(mcc, gcc, root, args.target, shlex.split(args.runner))
+        frame_size_warning(mcc, gcc, root, args.target, shlex.split(args.runner))
+        stack_usage_warning(mcc, gcc, root, args.target, shlex.split(args.runner))
+        stack_usage_file(mcc, gcc, root, args.target, shlex.split(args.runner))
+        undefined_macro_warning(mcc, gcc, root, args.target, shlex.split(args.runner))
+        import_and_once_identity(mcc, gcc, root, args.target, shlex.split(args.runner))
+        expanded_defined_operator(mcc, gcc, root, args.target, shlex.split(args.runner))
+        returns_twice_attribute(mcc, gcc, root, args.target, shlex.split(args.runner))
+        assume_aligned_attribute(mcc, gcc, root, args.target, shlex.split(args.runner))
+        allocation_alignment_attribute(mcc, gcc, root, args.target, shlex.split(args.runner))
         allocation_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
         library_allocation_sizes(mcc, gcc, root, args.target, shlex.split(args.runner))
         fortified_calls(mcc, gcc, root, args.target, shlex.split(args.runner))
@@ -9404,8 +12173,21 @@ def main():
         stack_allocations(mcc, gcc, root, args.target, shlex.split(args.runner))
         enum_types(mcc, gcc, root, args.target, shlex.split(args.runner))
         wide_integers(mcc, gcc, root, args.target, shlex.split(args.runner))
-        extended_assembly(mcc, gcc, root, args.target, shlex.split(args.runner))
+        printf_format_attributes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        scanf_and_positional_formats(mcc, gcc, root, args.target, shlex.split(args.runner))
+        format_argument_attributes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        multiple_format_attributes(mcc, gcc, root, args.target, shlex.split(args.runner))
+        library_format_diagnostics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        va_list_format_diagnostics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        nonliteral_format_diagnostics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        format_signedness_diagnostics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        strftime_format_diagnostics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        strfmon_format_diagnostics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        alias_type_diagnostics(mcc, gcc, root, args.target, shlex.split(args.runner))
+        indirect_functions(mcc, gcc, root, args.target, shlex.split(args.runner))
+        unsupported_inline_assembly(mcc, root, args.target)
         global_register_variables(mcc, gcc, root, args.target, shlex.split(args.runner))
+        global_vector_registers(mcc, gcc, root, args.target, shlex.split(args.runner))
         call_clobbered_global_registers(mcc, gcc, root, args.target, shlex.split(args.runner))
         aggregate_register_variables(mcc, gcc, root, args.target, shlex.split(args.runner))
         complex_numbers(mcc, gcc, root, args.target, shlex.split(args.runner))

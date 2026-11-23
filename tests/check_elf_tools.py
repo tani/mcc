@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 from shutil import copy2
 from struct import unpack_from
 import subprocess
@@ -158,6 +159,52 @@ def check(mcc, mas, mld, directory):
     assert b"undefined symbol 'calculate'" in command(mld, "-o", output, main, status=1).stderr
     assert b"multiple definitions" in command(mld, "-o", output, main, body, body, status=1).stderr
     assert output.read_bytes() == program
+
+    unique = root / "unique.o"
+    unique_copy = root / "unique-copy.o"
+    unique_source = b"""
+.data
+.global unique_value
+.type unique_value, %gnu_unique_object
+unique_value: .quad 17
+.size unique_value, 8
+"""
+    command(mas, "-o", unique, "-", source=unique_source)
+    unique_copy.write_bytes(unique.read_bytes())
+    undefined_unique = root / "undefined-unique.o"
+    command(mas, "-o", undefined_unique, "-", source=b"""
+.type missing_unique, %gnu_unique_object
+.data
+.quad missing_unique
+""")
+    symbols = subprocess.run(["readelf", "-sW", undefined_unique], capture_output=True,
+                             text=True, check=True).stdout
+    assert re.search(r"OBJECT\s+GLOBAL\s+DEFAULT\s+UND\s+missing_unique", symbols), symbols
+    unique_shared = root / "unique.so"
+    command(mld, "-shared", "-o", unique_shared, unique)
+    failed = command(mld, "-shared", "-o", unique_shared, unique, unique_copy, status=1)
+    assert b"multiple definitions" in failed.stderr
+    common = root / "common.o"
+    compiler = os.environ.get("MCC_TOOLCHAIN") or "gcc"
+    subprocess.run([compiler, "-fcommon", "-x", "c", "-c", "-", "-o", common],
+                   input=b"unsigned long unique_value;\n", check=True)
+    for operands in ((common, unique), (unique, common)):
+        command(mld, "-shared", "-o", unique_shared, *operands)
+    for artifact in (unique, unique_shared):
+        symbols = subprocess.run(["readelf", "-sW", artifact], capture_output=True,
+                                 text=True, check=True).stdout
+        assert re.search(r"OBJECT\s+(?:UNIQUE|<OS specific>:\s*10)\s+DEFAULT\s+\S+\s+unique_value",
+                         symbols), symbols
+    unique_executable = root / "unique-program"
+    command(mld, "-o", unique_executable, main, body, unique)
+    symbols = subprocess.run(["readelf", "--dyn-syms", "-W", unique_executable],
+                             capture_output=True, text=True, check=True).stdout
+    assert "unique_value" not in symbols, symbols
+    command(mld, "-E", "-o", unique_executable, main, body, unique)
+    symbols = subprocess.run(["readelf", "--dyn-syms", "-W", unique_executable],
+                             capture_output=True, text=True, check=True).stdout
+    assert re.search(r"OBJECT\s+(?:UNIQUE|<OS specific>:\s*10)\s+DEFAULT\s+\S+\s+unique_value",
+                     symbols), symbols
 
     foreign = next(obj for arch, obj in objects.items() if arch != native)
     failed = command(mld, "-o", directory / "mixed", foreign, status=1)

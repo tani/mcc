@@ -306,7 +306,7 @@ static void collect_definitions(Linker *l, Object *obj)
         if (!read_symbol(l, obj, i, &s, &name))
             return;
         unsigned binding = ELF64_ST_BIND(s.st_info);
-        if (binding != STB_GLOBAL && binding != STB_WEAK)
+        if (binding != STB_GLOBAL && binding != STB_WEAK && binding != STB_GNU_UNIQUE)
             continue;
         if (s.st_shndx != SHN_ABS && s.st_shndx != SHN_COMMON && s.st_shndx >= obj->header.e_shnum) {
             error(l->context, (Loc){0}, "%s: invalid section for symbol '%s'", obj->path, name);
@@ -321,19 +321,20 @@ static void collect_definitions(Linker *l, Object *obj)
             g->visibility = visibility;
         if (s.st_shndx == SHN_UNDEF) {
             g->undefined = true;
-            g->referenced |= binding == STB_GLOBAL;
+            g->referenced |= binding != STB_WEAK;
         } else if (s.st_shndx == SHN_COMMON && g->object && g->symbol.st_shndx == SHN_COMMON) {
             if (s.st_size > g->symbol.st_size)
                 g->symbol.st_size = s.st_size;
             if (s.st_value > g->symbol.st_value)
                 g->symbol.st_value = s.st_value;
-        } else if (s.st_shndx == SHN_COMMON && g->object && ELF64_ST_BIND(g->symbol.st_info) == STB_GLOBAL) {
+        } else if (s.st_shndx == SHN_COMMON && g->object &&
+                   ELF64_ST_BIND(g->symbol.st_info) != STB_WEAK) {
             continue;
-        } else if (!g->object || (binding == STB_GLOBAL &&
+        } else if (!g->object || (binding != STB_WEAK &&
                    (ELF64_ST_BIND(g->symbol.st_info) == STB_WEAK || g->symbol.st_shndx == SHN_COMMON))) {
             g->object = obj;
             g->symbol = s;
-        } else if (binding == STB_GLOBAL) {
+        } else if (binding != STB_WEAK) {
             error(l->context, (Loc){0}, "%s: multiple definitions of '%s' (also in %s)",
                   obj->path, name, g->object->path);
         }
@@ -1518,7 +1519,11 @@ static bool dynamic_image(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], u
     }
     for (size_t i = 0; i < l->globals.len; i++) {
         Global *g = l->globals.data[i];
-        if (!(l->options->shared || l->options->export_all || g->shared_reference) || !has_output_symbol(g))
+        /* Plugins must find the executable's fallback lock even without -E. */
+        bool atomic_lock = g->object && ELF64_ST_BIND(g->symbol.st_info) == STB_GNU_UNIQUE &&
+                           equal(g->name, "__mcc_atomic_object_lock");
+        if (!(l->options->shared || l->options->export_all || g->shared_reference ||
+              atomic_lock) || !has_output_symbol(g))
             continue;
         if (g->visibility == STV_DEFAULT || g->visibility == STV_PROTECTED)
             dynamic_symbol(l, (LinkSymbol){.global = g});
@@ -1607,6 +1612,11 @@ static bool executable(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint
             return false;
     }
     Elf64_Ehdr h = elf_header(l->machine, l->base ? ET_EXEC : ET_DYN);
+    for (size_t i = 0; i < l->objects.len; i++)
+        if (l->objects.data[i]->header.e_ident[EI_OSABI] == ELFOSABI_GNU) {
+            h.e_ident[EI_OSABI] = ELFOSABI_GNU;
+            break;
+        }
     h.e_entry = address;
     h.e_phoff = sizeof h;
     h.e_phentsize = sizeof(Elf64_Phdr);

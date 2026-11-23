@@ -29,6 +29,32 @@ struct SavedMacro {
     bool used;
 };
 
+struct SourceIdentity {
+    SourceIdentity *next;
+    const char *path;
+    dev_t device;
+    ino_t inode;
+    bool identified, seen, once;
+};
+
+static SourceIdentity *source_identity(Context *c, const char *path, FILE *file)
+{
+    struct stat st;
+    bool identified = (file ? fstat(fileno(file), &st) : stat(path, &st)) == 0 && S_ISREG(st.st_mode);
+    for (SourceIdentity *s = c->source_identities; s; s = s->next)
+        if ((identified && s->identified && s->device == st.st_dev && s->inode == st.st_ino) ||
+            (!identified && !s->identified && equal(s->path, path)))
+            return s;
+    SourceIdentity *s = alloc(c, sizeof *s);
+    *s = (SourceIdentity){.next = c->source_identities, .path = path, .identified = identified};
+    if (identified) {
+        s->device = st.st_dev;
+        s->inode = st.st_ino;
+    }
+    c->source_identities = s;
+    return s;
+}
+
 struct PackSetting {
     PackSetting *previous;
     const char *label;
@@ -264,6 +290,8 @@ static Token pasted(Context *c, Token a, Token b, Loc loc)
     Token t = tokens.data[0];
     t.loc = loc;
     t.space = a.space;
+    t.macro_origin = true;
+    t.macro_system_header = a.macro_origin ? a.macro_system_header : a.loc.system_header;
     check_poisoned(c, t);
     t.hide = intersection(c, a.hide, b.hide);
     return t;
@@ -372,7 +400,10 @@ static Tokens substitute(Context *c, Macro *m, Arguments args, Token invocation,
         t->hide = hide(c, t->hide, m);
         for (const Hide *h = invocation.hide; h; h = h->next)
             t->hide = hide(c, t->hide, h->macro);
+        bool system_origin = t->macro_origin ? t->macro_system_header : t->loc.system_header;
         t->loc = invocation.loc;
+        t->macro_origin = true;
+        t->macro_system_header = system_origin;
         t->loc.fallthrough_comment = 0;
     }
     if (result.len)
@@ -520,6 +551,36 @@ static bool glibc_declaration_attribute(Context *c, Token keyword, Macro *macro,
     return true;
 }
 
+/* The operand of defined is read from the unexpanded token stream. */
+static bool expand_defined(Context *c, Token *operator, Work **rest)
+{
+    Work *cursor = *rest;
+    bool paren = cursor && is(cursor->token, "(");
+    if (paren)
+        cursor = cursor->next;
+    if (!cursor || cursor->token.kind != WORD) {
+        error(c, operator->loc, "expected identifier after 'defined'");
+        return false;
+    }
+    if (!check_poisoned(c, cursor->token))
+        return false;
+    bool present = defined(c, cursor->token.text);
+    cursor = cursor->next;
+    if (paren) {
+        if (!cursor || !is(cursor->token, ")")) {
+            error(c, operator->loc, "expected ')' after 'defined'");
+            return false;
+        }
+        cursor = cursor->next;
+    }
+    if (operator->macro_origin)
+        warning_at(c, WARNING_EXPANSION_DEFINED, operator->loc, "this use of 'defined' may not be portable");
+    operator->kind = NUMBER;
+    operator->text = present ? "1" : "0";
+    *rest = cursor;
+    return true;
+}
+
 static Tokens expand(Context *c, Tokens input, unsigned depth)
 {
     Tokens result = {0};
@@ -535,6 +596,12 @@ static Tokens expand(Context *c, Tokens input, unsigned depth)
         if (c->in_system_header)
             t.loc.system_header = true;
         if (t.kind == WORD) {
+            if (c->pp_condition && depth == 0 && is(t, "defined")) {
+                if (!check_poisoned(c, t) || !expand_defined(c, &t, &p))
+                    break;
+                PUSH(c, result, t);
+                continue;
+            }
             if (poisoned(c, t.text)) {
                 if (!check_poisoned(c, t))
                     break;
@@ -622,7 +689,7 @@ static void define(Context *c, Tokens line, Loc loc)
         error(c, loc, "expected a macro name");
         return;
     }
-    if (predefined(c, line.data[0].text)) {
+    if (predefined(c, line.data[0].text) || is(line.data[0], "defined")) {
         error(c, loc, "cannot redefine '%s'", line.data[0].text);
         return;
     }
@@ -722,8 +789,16 @@ static uint64_t if_primary(IfParser *p, bool evaluate)
         return 0;
     }
     Token t = p->tokens.data[p->index++];
-    if (t.kind == WORD)
-        return p->context->dialect.standard >= C23 && is(t, "true");
+    if (t.kind == WORD) {
+        bool boolean = p->context->dialect.standard >= C23 && (is(t, "true") || is(t, "false"));
+        if (evaluate && !boolean) {
+            Loc loc = t.loc;
+            if (t.macro_origin)
+                loc.system_header = t.macro_system_header;
+            warning_at(p->context, WARNING_UNDEF, loc, "\"%s\" is not defined, evaluates to 0", t.text);
+        }
+        return boolean && is(t, "true");
+    }
     if (t.kind == CHARACTER) {
         Node *n = literal(p->context, t);
         return n ? n->integer : 0;
@@ -804,31 +879,8 @@ static uint64_t if_expr(IfParser *p, unsigned min, bool evaluate)
 
 static bool test_condition(Context *c, Tokens args, Loc loc)
 {
-    Tokens input = {0};
-    for (size_t i = 0; i < args.len; i++) {
-        Token t = args.data[i];
-        if (is(t, "defined")) {
-            if (!check_poisoned(c, t))
-                return false;
-            bool paren = at(args, i + 1, "(");
-            i += paren ? 2 : 1;
-            if (i >= args.len || args.data[i].kind != WORD) {
-                error(c, t.loc, "expected identifier after 'defined'");
-                return false;
-            }
-            if (!check_poisoned(c, args.data[i]))
-                return false;
-            t.kind = NUMBER;
-            t.text = defined(c, args.data[i].text) ? "1" : "0";
-            if (paren && !at(args, ++i, ")")) {
-                error(c, t.loc, "expected ')' after 'defined'");
-                return false;
-            }
-        }
-        PUSH(c, input, t);
-    }
     c->pp_condition = true;
-    Tokens expanded = expand(c, input, 0);
+    Tokens expanded = expand(c, args, 0);
     c->pp_condition = false;
     if (c->failed)
         return false;
@@ -890,7 +942,7 @@ static FILE *find_header(Context *c, Tokens args, Loc loc, bool next, const char
     return open_header(c, name, local, next, resolved, index);
 }
 
-static bool include_file(Context *c, Tokens args, Loc loc, Tokens *result, unsigned depth, bool next)
+static bool include_file(Context *c, Tokens args, Loc loc, Tokens *result, unsigned depth, bool next, bool import)
 {
     if (!at(args, 0, "<") && !(args.len && args.data[0].kind == STRING))
         args = expand(c, args, 0);
@@ -907,6 +959,8 @@ static bool include_file(Context *c, Tokens args, Loc loc, Tokens *result, unsig
         path = copy(c, canonical, strlen(canonical));
         free(canonical);
     }
+    if (import)
+        source_identity(c, path, file)->once = true;
     const char *saved_path = c->include_path;
     size_t saved_index = c->include_index;
     bool saved_system_header = c->in_system_header;
@@ -1212,7 +1266,7 @@ static void pragma(Context *c, const char *path, Tokens args, Loc loc, unsigned 
     if (!check_poisoned_tokens(c, words))
         return;
     if (at(args, 0, "once")) {
-        PUSH(c, c->once, path);
+        source_identity(c, path, NULL)->once = true;
     } else if (at(args, 0, "GCC") && at(args, 1, "system_header")) {
         if (c->include_index == SIZE_MAX) {
             warning_at(c, WARNING_PRAGMAS, loc, "#pragma GCC system_header ignored outside an include file");
@@ -1295,9 +1349,10 @@ static void pragma(Context *c, const char *path, Tokens args, Loc loc, unsigned 
 
 static bool read_source(Context *c, const char *path, FILE *file, Tokens *result, unsigned depth)
 {
-    for (size_t i = 0; i < c->once.len; i++)
-        if (equal(c->once.data[i], path))
-            return true;
+    SourceIdentity *identity = source_identity(c, path, file);
+    if (identity->once && identity->seen)
+        return true;
+    identity->seen = true;
     if (depth > 128) {
         error(c, (Loc){.file = path}, "include nesting exceeds 128 levels");
         return false;
@@ -1430,16 +1485,23 @@ static bool read_source(Context *c, const char *path, FILE *file, Tokens *result
         } else if (is(directive, "undef")) {
             if (args.len != 1 || args.data[0].kind != WORD)
                 error(c, loc, "expected an identifier after #undef");
-            else if (predefined(c, args.data[0].text))
+            else if (predefined(c, args.data[0].text) || is(args.data[0], "defined"))
                 error(c, loc, "cannot undefine '%s'", args.data[0].text);
             else
                 new_macro(c, args.data[0].text)->undefined = true;
-        } else if (is(directive, "include") || is(directive, "include_next")) {
+        } else if (is(directive, "include") || is(directive, "include_next") || is(directive, "import")) {
             bool next = is(directive, "include_next");
+            bool import = is(directive, "import");
             if (next)
                 extension(c, loc, "#include_next");
+            if (import) {
+                if (warning_enabled(c, WARNING_PEDANTIC, loc))
+                    warning_at(c, WARNING_PEDANTIC, loc, "#import is a GCC extension");
+                else
+                    warning_at(c, WARNING_DEPRECATED, loc, "#import is a deprecated GCC extension");
+            }
             if (!c->failed)
-                include_file(c, args, loc, result, depth, next);
+                include_file(c, args, loc, result, depth, next, import);
         } else if (is(directive, "error")) {
             error(c, loc, "#error %s", joined(c, args, false));
         } else if (is(directive, "warning")) {
@@ -1608,6 +1670,8 @@ bool preprocess(Context *c, const char *path, FILE *input, Tokens *result)
         command_define(c, "__FLT64X_DENORM_MIN__=0x1p-16494F64x");
     } else {
         command_define(c, "__x86_64__=1");
+        command_define(c, "__ATOMIC_HLE_ACQUIRE=65536");
+        command_define(c, "__ATOMIC_HLE_RELEASE=131072");
         command_define(c, "__amd64__=1");
         command_define(c, "__SIZEOF_FLOAT128__=16");
         command_define(c, "__SIZEOF_FLOAT80__=16");
@@ -1629,6 +1693,8 @@ bool preprocess(Context *c, const char *path, FILE *input, Tokens *result)
         const char *option = c->macro_options.data[i];
         if (option[0] == 'D')
             command_define(c, option + 1);
+        else if (equal(option + 1, "defined"))
+            error(c, (Loc){.file = "<command-line>"}, "cannot undefine 'defined'");
         else
             new_macro(c, option + 1)->undefined = true;
     }

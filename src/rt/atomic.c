@@ -8,8 +8,16 @@ void __mcc_atomic_fence(void);
 
 void __mcc_atomic_access(size_t, volatile void *, const void *, void *, unsigned);
 bool __mcc_atomic_compare(size_t, volatile void *, void *, const void *);
+bool __mcc_atomic_compare_hle(size_t, volatile void *, void *, const void *, unsigned);
 bool __mcc_atomic_lock_free(size_t, const volatile void *);
 uint64_t __mcc_atomic_rmw(volatile void *, uint64_t, unsigned, unsigned, bool);
+
+#if defined(__x86_64__)
+uint64_t __mcc_atomic_hle_acquire_cas(volatile void *, uint64_t, uint64_t, unsigned);
+uint64_t __mcc_atomic_hle_release_cas(volatile void *, uint64_t, uint64_t, unsigned);
+void __mcc_atomic_hle_acquire_store(volatile void *, uint64_t, unsigned);
+void __mcc_atomic_hle_release_store(volatile void *, uint64_t, unsigned);
+#endif
 
 #if defined(__aarch64__)
 uint8_t __aarch64_cas1_sync(uint8_t, uint8_t, volatile void *);
@@ -29,18 +37,25 @@ uint64_t __mcc_atomic_cas_word(volatile void *address, uint64_t expected, uint64
 }
 #endif
 
-static uint64_t object_lock;
+extern uint64_t __mcc_atomic_object_lock __attribute__((weak));
+static uint64_t local_object_lock;
+
+static uint64_t *object_lock(void)
+{
+    return &__mcc_atomic_object_lock ? &__mcc_atomic_object_lock : &local_object_lock;
+}
 
 static void acquire(void)
 {
-    while (__mcc_atomic_cas_word(&object_lock, 0, 1, 8))
-        while (__mcc_atomic_load_word(&object_lock, 8))
+    uint64_t *lock = object_lock();
+    while (__mcc_atomic_cas_word(lock, 0, 1, 8))
+        while (__mcc_atomic_load_word(lock, 8))
             ;
 }
 
 static void release(void)
 {
-    __mcc_atomic_store_word(&object_lock, 0, 8);
+    __mcc_atomic_store_word(object_lock(), 0, 8);
 }
 
 bool __mcc_atomic_lock_free(size_t width, const volatile void *address)
@@ -78,16 +93,49 @@ static uint64_t rmw_value(uint64_t before, uint64_t operand, unsigned operation)
     }
 }
 
+static uint64_t compare_word(volatile void *address, uint64_t expected, uint64_t desired,
+                             unsigned width, unsigned hint)
+{
+#if defined(__x86_64__)
+    if (hint == AT_HLE_ACQUIRE)
+        return __mcc_atomic_hle_acquire_cas(address, expected, desired, width);
+    if (hint == AT_HLE_RELEASE)
+        return __mcc_atomic_hle_release_cas(address, expected, desired, width);
+#else
+    (void)hint;
+#endif
+    return __mcc_atomic_cas_word(address, expected, desired, width);
+}
+
+static void store_word(volatile void *address, uint64_t value, unsigned width, unsigned hint)
+{
+#if defined(__x86_64__)
+    if (hint == AT_HLE_ACQUIRE) {
+        __mcc_atomic_hle_acquire_store(address, value, width);
+        return;
+    }
+    if (hint == AT_HLE_RELEASE) {
+        __mcc_atomic_hle_release_store(address, value, width);
+        return;
+    }
+#else
+    (void)hint;
+#endif
+    __mcc_atomic_store_word(address, value, width);
+}
+
 uint64_t __mcc_atomic_rmw(volatile void *address, uint64_t operand, unsigned width,
                           unsigned operation, bool return_new)
 {
     uint64_t before, next;
+    unsigned hint = operation & (AT_HLE_ACQUIRE | AT_HLE_RELEASE);
+    operation &= AT_OPERATION_MASK;
     if (__mcc_atomic_lock_free(width, address)) {
         uint64_t observed = __mcc_atomic_load_word(address, width);
         do {
             before = observed;
             next = rmw_value(before, operand, operation);
-            observed = __mcc_atomic_cas_word(address, before, next, width);
+            observed = compare_word(address, before, next, width, hint);
         } while (before != observed);
     } else {
         acquire();
@@ -102,15 +150,17 @@ uint64_t __mcc_atomic_rmw(volatile void *address, uint64_t operand, unsigned wid
 void __mcc_atomic_access(size_t size, volatile void *address, const void *input, void *output,
                          unsigned operation)
 {
+    unsigned hint = operation & (AT_HLE_ACQUIRE | AT_HLE_RELEASE);
+    operation &= AT_OPERATION_MASK;
     if (__mcc_atomic_lock_free(size, address)) {
         unsigned width = (unsigned)size;
         if (operation == AT_LOAD)
             put_bytes(output, __mcc_atomic_load_word(address, width), width);
         else if (operation == AT_STORE)
-            __mcc_atomic_store_word(address, take_bytes(input, width), width);
+            store_word(address, take_bytes(input, width), width, hint);
         else
             put_bytes(output, __mcc_atomic_rmw(address, take_bytes(input, width), width,
-                                                AT_EXCHANGE, false), width);
+                                                AT_EXCHANGE | hint, false), width);
         return;
     }
     volatile unsigned char *object = address;
@@ -133,12 +183,13 @@ void __mcc_atomic_access(size_t size, volatile void *address, const void *input,
     release();
 }
 
-bool __mcc_atomic_compare(size_t size, volatile void *address, void *expected, const void *desired)
+bool __mcc_atomic_compare_hle(size_t size, volatile void *address, void *expected,
+                              const void *desired, unsigned hint)
 {
     if (__mcc_atomic_lock_free(size, address)) {
         unsigned width = (unsigned)size;
         uint64_t before = take_bytes(expected, width);
-        uint64_t observed = __mcc_atomic_cas_word(address, before, take_bytes(desired, width), width);
+        uint64_t observed = compare_word(address, before, take_bytes(desired, width), width, hint);
         if (before == observed)
             return true;
         put_bytes(expected, observed, width);
@@ -164,4 +215,9 @@ bool __mcc_atomic_compare(size_t size, volatile void *address, void *expected, c
     }
     release();
     return match;
+}
+
+bool __mcc_atomic_compare(size_t size, volatile void *address, void *expected, const void *desired)
+{
+    return __mcc_atomic_compare_hle(size, address, expected, desired, 0);
 }

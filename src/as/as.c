@@ -15,7 +15,7 @@ struct AsmSymbol {
     size_t offset, size;
     unsigned type, visibility;
     uint32_t index;
-    bool global, weak, weak_reference, referenced;
+    bool global, weak, unique, weak_reference, referenced;
 };
 
 struct AsmDifference {
@@ -268,8 +268,15 @@ static bool symbol_directive(Assembler *a, const char *op, AsmArgs *args)
             value++;
         if (equal(value, "function"))
             s->type = STT_FUNC;
+        else if (equal(value, "gnu_indirect_function"))
+            s->type = STT_GNU_IFUNC;
         else if (equal(value, "object"))
             s->type = STT_OBJECT;
+        else if (equal(value, "gnu_unique_object")) {
+            s->type = STT_OBJECT;
+            s->unique = true;
+            s->global = true;
+        }
         else if (equal(value, "tls_object"))
             s->type = STT_TLS;
         else if (!equal(value, "notype"))
@@ -307,9 +314,13 @@ static void resolve_aliases(Assembler *a)
         if (!s->alias || s->weak_reference)
             continue;
         AsmSymbol *target = s->alias;
+        unsigned alias_type = target->type;
         size_t steps = 0;
-        while (target->alias && ++steps < a->symbols.len)
+        while (target->alias && ++steps < a->symbols.len) {
             target = target->alias;
+            if (!alias_type)
+                alias_type = target->type;
+        }
         if (target->alias || !target->section) {
             error(a->context, s->alias_loc, "alias '%s' requires a defined target", s->name);
             return;
@@ -317,7 +328,7 @@ static void resolve_aliases(Assembler *a)
         s->section = target->section;
         s->offset = target->offset;
         if (!s->type)
-            s->type = target->type;
+            s->type = alias_type;
         if (!s->size)
             s->size = target->size;
     }
@@ -694,7 +705,9 @@ static bool build_object(Assembler *a, ElfOptions *options)
     bytes_add(c, &symbols, NULL, sizeof(Elf64_Sym));
     bytes_add(c, &output, NULL, sizeof(Elf64_Ehdr));
     uint32_t index = 1, first_global = 1;
-    for (unsigned binding = STB_LOCAL; binding <= STB_WEAK; binding++) {
+    const unsigned bindings[] = {STB_LOCAL, STB_GLOBAL, STB_WEAK, STB_GNU_UNIQUE};
+    for (size_t pass = 0; pass < sizeof bindings / sizeof *bindings; pass++) {
+        unsigned binding = bindings[pass];
         if (binding == STB_GLOBAL)
             first_global = index;
         for (size_t i = 0; i < a->symbols.len; i++) {
@@ -706,7 +719,8 @@ static bool build_object(Assembler *a, ElfOptions *options)
                 error(c, (Loc){0}, "undefined local symbol '%s'", s->name);
                 return false;
             }
-            unsigned actual = s->weak ? STB_WEAK : (s->global || !s->section ? STB_GLOBAL : STB_LOCAL);
+            unsigned actual = s->unique && s->section ? STB_GNU_UNIQUE :
+                              s->weak ? STB_WEAK : (s->global || !s->section ? STB_GLOBAL : STB_LOCAL);
             if (actual != binding)
                 continue;
             unsigned type = a->sections.data[s->section].kind.flags & SHF_TLS ? STT_TLS : s->type;
@@ -766,6 +780,11 @@ static bool build_object(Assembler *a, ElfOptions *options)
     put_section(c, &output, &sections[shstrtab], &names);
     bytes_align(c, &output, 8);
     Elf64_Ehdr header = elf_header(options->machine, ET_REL);
+    for (size_t i = 0; i < a->symbols.len; i++)
+        if (a->symbols.data[i]->type == STT_GNU_IFUNC || a->symbols.data[i]->unique) {
+            header.e_ident[EI_OSABI] = ELFOSABI_GNU;
+            break;
+        }
     header.e_shoff = output.len;
     header.e_shnum = (uint16_t)count;
     header.e_shstrndx = (uint16_t)shstrtab;

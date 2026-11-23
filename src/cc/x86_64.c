@@ -1,6 +1,6 @@
 #include "compiler.h"
 #include "parser.h"
-#include "inline_asm.h"
+#include "register.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -985,59 +985,6 @@ static void copy_extended(FILE *out, const char *source, const char *destination
             source, destination, source, destination);
 }
 
-static void preserve_asm_registers(Emitter *e, const AsmPlan *plan, bool restore)
-{
-    for (unsigned i = 0; i < 16; i++) {
-        size_t id = plan->save_slots[i];
-        if (!id)
-            continue;
-        const char *reg = x86_asm_register(i, 8);
-        if (restore)
-            fprintf(e->out, "\tmovq -%zu(%%rbp), %%%s\n", e->offsets[id], reg);
-        else
-            fprintf(e->out, "\tmovq %%%s, -%zu(%%rbp)\n", reg, e->offsets[id]);
-    }
-}
-
-static void prepare_asm(Emitter *e, const AsmPlan *plan)
-{
-    preserve_asm_registers(e, plan, false);
-    /* Stage spilled tied inputs before filling the ordinary asm operands. */
-    for (int staged = 1; staged >= 0; staged--) {
-        for (size_t i = 0; i < plan->assembly->operands.len; i++) {
-            const AsmBinding *binding = &plan->bindings[i];
-            if (binding->load && (e->register_spills[binding->reg] != 0) == staged)
-                write_register_slot(e, binding->reg, binding->load, binding->width);
-        }
-    }
-    sync_register_spills(e, 0, true);
-    emit_asm_template(e->context, e->out, plan, e->function_id);
-}
-
-static void finish_asm(Emitter *e, const AsmPlan *plan)
-{
-    sync_register_spills(e, 0, false);
-    for (size_t i = 0; i < plan->assembly->outputs; i++) {
-        const AsmBinding *binding = &plan->bindings[i];
-        if (binding->location != ASM_REGISTER || !binding->result)
-            continue;
-        size_t offset = e->offsets[binding->result];
-        if (binding->reg >= 32)
-            fprintf(e->out, "\t%s %%xmm%u, -%zu(%%rbp)\n",
-                    asm_simd_move(binding->width), binding->reg - 32, offset);
-        else
-            fprintf(e->out, "\tmovq %%%s, -%zu(%%rbp)\n", x86_asm_register(binding->reg, 8), offset);
-    }
-    for (size_t i = 0; i < plan->assembly->outputs; i++) {
-        const AsmBinding *binding = &plan->bindings[i];
-        if (binding->location == ASM_FLAGS) {
-            fprintf(e->out, "\tset%s %%al\n\tmovzbl %%al, %%eax\n", binding->condition);
-            slot_store(e, binding->result, "%rax");
-        }
-    }
-    preserve_asm_registers(e, plan, true);
-}
-
 static void stack_pin_checkpoint(Emitter *e, size_t pin, bool restoring)
 {
     if (!pin)
@@ -1224,9 +1171,6 @@ static void instruction(Emitter *e, Inst *in, Type *result)
         fprintf(out, "\t%s (%%rax)\n", locality[in->immediate]);
         break;
     }
-    case I_ASM: fprintf(out, "\t%s\n", in->asm_text); break;
-    case I_EXTENDED_ASM: prepare_asm(e, in->asm_plan); break;
-    case I_ASM_OUTPUT: finish_asm(e, in->asm_plan); break;
     case I_JUMP:
         fprintf(out, "\tjmp .L%u_%zu\n", e->function_id, in->label);
         break;
@@ -1271,6 +1215,25 @@ static void instruction(Emitter *e, Inst *in, Type *result)
     }
 }
 
+static size_t maximum_outgoing_stack(const FunctionIR *ir)
+{
+    size_t maximum = 0;
+    for (size_t i = 0; i < ir->instructions.len; i++) {
+        const Inst *in = &ir->instructions.data[i];
+        if (in->code != I_CALL)
+            continue;
+        Abi result = classify(in->type);
+        ArgumentState state = {.gp = result.memory ? 1u : 0u};
+        for (size_t j = 0; j < in->args.len; j++)
+            argument(&state, in->arg_types.data[j]);
+        unsigned alignment = state.stack_alignment > 16 ? state.stack_alignment : 16;
+        size_t outgoing = align_to(state.stack, alignment) + alignment - 16 + 8;
+        if (outgoing > maximum)
+            maximum = outgoing;
+    }
+    return maximum;
+}
+
 static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
 {
     FunctionIR ir;
@@ -1301,6 +1264,14 @@ static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
         return;
     }
 
+    check_frame_size(c, s, frame);
+    if (!c->failed && !c->syntax_only && (c->stack_usage_report ||
+        warning_enabled(c, WARNING_STACK_USAGE, s->function_end_loc))) {
+        size_t outgoing = maximum_outgoing_stack(&ir);
+        check_stack_usage(c, &ir, frame, outgoing, outgoing > 8);
+    }
+    if (c->failed)
+        return;
     emit_function_entry(c, out, s, id);
     fprintf(out, "\tpushq %%rbp\n\tmovq %%rsp, %%rbp\n\tsubq $%zu, %%rsp\n", frame);
     sync_registers(&e, saved_registers, false);
@@ -1323,11 +1294,7 @@ bool emit_x86_64(Context *c, FILE *out)
         emit_symbol_linkage(out, s);
         if (s->alias)
             continue;
-        if (s->asm_plan)
-            emit_asm_template(c, out, s->asm_plan, 0);
-        else if (s->asm_text)
-            fprintf(out, "%s\n", s->asm_text);
-        else if (s->type->kind == TY_FUNC && s->body)
+        if (s->type->kind == TY_FUNC && s->body)
             emit_function(c, out, s, (unsigned)i);
         else if (s->type->kind != TY_FUNC && !global_register(s) && (s->defined || s->tentative))
             emit_static_data(c, out, s);

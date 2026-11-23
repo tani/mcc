@@ -1,7 +1,7 @@
 #include "compiler.h"
 #include "parser.h"
 #include "int128_math.h"
-#include "inline_asm.h"
+#include "register.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +17,7 @@ typedef struct { size_t index, target; Lifetime *source; Loc loc; } Goto;
 typedef struct { size_t index, resume; Lifetime *lifetime; } Checkpoint;
 typedef struct { Node *declaration; size_t checkpoint, label; } NonlocalLabel;
 typedef struct { const Node *expression; size_t instruction, arguments[2]; } AllocationSite;
+typedef struct { Symbol *symbol; Loc loc; size_t instruction; } VariableArraySite;
 typedef struct Substitution Substitution;
 struct Substitution { Substitution *previous; Node *node; size_t value; };
 
@@ -42,6 +43,7 @@ typedef struct {
     VECTOR(Checkpoint) checkpoints;
     VECTOR(NonlocalLabel) nonlocal_labels;
     VECTOR(AllocationSite) allocation_sites;
+    VECTOR(VariableArraySite) variable_array_sites;
     size_t next_label, break_label, continue_label, switch_id;
     Cases *cases;
     Lifetime *lifetime, *break_lifetime, *continue_lifetime, *switch_lifetime;
@@ -333,6 +335,53 @@ static size_t address_symbol(Lower *l, Symbol *s)
     return dest;
 }
 
+void check_frame_size(Context *c, const Symbol *function, size_t frame)
+{
+    uint64_t limit = c->frame_warning_limit_set ? c->frame_warning_limit : PTRDIFF_MAX;
+    if (!c->syntax_only && frame > limit)
+        warning_at(c, WARNING_FRAME_LARGE, function->function_end_loc,
+                   "the frame size of %llu bytes is larger than %llu bytes",
+                   (unsigned long long)frame, (unsigned long long)limit);
+}
+
+void check_stack_usage(Context *c, const FunctionIR *ir, size_t frame, size_t outgoing, bool outgoing_dynamic)
+{
+    const Symbol *function = ir->function;
+    Loc loc = function->function_end_loc;
+    uint64_t limit = c->stack_warning_limit_set ? c->stack_warning_limit : PTRDIFF_MAX;
+    if (c->syntax_only || (!c->stack_usage_report &&
+        (limit == UINT64_MAX || !warning_enabled(c, WARNING_STACK_USAGE, loc))))
+        return;
+    uint64_t total = frame;
+    bool overflow = total > UINT64_MAX - 16;
+    if (!overflow)
+        total += 16; /* Saved frame pointer and return address. */
+    if (!overflow && outgoing <= UINT64_MAX - total)
+        total += outgoing;
+    else
+        overflow = true;
+    if (!overflow && ir->dynamic_stack_bound <= UINT64_MAX - total)
+        total += ir->dynamic_stack_bound;
+    else
+        overflow = true;
+    bool unbounded = ir->dynamic_stack_unbounded || overflow;
+    bool dynamic = ir->has_dynamic_stack || outgoing_dynamic;
+    if (c->stack_usage_report) {
+        Loc definition = function->function_definition_loc;
+        fprintf(c->stack_usage_report, "%s:%u:%u:%s\t%llu\t%s%s\n",
+                definition.file ? definition.file : c->input, definition.line, definition.column, function->name,
+                (unsigned long long)total, dynamic ? "dynamic" : "static", dynamic && !unbounded ? ",bounded" : "");
+    }
+    if (limit == UINT64_MAX || !warning_enabled(c, WARNING_STACK_USAGE, loc))
+        return;
+    if (unbounded)
+        warning_at(c, WARNING_STACK_USAGE, loc, "stack usage might be unbounded");
+    else if (total > limit)
+        warning_at(c, WARNING_STACK_USAGE, loc, ir->has_dynamic_stack ?
+                   "stack usage might be %llu bytes" : "stack usage is %llu bytes",
+                   (unsigned long long)total);
+}
+
 static size_t frame_slot_address(Lower *l, size_t object, Type *type)
 {
     size_t address = slot(l, pointer(l->context, type));
@@ -427,7 +476,7 @@ static size_t register_slot(Lower *l, Type *t)
 
 static size_t copy_register_operand(Lower *l, size_t source, Type *t)
 {
-    if (!aggregate(t))
+    if (!aggregate(t) && t->kind != TY_VECTOR)
         return source;
     size_t raw = register_slot(l, t);
     size_t dest = frame_slot_address(l, raw, t);
@@ -445,7 +494,7 @@ static size_t read_register_bits(Lower *l, Symbol *s)
 static size_t read_register(Lower *l, Symbol *s)
 {
     size_t bits = read_register_bits(l, s);
-    return aggregate(s->type) ? frame_slot_address(l, bits, s->type) : bits;
+    return address_value(s->type) ? frame_slot_address(l, bits, s->type) : bits;
 }
 
 static size_t runtime_call(Lower *l, const char *name, Type *result,
@@ -596,7 +645,7 @@ static size_t atomic_size(Lower *l, Type *type)
 }
 
 static void atomic_access(Lower *l, Type *type, size_t at, size_t input, size_t output,
-                          AtomicOperation operation)
+                          unsigned operation)
 {
     Type *void_type = alloc(l->context, sizeof *void_type);
     *void_type = (Type){.kind = TY_VOID, .align = 1, .complete = true};
@@ -611,6 +660,17 @@ static size_t atomic_compare(Lower *l, Type *type, size_t at, size_t expected, s
 {
     size_t args[] = {atomic_size(l, type), at, expected, desired};
     return runtime_call(l, "__mcc_atomic_compare", type_int(l->context, 0, true),
+                        args, sizeof args / sizeof *args);
+}
+
+static size_t atomic_compare_hle(Lower *l, Type *type, size_t at, size_t expected, size_t desired,
+                                 unsigned hint)
+{
+    if (!hint)
+        return atomic_compare(l, type, at, expected, desired);
+    size_t args[] = {atomic_size(l, type), at, expected, desired,
+                     imm(l, type_int(l->context, 3, true), hint)};
+    return runtime_call(l, "__mcc_atomic_compare_hle", type_int(l->context, 0, true),
                         args, sizeof args / sizeof *args);
 }
 
@@ -635,7 +695,7 @@ static size_t allocate_variable_temporary(Lower *l, Type *type, unsigned alignme
 {
     size_t size = dynamic_size(l, type);
     size_t result = slot(l, pointer(l->context, type));
-    put(l, (Inst){.code = I_STACK_ALLOC, .dest = result, .a = size, .immediate = alignment});
+    put(l, (Inst){.code = I_STACK_ALLOC, .dest = result, .a = size, .immediate = alignment, .type = type});
     return result;
 }
 
@@ -1041,10 +1101,22 @@ static size_t atomic_value(Lower *l, Node *n)
         size_t query[] = {atomic_size(l, type), at};
         return runtime_call(l, "__mcc_atomic_lock_free", n->type, query, 2);
     }
+    unsigned hle = 0;
+    if (c->target == &x86_64_linux && (n->op & AT_HAS_ORDER)) {
+        size_t index = op == AT_COMPARE ? 4 : n->list.len - 1;
+        uint64_t order;
+        if (constant_int(c, n->list.data[index], &order)) {
+            uint64_t model = order & UINT64_C(0xffff);
+            uint64_t extension = order & ~UINT64_C(0xffff);
+            if ((extension == AT_HLE_ACQUIRE && (model == 2 || model == 4 || model == 5)) ||
+                (extension == AT_HLE_RELEASE && (model == 3 || model == 4 || model == 5)))
+                hle = (unsigned)extension;
+        }
+    }
     if (op == AT_COMPARE) {
         size_t desired = pointers ? args[2] : value_address(l, args[2], type);
         size_t expected = n->op & AT_EXPECTED_VALUE ? value_address(l, args[1], type) : args[1];
-        size_t compared = atomic_compare(l, type, at, expected, desired);
+        size_t compared = atomic_compare_hle(l, type, at, expected, desired, hle);
         return n->op & AT_RETURN_OBSERVED ? plain_load(l, expected, type) : compared;
     }
     if (op >= AT_ADD && op <= AT_TEST_AND_SET) {
@@ -1052,7 +1124,7 @@ static size_t atomic_value(Lower *l, Node *n)
             return atomic_wide_rmw(l, n, at, args[1], op);
         Type *wide = type_int(c, 4, true), *small = type_int(c, 3, true);
         size_t operand = op == AT_TEST_AND_SET ? imm(l, wide, 1) : args[1];
-        size_t rmw[] = {at, operand, imm(l, small, type->size), imm(l, small, op),
+        size_t rmw[] = {at, operand, imm(l, small, type->size), imm(l, small, op | hle),
                         imm(l, type_int(c, 0, true), (n->op & AT_RETURN_NEW) != 0)};
         size_t result = runtime_call(l, "__mcc_atomic_rmw", wide, rmw, sizeof rmw / sizeof *rmw);
         if (op == AT_TEST_AND_SET)
@@ -1068,7 +1140,7 @@ static size_t atomic_value(Lower *l, Node *n)
     }
     if (op != AT_STORE)
         output = pointers ? args[op == AT_LOAD ? 1 : 2] : object_slot(l, type);
-    atomic_access(l, type, at, input, output, (AtomicOperation)op);
+    atomic_access(l, type, at, input, output, op | hle);
     return output && !pointers ? plain_load(l, output, type) : 0;
 }
 
@@ -1192,6 +1264,33 @@ static size_t write_register_object(Lower *l, Symbol *s, Node *lhs, size_t displ
     }
     put(l, (Inst){.code = I_REGISTER_WRITE, .a = raw, .symbol = s, .type = s->type});
     return val;
+}
+
+/* Vector element assignment updates a snapshot and writes the complete
+   register back. Evaluate the index once for both read-modify-write and store. */
+static size_t update_global_vector_element(Lower *l, Node *n, Symbol *reg, size_t displacement)
+{
+    Node *lhs = n->left;
+    Type *index_type = type_int(l->context, 4, false);
+    size_t index = value(l, convert(l->context, lhs->right, index_type, lhs->loc));
+    size_t before = 0;
+    Substitution substitute = {.previous = l->substitution, .node = lhs};
+    if (n->kind == N_UPDATE) {
+        size_t prior = read_register_bits(l, reg);
+        size_t base = offset(l, frame_slot_address(l, prior, reg->type), displacement);
+        before = read_lvalue(l, lhs, vector_element_address(l, base, index, lhs->type));
+        substitute.value = before;
+        l->substitution = &substitute;
+    }
+    size_t result = value(l, n->right);
+    l->substitution = substitute.previous;
+    /* The right side may call a function that changes other lanes. */
+    size_t raw = read_register_bits(l, reg);
+    size_t base = offset(l, frame_slot_address(l, raw, reg->type), displacement);
+    size_t at = vector_element_address(l, base, index, lhs->type);
+    write_lvalue(l, lhs, at, result);
+    put(l, (Inst){.code = I_REGISTER_WRITE, .a = raw, .symbol = reg, .type = reg->type});
+    return n->postfix ? before : result;
 }
 
 static void copy_value(Lower *l, size_t dest, size_t src)
@@ -1344,14 +1443,22 @@ static void branch_full_expression(Lower *l, Node *expr, size_t label, bool nonz
     branch_expression(l, expr, result, label, nonzero, loc);
 }
 
-static void record_allocation_extent(Lower *l, Node *n, Substitution *inputs)
+static void record_allocation_extent(Lower *l, Node *n, Substitution *inputs, size_t address)
 {
-    Symbol *extent = n->symbol;
+    Symbol *extents[] = {n->symbol, n->symbol->object_subextent};
     Substitution *previous = l->substitution;
     l->substitution = inputs;
-    size_t size = value(l, n->third);
+    for (size_t i = 0; i < 2; i++) {
+        Symbol *extent = extents[i];
+        Node *size_node = i && n->object_subsize ? n->object_subsize : n->third;
+        size_t size = value(l, size_node);
+        size_t base = address;
+        if (!i && n->object_displacement)
+            base = operation(l, '-', address, value(l, n->object_displacement), extent->object_base->type);
+        store(l, storage_address(l, extent), size, extent->type);
+        store(l, storage_address(l, extent->object_base), base, extent->object_base->type);
+    }
     l->substitution = previous;
-    store(l, storage_address(l, extent), size, extent->type);
 }
 
 static void pin_stack_allocation(Lower *l, size_t result, bool block)
@@ -1391,11 +1498,11 @@ static size_t stack_allocation(Lower *l, Node *n)
                                .arguments = {start, 0}};
         PUSH(l->context, l->allocation_sites, site);
     }
-    put(l, (Inst){.code = I_STACK_ALLOC, .dest = result, .a = amount, .immediate = n->integer});
+    put(l, (Inst){.code = I_STACK_ALLOC, .dest = result, .a = amount, .immediate = n->integer, .access_call = n});
     pin_stack_allocation(l, result, n->flags & BLOCK_STACK_ALLOCATION);
     if (n->third) {
         Substitution input = {l->substitution, n->left, amount};
-        record_allocation_extent(l, n, &input);
+        record_allocation_extent(l, n, &input, result);
     }
     return result;
 }
@@ -1435,15 +1542,26 @@ static void update_object_extent(Lower *l, Symbol *s, Node *rhs)
     if (!extent)
         return;
     Node *source = pointer_value_source(rhs);
-    if (source && (source->kind == N_CALL || source->kind == N_ALLOCA) && source->symbol == extent)
+    if (source && (source->kind == N_CALL || source->kind == N_ALLOCA || source->kind == N_ADDR ||
+                   ((source->kind == N_BINARY || source->kind == N_COND) && source->extent_source)) &&
+        source->symbol == extent)
         return;
     Symbol *copied = source && source->kind == N_SYMBOL && source->symbol->owner == s->owner ?
                      source->symbol->object_extent : NULL;
     if (copied == extent)
         return;
-    size_t size = copied ? load(l, storage_address(l, copied), copied->type) :
-                           imm(l, extent->type, UINT64_MAX);
-    store(l, storage_address(l, extent), size, extent->type);
+    Symbol *extents[] = {extent, extent->object_subextent};
+    Symbol *copies[] = {copied, copied ? copied->object_subextent : NULL};
+    for (size_t i = 0; i < 2; i++) {
+        Symbol *current = extents[i], *from = copies[i];
+        size_t size = from ? load(l, storage_address(l, from), from->type) :
+                             imm(l, current->type, UINT64_MAX);
+        store(l, storage_address(l, current), size, current->type);
+        Symbol *base = current->object_base;
+        size_t address = from ? load(l, storage_address(l, from->object_base), from->object_base->type) :
+                                imm(l, base->type, 0);
+        store(l, storage_address(l, base), address, base->type);
+    }
 }
 
 static void record_call_extent(Lower *l, Node *n, Inst *call)
@@ -1452,7 +1570,33 @@ static void record_call_extent(Lower *l, Node *n, Inst *call)
     size_t first = allocation.first - 1, second = allocation.second ? allocation.second - 1 : first;
     Substitution a = {l->substitution, n->list.data[first], call->args.data[first]};
     Substitution b = {&a, n->list.data[second], call->args.data[second]};
-    record_allocation_extent(l, n, &b);
+    record_allocation_extent(l, n, &b, call->dest);
+}
+
+static void record_offset_extent(Lower *l, Node *n, size_t original, size_t old_size[2],
+                                 size_t base[2], size_t result)
+{
+    Symbol *extents[] = {n->symbol, n->symbol->object_subextent};
+    for (size_t i = 0; i < 2; i++) {
+        Symbol *extent = extents[i];
+        Type *size_type = extent->type;
+        size_t unknown = imm(l, size_type, UINT64_MAX);
+        size_t updated = slot(l, size_type), done = new_label(l);
+        copy_value(l, updated, unknown);
+        branch(l, operation(l, EQ, old_size[i], unknown, size_type), done, true, n->loc);
+        size_t prior_offset = operation(l, '-', original, base[i], size_type);
+        size_t total = operation(l, '+', prior_offset, old_size[i], size_type);
+        size_t limit = imm(l, size_type, PTRDIFF_MAX);
+        branch(l, operation(l, '>', prior_offset, limit, size_type), done, true, n->loc);
+        branch(l, operation(l, '>', total, limit, size_type), done, true, n->loc);
+        size_t offset = operation(l, '-', result, base[i], size_type);
+        copy_value(l, updated, imm(l, size_type, 0));
+        branch(l, operation(l, '>', offset, total, size_type), done, true, n->loc);
+        copy_value(l, updated, operation(l, '-', total, offset, size_type));
+        mark(l, done);
+        store(l, storage_address(l, extent), updated, size_type);
+        store(l, storage_address(l, extent->object_base), base[i], extent->object_base->type);
+    }
 }
 
 static size_t flow_value(Lower *l, Node *n, ResultUse use)
@@ -1479,11 +1623,15 @@ static size_t flow_value(Lower *l, Node *n, ResultUse use)
             l->substitution = &substitute;
         l->suppress_unused_result = suppress || (known && !selected);
         copy_value(l, dest, evaluate(l, n->right, arm));
+        if (n->extent_source)
+            update_object_extent(l, n->extent_source, n->right);
         l->substitution = substitute.previous;
         jump(l, done);
         mark(l, other);
         l->suppress_unused_result = suppress || (known && selected);
         copy_value(l, dest, evaluate(l, n->third, arm));
+        if (n->extent_source)
+            update_object_extent(l, n->extent_source, n->third);
     } else {
         bool is_or = n->op == OR;
         branch_expression(l, test_node, condition, other, is_or, n->loc);
@@ -1582,6 +1730,8 @@ struct PaddingStep {
     size_t offset, bytes;
     unsigned keep;
     Type *repeat;
+    Type *record_tail;
+    Type *record_general;
     PaddingSteps element;
 };
 
@@ -1787,6 +1937,26 @@ static void plan_padding(Context *c, Type *t, size_t origin, PaddingSteps *steps
         clear_bit_range(c, steps, origin, scalar_value_bits(c, t), (size_t)t->size * 8);
         return;
     }
+    if (t->variable_size) {
+        bool trailing_array = (t->kind == TY_STRUCT || t->members.len == 1) && t->members.len &&
+                              t->members.data[t->members.len - 1].type->kind == TY_ARRAY &&
+                              t->members.data[t->members.len - 1].type->variable_size;
+        for (size_t i = 0; trailing_array && i + 1 < t->members.len; i++)
+            trailing_array = !t->members.data[i].type->variable_size;
+        if (!trailing_array) {
+            PUSH(c, *steps, ((PaddingStep){.offset = origin, .record_general = t}));
+            return;
+        }
+        Member tail = t->members.data[t->members.len - 1];
+        Type prefix = *t;
+        prefix.members.len--;
+        prefix.size = (unsigned)tail.offset;
+        prefix.variable_size = false;
+        plan_padding(c, &prefix, origin, steps);
+        plan_padding(c, tail.type, origin + tail.offset, steps);
+        PUSH(c, *steps, ((PaddingStep){.offset = origin + tail.offset, .record_tail = t}));
+        return;
+    }
 
     /* The live bits of a union are the union of the live bits of its members. */
     bool overlap = t->kind == TY_UNION && t->members.len > 1;
@@ -1802,13 +1972,135 @@ static void plan_padding(Context *c, Type *t, size_t origin, PaddingSteps *steps
         }
 }
 
+/* Add the value bits covering one byte of an object to a runtime mask. */
+static void mark_value_byte(Lower *l, Type *t, size_t position, size_t mask, Loc loc)
+{
+    Context *c = l->context;
+    Type *size_type = type_int(c, 4, true);
+    Type *word = type_int(c, 3, true);
+    Type *condition_type = type_int(c, 3, false);
+    if (!t->variable_size && !t->size)
+        return;
+    if (indexed_elements(t) || t->kind == TY_COMPLEX) {
+        if (!indexed_elements(t->base) && t->base->kind != TY_COMPLEX &&
+            t->base->kind != TY_STRUCT && t->base->kind != TY_UNION &&
+            scalar_value_bits(c, t->base) == (size_t)t->base->size * 8) {
+            copy_value(l, mask, operation(l, '|', mask, imm(l, word, 255), word));
+            return;
+        }
+        size_t stride = t->base->variable_size ? dynamic_size(l, t->base) : imm(l, size_type, t->base->size);
+        size_t within = operation(l, '%', position, stride, size_type);
+        mark_value_byte(l, t->base, within, mask, loc);
+        return;
+    }
+    if (t->kind != TY_STRUCT && t->kind != TY_UNION) {
+        size_t bits = scalar_value_bits(c, t);
+        size_t skip = 0;
+        if (bits < (size_t)t->size * 8) {
+            skip = new_label(l);
+            size_t outside = operation(l, GE, position, imm(l, size_type, bits / 8), condition_type);
+            branch(l, outside, skip, true, loc);
+        }
+        copy_value(l, mask, operation(l, '|', mask, imm(l, word, 255), word));
+        if (skip)
+            mark(l, skip);
+        return;
+    }
+    for (size_t i = 0; i < t->members.len; i++) {
+        Member m = t->members.data[i];
+        size_t start = m.runtime_offset ? value(l, m.runtime_offset) : imm(l, size_type, m.offset);
+        if (m.bit_field) {
+            if (!m.name || !m.width)
+                continue;
+            unsigned first = m.bit / 8, last = (m.bit + m.width - 1) / 8;
+            for (unsigned byte = first; byte <= last; byte++) {
+                unsigned begin = m.bit > byte * 8 ? m.bit - byte * 8 : 0;
+                unsigned end = m.bit + m.width < byte * 8 + 8 ? m.bit + m.width - byte * 8 : 8;
+                unsigned bits = t->kind == TY_UNION ? 255 : ((1u << (end - begin)) - 1) << begin;
+                size_t at = byte ? operation(l, '+', start, imm(l, size_type, byte), size_type) : start;
+                size_t skip = new_label(l);
+                size_t different = operation(l, NE, position, at, condition_type);
+                branch(l, different, skip, true, loc);
+                copy_value(l, mask, operation(l, '|', mask, imm(l, word, bits), word));
+                mark(l, skip);
+            }
+            continue;
+        }
+        if (!m.type->variable_size && !m.type->size)
+            continue;
+        size_t extent = m.type->variable_size ? dynamic_size(l, m.type) : imm(l, size_type, m.type->size);
+        size_t end = operation(l, '+', start, extent, size_type);
+        size_t skip = new_label(l);
+        size_t before = operation(l, '<', position, start, condition_type);
+        branch(l, before, skip, true, loc);
+        size_t after = operation(l, GE, position, end, condition_type);
+        branch(l, after, skip, true, loc);
+        size_t within = operation(l, '-', position, start, size_type);
+        mark_value_byte(l, m.type, within, mask, loc);
+        mark(l, skip);
+    }
+}
+
+static void lower_general_padding(Lower *l, size_t at, Type *record, Loc loc)
+{
+    Context *c = l->context;
+    Type *size_type = type_int(c, 4, true);
+    Type *word = type_int(c, 3, true);
+    Type *byte = type_int(c, 1, true);
+    Type *condition_type = type_int(c, 3, false);
+    Type *pointer_type = l->function->slots.data[at - 1].type;
+    size_t length = dynamic_size(l, record);
+    size_t index = slot(l, size_type), mask = slot(l, word);
+    copy_value(l, index, imm(l, size_type, 0));
+    size_t loop = new_label(l), done = new_label(l), advance = new_label(l);
+    mark(l, loop);
+    size_t finished = operation(l, GE, index, length, condition_type);
+    branch(l, finished, done, true, loc);
+    copy_value(l, mask, imm(l, word, 0));
+    mark_value_byte(l, record, index, mask, loc);
+    size_t complete = operation(l, EQ, mask, imm(l, word, 255), condition_type);
+    branch(l, complete, advance, true, loc);
+    size_t place = operation(l, '+', at, index, pointer_type);
+    size_t partial = new_label(l), written = new_label(l);
+    branch(l, mask, partial, true, loc);
+    store(l, place, imm(l, byte, 0), byte);
+    jump(l, written);
+    mark(l, partial);
+    size_t old = plain_load(l, place, byte);
+    store(l, place, operation(l, '&', old, mask, byte), byte);
+    mark(l, written);
+    mark(l, advance);
+    copy_value(l, index, operation(l, '+', index, imm(l, size_type, 1), size_type));
+    jump(l, loop);
+    mark(l, done);
+}
+
 static void lower_padding(Lower *l, size_t at, PaddingSteps steps, Loc loc)
 {
     Context *c = l->context;
     for (size_t i = 0; i < steps.len; i++) {
         PaddingStep step = steps.data[i];
         size_t place = offset(l, at, step.offset);
-        if (step.repeat) {
+        if (step.record_general) {
+            lower_general_padding(l, place, step.record_general, loc);
+        } else if (step.record_tail) {
+            Type *record = step.record_tail;
+            Type *array = record->members.data[record->members.len - 1].type;
+            Type *pointer_type = l->function->slots.data[place - 1].type;
+            Type *byte = type_int(c, 1, true);
+            size_t current = slot(l, pointer_type);
+            copy_value(l, current, operation(l, '+', place, dynamic_size(l, array), pointer_type));
+            size_t start = offset(l, at, step.offset - record->members.data[record->members.len - 1].offset);
+            size_t end = operation(l, '+', start, dynamic_size(l, record), pointer_type);
+            size_t loop = new_label(l), done = new_label(l);
+            mark(l, loop);
+            size_t finished = operation(l, EQ, current, end, type_int(c, 3, false));
+            branch(l, finished, done, true, loc);
+            store(l, current, imm(l, byte, 0), byte);
+            copy_value(l, current, operation(l, '+', current, imm(l, pointer_type, 1), pointer_type));
+            jump(l, loop);
+            mark(l, done);
+        } else if (step.repeat) {
             Type *t = step.repeat;
             Type *pointer_type = l->function->slots.data[place - 1].type;
             Type *size_type = type_int(c, 4, true);
@@ -1983,7 +2275,12 @@ static size_t evaluate(Lower *l, Node *n, ResultUse use)
         }
         if (n->left->kind == N_SYMBOL && n->left->type->kind == TY_FUNC && n->left->symbol->owner)
             return nested_pointer(l, n->left->symbol, t);
-        return address(l, n->left);
+        {
+            size_t result = address(l, n->left);
+            if (n->third)
+                record_allocation_extent(l, n, NULL, result);
+            return result;
+        }
     case N_COND: return flow_value(l, n, use);
     case N_VECTOR_CONVERT: return vector_operation(l, n);
     case N_VECTOR_SHUFFLE: return vector_shuffle(l, n);
@@ -2153,16 +2450,33 @@ static size_t evaluate(Lower *l, Node *n, ResultUse use)
         if (n->operand_type && n->operand_type->kind == TY_COMPLEX)
             return complex_binary(l, n);
         size_t a = value(l, n->left);
+        size_t old_size[2] = {0}, old_base[2] = {0};
+        if (n->extent_source) {
+            Symbol *extents[] = {n->extent_source->object_extent, n->extent_source->object_subextent};
+            for (size_t i = 0; i < 2; i++) {
+                Symbol *extent = extents[i];
+                old_size[i] = load(l, storage_address(l, extent), extent->type);
+                old_base[i] = load(l, storage_address(l, extent->object_base), extent->object_base->type);
+            }
+        }
         size_t b = value(l, n->right);
         mark_nonnull_comparison(l, compared_to_null(l->context, n), n->loc);
         bool truth_value;
         if (nonnull_result_truth(l->context, n, &truth_value))
             return imm(l, t, truth_value);
-        return operation(l, n->op, a, b, t);
+        size_t result = operation(l, n->op, a, b, t);
+        if (n->extent_source)
+            record_offset_extent(l, n, a, old_size, old_base, result);
+        return result;
     }
     case N_ASSIGN: case N_UPDATE: {
         Node *lhs = n->left;
         size_t displacement;
+        if (lhs->kind == N_VECTOR_ELEMENT) {
+            Symbol *owner = explicit_register_object(l->context, lhs->left, &displacement);
+            if (owner && global_register(owner))
+                return update_global_vector_element(l, n, owner, displacement);
+        }
         Symbol *reg = explicit_register_object(l->context, lhs, &displacement);
         size_t at = !reg ? address(l, lhs) : global_register(reg) ? 0 :
                     offset(l, address_symbol(l, reg), displacement);
@@ -2338,83 +2652,6 @@ static void goto_label(Lower *l, Node *n)
     put(l, (Inst){.code = I_JUMP, .label = target, .op = 1});
 }
 
-static void copy_asm_outputs(Lower *l, AsmPlan *plan)
-{
-    put(l, (Inst){.code = I_ASM_OUTPUT, .asm_plan = plan});
-    for (size_t i = 0; i < plan->assembly->outputs; i++) {
-        AsmBinding *binding = &plan->bindings[i];
-        if (!binding->result)
-            continue;
-        Node *expr = plan->assembly->operands.data[i].expression;
-        size_t val = binding->result;
-        if (aggregate(expr->type))
-            val = frame_slot_address(l, val, expr->type);
-        if (binding->address) {
-            write_lvalue(l, expr, binding->address, val);
-        } else {
-            size_t displacement;
-            Symbol *reg = explicit_register_object(l->context, expr, &displacement);
-            write_register_object(l, reg, expr, displacement, val);
-        }
-    }
-}
-
-static void lower_extended_asm(Lower *l, Node *n)
-{
-    Context *c = l->context;
-    InlineAssembly *assembly = n->inline_asm;
-    AsmPlan *plan = alloc(c, sizeof *plan);
-    plan->assembly = assembly;
-    plan->loc = n->loc;
-    plan->serial = c->unique++;
-    if (!plan_inline_asm(c, plan))
-        return;
-    for (size_t i = 0; i < assembly->operands.len; i++) {
-        AsmBinding *binding = &plan->bindings[i];
-        Node *expr = assembly->operands.data[i].expression;
-        if (binding->global_register && binding->match < 0)
-            continue;
-        size_t displacement;
-        Symbol *reg = explicit_register_object(c, expr, &displacement);
-        if (binding->location == ASM_MEMORY) {
-            binding->load = address(l, expr);
-        } else if (i < assembly->outputs) {
-            if (!reg)
-                binding->address = address(l, expr);
-            else if (!global_register(reg))
-                binding->address = offset(l, address_symbol(l, reg), displacement);
-            binding->result = register_slot(l, unqualified_type(c, expr->type));
-            if (binding->read_write) {
-                size_t initial = binding->address ? read_lvalue(l, expr, binding->address) : value(l, expr);
-                binding->load = copy_register_operand(l, initial, expr->type);
-            }
-        } else if (binding->location == ASM_REGISTER) {
-            Node *input = reg && expr->type->kind == TY_ARRAY ? expr : decay(c, expr);
-            binding->load = copy_register_operand(l, value(l, input), input->type);
-        }
-    }
-    if (plan->preserve) {
-        Type *word = type_int(c, 4, true);
-        for (unsigned i = 0; i < 64; i++)
-            if (plan->preserve & (UINT64_C(1) << i))
-                plan->save_slots[i] = slot(l, word);
-    }
-    for (size_t i = 0; i < assembly->labels.len; i++)
-        plan->labels[i] = new_label(l);
-    put(l, (Inst){.code = I_EXTENDED_ASM, .asm_plan = plan});
-    copy_asm_outputs(l, plan);
-    if (assembly->labels.len) {
-        size_t done = new_label(l);
-        jump(l, done);
-        for (size_t i = 0; i < assembly->labels.len; i++) {
-            mark(l, plan->labels[i]);
-            copy_asm_outputs(l, plan);
-            goto_label(l, assembly->labels.data[i]);
-        }
-        mark(l, done);
-    }
-}
-
 static void gather_cases(Lower *l, Cases *cases, Node *n, Type *t)
 {
     if (!n || n->kind == N_SWITCH)
@@ -2564,6 +2801,7 @@ static void allocate_variable_object(Lower *l, Symbol *s)
     size_t stack_slot = slot(l, pointer_type);
     put(l, (Inst){.code = I_STACK_SAVE, .dest = stack_slot});
     size_t object = allocate_variable_temporary(l, s->type, symbol_alignment(s));
+    l->function->instructions.data[l->function->instructions.len - 1].label = stack_slot;
     store(l, storage_address(l, s), object, pointer_type);
     if (s->init)
         zero_variable_object(l, object, s->type);
@@ -2631,6 +2869,12 @@ static void statement(Lower *l, Node *n)
         if (!s->local)
             break;
         if (s->type->variable_size) {
+            if (!l->context->syntax_only && s->type->kind == TY_ARRAY &&
+                warning_enabled(l->context, WARNING_VLA_LARGE, n->loc)) {
+                VariableArraySite site = {.symbol = s, .loc = n->loc,
+                                          .instruction = l->function->instructions.len};
+                PUSH(l->context, l->variable_array_sites, site);
+            }
             allocate_variable_object(l, s);
         } else {
             if (s->init) {
@@ -2653,16 +2897,6 @@ static void statement(Lower *l, Node *n)
             flow_statement(l, n->loc, true);
         scalar_full_expression(l, n->left, FULL_EFFECT);
         break;
-    case N_ASM: {
-        flow_statement(l, n->loc, true);
-        Lifetime *prior = begin_full_expression(l);
-        if (n->inline_asm)
-            lower_extended_asm(l, n);
-        else
-            put(l, (Inst){.code = I_ASM, .asm_text = n->name});
-        restore(l, prior, n->loc);
-        break;
-    }
     case N_RETURN: {
         Lifetime *prior = begin_full_expression(l);
         size_t result = value(l, n->left);
@@ -3037,9 +3271,6 @@ static bool *reachable_instructions(Lower *l, Symbol *parameter, const unsigned 
                     PUSH(c, walk->work, walk->targets.data[j] + changed);
                 break;
             }
-            if (in->code == I_EXTENDED_ASM)
-                for (size_t j = 0; j < in->asm_plan->assembly->labels.len; j++)
-                    PUSH(c, walk->work, walk->labels[in->asm_plan->labels[j]] + changed);
         }
     }
     return walk->visited;
@@ -3113,6 +3344,82 @@ static Symbol *direct_local_address(const Inst **definitions, size_t slot, const
     const Inst *definition = definitions[slot];
     Symbol *s = definition && definition->code == I_ADDRESS ? definition->symbol : NULL;
     return s && s->local && s->owner == function ? s : NULL;
+}
+
+/* A returns-twice continuation can be reached again after an intervening call
+   or a loop. Report a scalar only when one path reads its old value and a
+   path can modify it before such a return. */
+static void check_clobbered(Lower *l)
+{
+    Context *c = l->context;
+    Symbol *function = l->function->function;
+    if (!function->has_builtin_setjmp && !function->has_returns_twice)
+        return;
+    Instructions instructions = l->function->instructions;
+    InstructionWalk walk = {0};
+    const bool *reachable = reachable_instructions(l, NULL, NULL, &walk);
+    const Inst **definitions = unique_slot_definitions(l, reachable);
+    bool *visited = alloc(c, 2 * instructions.len * sizeof *visited);
+    Values pending = {0};
+    for (size_t v = 0; v < function->locals.len; v++) {
+        Symbol *s = function->locals.data[v];
+        if (!s->name || !s->loc.file || !warning_enabled(c, WARNING_CLOBBERED, s->loc) ||
+            (s->type->qualifiers & (S_VOLATILE | S_ATOMIC)) || s->register_binding ||
+            (!integer_type(s->type) && s->type->kind != TY_PTR && s->type->kind != TY_FLOAT))
+            continue;
+        /* Compiler-created temporaries use descriptive names containing spaces. */
+        if (strchr(s->name, ' '))
+            continue;
+        bool report = false;
+        for (size_t checkpoint = 0; checkpoint < instructions.len && !report; checkpoint++) {
+            const Inst *jump = &instructions.data[checkpoint];
+            bool twice = jump->code == I_SETJMP || (jump->code == I_CALL && function_returns_twice(c, jump->symbol));
+            if (!twice || !reachable[checkpoint] || checkpoint + 1 >= instructions.len)
+                continue;
+            memset(visited, 0, 2 * instructions.len * sizeof *visited);
+            pending.len = 0;
+            PUSH(c, pending, checkpoint + 1);
+            bool read_before_write = false, return_after_write = false;
+            for (size_t w = 0; w < pending.len; w++) {
+                size_t encoded = pending.data[w], at = encoded % instructions.len;
+                bool written = encoded >= instructions.len;
+                if (visited[encoded])
+                    continue;
+                visited[encoded] = true;
+                const Inst *in = &instructions.data[at];
+                if ((in->code == I_LOAD || in->code == I_BITLOAD) && !written &&
+                    direct_local_address(definitions, in->a, function) == s)
+                    read_before_write = true;
+                if ((in->code == I_STORE || in->code == I_BITSTORE) &&
+                    direct_local_address(definitions, in->a, function) == s)
+                    written = true;
+                if (written && (at == checkpoint || in->code == I_CALL || in->code == I_LONGJMP))
+                    return_after_write = true;
+                if (read_before_write && return_after_write) {
+                    report = true;
+                    break;
+                }
+                if (in->code == I_RETURN || in->code == I_TRAP || in->code == I_LONGJMP)
+                    continue;
+                size_t state = written ? instructions.len : 0;
+                if (in->code == I_JUMP || (in->code == I_ZERO && branch_can_jump(in))) {
+                    PUSH(c, pending, walk.labels[in->label] + state);
+                    if (in->code == I_JUMP || in->immediate != CONDITION_UNKNOWN)
+                        continue;
+                }
+                if (in->code == I_INDIRECT_JUMP) {
+                    for (size_t j = 0; j < walk.targets.len; j++)
+                        PUSH(c, pending, walk.targets.data[j] + state);
+                    continue;
+                }
+                if (at + 1 < instructions.len)
+                    PUSH(c, pending, at + 1 + state);
+            }
+        }
+        if (report)
+            warning_at(c, WARNING_CLOBBERED, s->loc,
+                       "variable '%s' might be clobbered by 'longjmp' or 'vfork'", s->name);
+    }
 }
 
 static bool tracked_pointer_alias(Symbol *s)
@@ -3268,15 +3575,6 @@ static unsigned char access_effect(const AccessInitialization *flow, const Inst 
             if (flow->values[in->args.data[i]].points_to_object)
                 return FLOW_ACCESS;
         return FLOW_EXTERNAL;
-    case I_EXTENDED_ASM:
-        for (size_t i = 0; i < in->asm_plan->assembly->operands.len; i++) {
-            const AsmBinding *binding = &in->asm_plan->bindings[i];
-            if (flow->values[binding->address].points_to_object || flow->values[binding->load].points_to_object)
-                return FLOW_ACCESS;
-        }
-        return FLOW_EXTERNAL;
-    case I_ASM:
-        return FLOW_EXTERNAL;
     default:
         return 0;
     }
@@ -3300,6 +3598,7 @@ typedef struct {
     RangePoint *points;
     size_t argument;
     const Symbol *symbol;
+    unsigned layout_depth;
     Values work;
 } IntegerFlow;
 
@@ -3443,8 +3742,6 @@ static void bound_integer_symbol(IntegerFlow *flow, const Symbol *symbol)
             range = value ? convert_integer_range(integer_expression_range(c, value, NULL, NULL),
                                                   value->type, symbol->type) : full;
         }
-        if (in->code == I_ASM || in->code == I_EXTENDED_ASM)
-            range = full;
         if (in->code == I_JUMP) {
             merge_integer_edge(flow, at, flow->walk->labels[in->label], range);
             continue;
@@ -3469,9 +3766,6 @@ static void bound_integer_symbol(IntegerFlow *flow, const Symbol *symbol)
                 merge_integer_edge(flow, at, flow->walk->targets.data[i], full);
             continue;
         }
-        if (in->code == I_EXTENDED_ASM)
-            for (size_t i = 0; i < in->asm_plan->assembly->labels.len; i++)
-                merge_integer_edge(flow, at, flow->walk->labels[in->asm_plan->labels[i]], range);
         merge_integer_edge(flow, at, at + 1, range);
     }
 }
@@ -3482,7 +3776,7 @@ static IntegerRange access_integer_symbol(void *data, const Symbol *symbol)
     const Symbol *function = flow->lower->function->function;
     if (!symbol->local || symbol->owner != function || symbol->address_taken || symbol->captured_in_nested_function ||
         symbol->register_binding || (symbol->type->qualifiers & (S_VOLATILE | S_ATOMIC)) ||
-        function->has_nonlocal_labels || function->has_builtin_setjmp)
+        function->has_nonlocal_labels || function->has_builtin_setjmp || function->has_returns_twice)
         return integer_type_range(symbol->type);
     if (flow->symbol != symbol)
         bound_integer_symbol(flow, symbol);
@@ -3522,9 +3816,6 @@ static void find_predecessors(IntegerFlow *flow)
                 add_predecessor(flow, i, flow->walk->targets.data[j]);
             continue;
         }
-        if (in->code == I_EXTENDED_ASM)
-            for (size_t j = 0; j < in->asm_plan->assembly->labels.len; j++)
-                add_predecessor(flow, i, flow->walk->labels[in->asm_plan->labels[j]]);
         add_predecessor(flow, i, i + 1);
     }
 }
@@ -3535,8 +3826,8 @@ static bool access_pointer_stores(void *data, const Symbol *symbol, size_t point
     Lower *l = flow->lower;
     Context *c = l->context;
     const Symbol *function = l->function->function;
-    if (symbol->address_taken || symbol->captured_in_nested_function ||
-        function->has_nonlocal_labels || function->has_builtin_setjmp || !flow->reachable[point])
+    if (symbol->captured_in_nested_function ||
+        function->has_nonlocal_labels || function->has_builtin_setjmp || function->has_returns_twice || !flow->reachable[point])
         return false;
     if (!flow->predecessors)
         find_predecessors(flow);
@@ -3553,11 +3844,21 @@ static bool access_pointer_stores(void *data, const Symbol *symbol, size_t point
         for (size_t link = flow->predecessors[at]; link; link = flow->edges.data[link - 1].next) {
             size_t from = flow->edges.data[link - 1].from;
             const Inst *in = &instructions.data[from];
-            if (in->code == I_ASM || in->code == I_EXTENDED_ASM)
-                return false;
             if (flow->pointer_visits[from] == visit)
                 continue;
             flow->pointer_visits[from] = visit;
+            if (symbol->address_taken) {
+                /* An escaped address may be written through an alias. A store
+                   to a different known local cannot affect this pointer. */
+                if (in->code == I_CALL)
+                    return false;
+                if (in->code == I_STORE || in->code == I_BITSTORE || in->code == I_MEMCOPY ||
+                    in->code == I_MEMZERO || in->code == I_VA_START || in->code == I_VA_ARG) {
+                    Symbol *target = direct_local_address(flow->definitions, in->a, function);
+                    if (!target || (target == symbol && in->code != I_STORE))
+                        return false;
+                }
+            }
             if (in->code == I_STORE && direct_local_address(flow->definitions, in->a, function) == symbol) {
                 if (!in->stored_value)
                     return false;
@@ -3579,6 +3880,51 @@ static IntegerRange access_offset_range(void *data, Node *value, size_t point)
     IntegerRange range = integer_expression_range(c, value, access_integer_symbol, flow);
     flow->argument = argument;
     return range;
+}
+
+static bool access_layout_range(void *, const Symbol *, size_t, IntegerRange *);
+
+static IntegerRange access_layout_symbol(void *data, const Symbol *symbol)
+{
+    IntegerFlow *flow = data;
+    IntegerRange result;
+    if (symbol->array_layout_size && flow->layout_depth < 32) {
+        flow->layout_depth++;
+        bool found = access_layout_range(data, symbol, flow->argument, &result);
+        flow->layout_depth--;
+        if (found)
+            return result;
+    }
+    return access_integer_symbol(data, symbol);
+}
+
+static bool access_layout_range(void *data, const Symbol *symbol, size_t point, IntegerRange *result)
+{
+    IntegerFlow *flow = data;
+    Context *c = flow->lower->context;
+    AccessPointerStore first;
+    AccessPointerStores stores = {.data = &first, .cap = 1};
+    if (!access_pointer_stores(data, symbol, point, &stores))
+        return false;
+    size_t argument = flow->argument;
+    bool found = false;
+    for (size_t i = 0; i < stores.len; i++) {
+        AccessPointerStore store = stores.data[i];
+        if (expression_has_effect(c, store.value)) {
+            flow->argument = argument;
+            return false;
+        }
+        flow->argument = store.point;
+        IntegerRange range = integer_expression_range(c, store.value, access_layout_symbol, flow);
+        range = convert_integer_range(range, store.value->type, symbol->type);
+        if (!found || wide_compare(range.lower, result->lower, true) < 0)
+            result->lower = range.lower;
+        if (!found || wide_compare(range.upper, result->upper, true) > 0)
+            result->upper = range.upper;
+        found = true;
+    }
+    flow->argument = argument;
+    return found;
 }
 
 static IntegerRange access_allocation_range(void *data, const Node *allocation, unsigned index, Node *value)
@@ -3607,6 +3953,22 @@ static IntegerRange access_allocation_range(void *data, const Node *allocation, 
     }
     flow->argument = argument;
     return found ? range : integer_expression_range(c, value, NULL, NULL);
+}
+
+static IntegerRange bounded_alloca_range(IntegerFlow *flow, const Node *expression)
+{
+    Context *c = flow->lower->context;
+    IntegerRange range = access_allocation_range(flow, expression, 0, expression->left);
+    uint64_t known, maximum;
+    if (expression->fourth && !constant_int(c, expression->left, &known) &&
+        constant_int(c, expression->fourth, &maximum)) {
+        Integer128 bound = {maximum, 0};
+        if (wide_compare(range.upper, bound, true) > 0)
+            range.upper = bound;
+        if (wide_compare(range.lower, range.upper, true) > 0)
+            range.lower = (Integer128){0, 0};
+    }
+    return range;
 }
 
 static uint64_t access_read_size(const Inst *in, AccessClause clause, IntegerRange counts)
@@ -3697,6 +4059,152 @@ static void call_diagnostics(Context *c, const Inst *call)
                    function->name, warning_message);
 }
 
+/* Detect cycles through an allocation site, including computed gotos. */
+static bool allocation_in_loop(IntegerFlow *flow, size_t point, size_t restore_slot)
+{
+    if (!flow->predecessors)
+        find_predecessors(flow);
+    Context *c = flow->lower->context;
+    size_t visit = ++flow->pointer_search;
+    flow->pointer_work.len = 0;
+    PUSH(c, flow->pointer_work, point);
+    while (flow->pointer_work.len) {
+        size_t at = flow->pointer_work.data[--flow->pointer_work.len];
+        for (size_t link = flow->predecessors[at]; link; link = flow->edges.data[link - 1].next) {
+            size_t from = flow->edges.data[link - 1].from;
+            if (from == point)
+                return true;
+            const Inst *in = &flow->lower->function->instructions.data[from];
+            if (restore_slot && in->code == I_STACK_RESTORE && in->a == restore_slot)
+                continue;
+            if (flow->pointer_visits[from] != visit) {
+                flow->pointer_visits[from] = visit;
+                PUSH(c, flow->pointer_work, from);
+            }
+        }
+    }
+    return false;
+}
+
+/* Sum all reachable dynamic sites, conservatively including both sides of
+   branches. Cyclic allocations may accumulate without a finite bound. */
+static void analyze_stack_usage(Lower *l)
+{
+    FunctionIR *ir = l->function;
+    InstructionWalk walk = {0};
+    const bool *reachable = reachable_instructions(l, NULL, NULL, &walk);
+    IntegerFlow sizes = {.lower = l, .walk = &walk, .reachable = reachable};
+    for (size_t i = 0; i < ir->instructions.len; i++) {
+        const Inst *in = &ir->instructions.data[i];
+        if (in->code != I_STACK_ALLOC || (!reachable[i] && !ir->function->has_nonlocal_labels))
+            continue;
+        ir->has_dynamic_stack = true;
+        if (ir->function->has_nonlocal_labels || ir->function->has_builtin_setjmp || ir->function->has_returns_twice ||
+            allocation_in_loop(&sizes, i, in->label)) {
+            ir->dynamic_stack_unbounded = true;
+            continue;
+        }
+        IntegerRange range;
+        bool known = false;
+        if (in->access_call) {
+            range = bounded_alloca_range(&sizes, in->access_call);
+            known = true;
+        } else if (in->type && in->type->runtime_size) {
+            known = access_layout_range(&sizes, in->type->runtime_size, i, &range);
+        }
+        if (!known || range.upper.hi || range.upper.lo > PTRDIFF_MAX) {
+            ir->dynamic_stack_unbounded = true;
+            continue;
+        }
+        uint64_t alignment = in->immediate > 16 ? in->immediate : 16;
+        uint64_t padding = alignment - 1;
+        if (has_stack_checkpoints(ir->function) && ir->function->has_stack_alloca)
+            padding += 16;
+        uint64_t amount = range.upper.lo;
+        if (amount > UINT64_MAX - padding || amount + padding > UINT64_MAX - ir->dynamic_stack_bound) {
+            ir->dynamic_stack_unbounded = true;
+            continue;
+        }
+        ir->dynamic_stack_bound += amount + padding;
+    }
+}
+
+static void check_stack_allocation_warnings(Lower *l)
+{
+    Context *c = l->context;
+    const bool *reachable = NULL;
+    InstructionWalk walk = {0};
+    IntegerFlow sizes = {.lower = l, .walk = &walk};
+    for (size_t i = 0; i < l->allocation_sites.len; i++) {
+        AllocationSite site = l->allocation_sites.data[i];
+        const Node *expression = site.expression;
+        if (expression->kind != N_ALLOCA)
+            continue;
+        bool alloca = warning_enabled(c, WARNING_ALLOCA, expression->loc);
+        bool large = warning_enabled(c, WARNING_ALLOCA_LARGE, expression->loc);
+        if (!alloca && !large)
+            continue;
+        if (!reachable) {
+            reachable = reachable_instructions(l, NULL, NULL, &walk);
+            sizes.reachable = reachable;
+        }
+        if (!reachable[site.instruction])
+            continue;
+        bool reported = false;
+        for (size_t j = 0; j < i; j++)
+            if (l->allocation_sites.data[j].expression == expression &&
+                reachable[l->allocation_sites.data[j].instruction]) {
+                reported = true;
+                break;
+            }
+        if (reported)
+            continue;
+        if (alloca)
+            warning_at(c, WARNING_ALLOCA, expression->loc, "use of 'alloca'");
+        if (large) {
+            uint64_t limit = c->alloca_warning_limit_set ? c->alloca_warning_limit : PTRDIFF_MAX;
+            if (limit == UINT64_MAX)
+                continue;
+            IntegerRange range = bounded_alloca_range(&sizes, expression);
+            bool zero = !wide_nonzero(range.lower) && !wide_nonzero(range.upper);
+            bool too_large = range.upper.hi || range.upper.lo > limit;
+            bool loop = false;
+            for (size_t j = i; j < l->allocation_sites.len && !loop; j++) {
+                AllocationSite other = l->allocation_sites.data[j];
+                if (other.expression == expression && reachable[other.instruction])
+                    loop = allocation_in_loop(&sizes, other.instruction, 0);
+            }
+            if (zero)
+                warning_at(c, WARNING_ALLOCA_LARGE, expression->loc, "argument to 'alloca' is zero");
+            else if (too_large)
+                warning_at(c, WARNING_ALLOCA_LARGE, expression->loc,
+                           "argument to 'alloca' may exceed %llu bytes", (unsigned long long)limit);
+            else if (loop)
+                warning_at(c, WARNING_ALLOCA_LARGE, expression->loc, "use of 'alloca' within a loop");
+        }
+    }
+    for (size_t i = 0; i < l->variable_array_sites.len; i++) {
+        VariableArraySite site = l->variable_array_sites.data[i];
+        if (!warning_enabled(c, WARNING_VLA_LARGE, site.loc))
+            continue;
+        if (!reachable) {
+            reachable = reachable_instructions(l, NULL, NULL, &walk);
+            sizes.reachable = reachable;
+        }
+        if (!reachable[site.instruction])
+            continue;
+        uint64_t limit = c->vla_warning_limit_set ? c->vla_warning_limit : PTRDIFF_MAX;
+        if (limit == UINT64_MAX)
+            continue;
+        IntegerRange range;
+        Symbol *runtime_size = site.symbol->type->runtime_size;
+        if (!runtime_size || !access_layout_range(&sizes, runtime_size, site.instruction, &range) ||
+            range.upper.hi || range.upper.lo > limit)
+            warning_at(c, WARNING_VLA_LARGE, site.loc, "variable length array '%s' may exceed %llu bytes",
+                       site.symbol->name, (unsigned long long)limit);
+    }
+}
+
 static void check_function_flow(Lower *l, bool noreturn)
 {
     Context *c = l->context;
@@ -3706,6 +4214,7 @@ static void check_function_flow(Lower *l, bool noreturn)
     AccessInitialization initialization = {0};
     IntegerFlow sizes = {.lower = l, .walk = &walk, .reachable = reachable};
     bool check_initialization = !l->function->function->has_builtin_setjmp &&
+                                !l->function->function->has_returns_twice &&
                                 !l->function->function->has_nonlocal_labels;
     bool reported_return = false;
     for (size_t i = 0; i < instructions.len; i++) {
@@ -3741,7 +4250,8 @@ static void check_function_flow(Lower *l, bool noreturn)
                 Node *address = in->access_call->list.data[clause.reference - 1];
                 sizes.argument = in->access_argument_starts[clause.reference - 1];
                 AccessRangeSource source = {.pointer_stores = access_pointer_stores, .offset = access_offset_range,
-                                            .allocation = access_allocation_range, .data = &sizes,
+                                            .allocation = access_allocation_range, .layout = access_layout_range,
+                                            .data = &sizes,
                                             .point = expression_has_effect(c, address) ? SIZE_MAX : sizes.argument};
                 check_access_argument(c, l->function->function, in->symbol, in->access_call, clause, range, source);
                 if (check_initialization)
@@ -3803,6 +4313,8 @@ bool lower(Context *c, Symbol *function, FunctionIR *output)
         resolve_nonlocal(&l);
     if (l.indirect_gotos.len)
         indirect_lifetimes(&l);
+    if (!c->failed && !c->syntax_only && (function->has_builtin_setjmp || function->has_returns_twice))
+        check_clobbered(&l);
     if (!c->failed && !c->syntax_only && function->has_switch)
         check_fallthrough(&l);
     if (!c->failed && l.has_nonnull_comparisons)
@@ -3810,5 +4322,10 @@ bool lower(Context *c, Symbol *function, FunctionIR *output)
     bool noreturn = function_noreturn(c, function);
     if (!c->failed && (noreturn || l.has_access_calls || (!c->syntax_only && l.has_call_diagnostics)))
         check_function_flow(&l, noreturn);
+    if (!c->failed && !c->syntax_only && (l.allocation_sites.len || l.variable_array_sites.len))
+        check_stack_allocation_warnings(&l);
+    if (!c->failed && !c->syntax_only && (c->stack_usage_report ||
+        warning_enabled(c, WARNING_STACK_USAGE, function->function_end_loc)))
+        analyze_stack_usage(&l);
     return !c->failed;
 }

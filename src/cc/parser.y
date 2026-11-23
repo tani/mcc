@@ -1,3 +1,7 @@
+%code top {
+/* Keep the initial parser stack bounded; Bison grows it for deep input. */
+#define YYINITDEPTH 128
+}
 %code requires {
 #include "compiler.h"
 #define YYLLOC_DEFAULT(Current, Rhs, N) do { \
@@ -54,14 +58,33 @@ static CallDiagnostics combine_call_diagnostics(Context *c, CallDiagnostics a, C
     return result;
 }
 
+static unsigned combine_markers(Context *c, unsigned previous, unsigned added, Loc loc)
+{
+    if (((previous & MARK_HOT) && (added & MARK_COLD)) ||
+        ((previous & MARK_COLD) && (added & MARK_HOT))) {
+        bool cold = (previous & MARK_HOT) != 0;
+        warning_at(c, WARNING_ATTRIBUTES, loc, "ignoring '%s' attribute because it conflicts with '%s'",
+                   cold ? "cold" : "hot", cold ? "hot" : "cold");
+        added &= ~(unsigned)(cold ? MARK_COLD : MARK_HOT);
+    }
+    return previous | added;
+}
+
 static Specs combine_specs(Context *c, Specs a, Specs b, Loc loc)
 {
     if (a.visibility && b.visibility && a.visibility != b.visibility)
         error(c, loc, "conflicting visibility attributes in declaration");
+    if (a.assumed_alignment && b.assumed_alignment &&
+        (a.assumed_alignment->alignment != b.assumed_alignment->alignment ||
+         a.assumed_alignment->offset != b.assumed_alignment->offset))
+        warning_at(c, WARNING_ATTRIBUTES, loc, "conflicting assume_aligned attributes; keeping the first");
+    if (a.allocation_alignment && b.allocation_alignment && a.allocation_alignment != b.allocation_alignment)
+        warning_at(c, WARNING_ATTRIBUTES, loc, "conflicting alloc_align attributes; keeping the first");
     return (Specs){
         .flags = a.flags | b.flags,
         .type = a.type ? a.type : b.type,
         .alias = b.alias ? b.alias : a.alias,
+        .ifunc = b.ifunc ? b.ifunc : a.ifunc,
         .cleanup = b.cleanup ? b.cleanup : a.cleanup,
         .section = b.section ? b.section : a.section,
         .deprecated = b.deprecated ? b.deprecated : a.deprecated,
@@ -72,12 +95,16 @@ static Specs combine_specs(Context *c, Specs a, Specs b, Loc loc)
         .type_attributes = combine_type_attributes(c, a.type_attributes, b.type_attributes),
         .call_diagnostics = combine_call_diagnostics(c, a.call_diagnostics, b.call_diagnostics),
         .sentinels = combine_sentinels(c, b.sentinels, a.sentinels),
+        .format_spec = combine_format_specs(c, a.format_spec, b.format_spec),
+        .format_args = combine_format_arguments(c, a.format_args, b.format_args),
         .nullability = combine_nullability(c, a.nullability, b.nullability),
         .accesses = combine_accesses(c, a.accesses, b.accesses, true),
         .constructor_priority = b.constructor_priority ? b.constructor_priority : a.constructor_priority,
         .destructor_priority = b.destructor_priority ? b.destructor_priority : a.destructor_priority,
-        .attribute_markers = a.attribute_markers | b.attribute_markers,
+        .attribute_markers = combine_markers(c, a.attribute_markers, b.attribute_markers, loc),
         .allocation = b.allocation.first ? b.allocation : a.allocation,
+        .allocation_alignment = a.allocation_alignment ? a.allocation_alignment : b.allocation_alignment,
+        .assumed_alignment = a.assumed_alignment ? a.assumed_alignment : b.assumed_alignment,
         .patchable_entries = combine_patchable_entries(c, a.patchable_entries, b.patchable_entries),
         .inherited_patchable_entries = a.type ? a.inherited_patchable_entries : b.inherited_patchable_entries,
         .has_alignas = a.has_alignas || b.has_alignas,
@@ -93,6 +120,11 @@ static Specs declarator_specs(Context *c, Specs prefix, Specs suffix, Loc loc)
     TypeAttributes attributes = prefix.type_attributes;
     prefix.type_attributes = suffix.type_attributes;
     suffix.type_attributes = attributes;
+    /* Declarator frequency attributes also take precedence over specifiers. */
+    unsigned frequency = MARK_HOT | MARK_COLD;
+    unsigned prior = prefix.attribute_markers & frequency;
+    prefix.attribute_markers = (prefix.attribute_markers & ~frequency) | (suffix.attribute_markers & frequency);
+    suffix.attribute_markers = (suffix.attribute_markers & ~frequency) | prior;
     return combine_specs(c, prefix, suffix, loc);
 }
 
@@ -113,10 +145,15 @@ static Decl *with_member_attributes(Context *c, Decl *d, Specs spec)
     d->packed_member = (spec.flags & S_PACKED) != 0;
     d->member_alignment = spec.gnu_alignment;
     d->member_alignment_attributes = spec.alignment_attributes;
-    d->member_attribute_markers = spec.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT);
+    d->member_attribute_markers = spec.attribute_markers &
+                                  (MARK_NORETURN | MARK_WARN_UNUSED_RESULT | MARK_LEAF | MARK_HOT | MARK_COLD | MARK_RETURNS_TWICE);
     d->member_type_attributes = spec.type_attributes;
     d->member_allocation = spec.allocation;
+    d->member_allocation_alignment = spec.allocation_alignment;
+    d->member_assumed_alignment = spec.assumed_alignment;
     d->member_sentinels = spec.sentinels;
+    d->member_format_spec = spec.format_spec;
+    d->member_format_args = spec.format_args;
     d->member_nullability = spec.nullability;
     d->member_accesses = spec.accesses;
     return d;
@@ -145,10 +182,6 @@ static Decl *with_member_attributes(Context *c, Decl *d, Specs spec)
     Members members;
     Decls decls;
     bool flag;
-    AsmOperand asm_operand;
-    AsmOperands asm_operands;
-    Strings strings;
-    InlineAssembly *assembly;
 }
 
 %token <token> IDENT TYPE_NAME TYPE_LABEL NUMBER_TOKEN STRING_TOKEN CHAR_TOKEN ATTRIBUTE_NAME
@@ -161,7 +194,7 @@ static Decl *with_member_attributes(Context *c, Decl *d, Specs spec)
 %token TYPEDEF EXTERN STATIC AUTO REGISTER CONST VOLATILE RESTRICT INLINE NORETURN THREAD_LOCAL
 %token ATOMIC_TYPE ATOMIC_QUALIFIER
 %token STRUCT UNION ENUM ENUM_BASE_COLON
-%token PACKED_ATTR GNU_INLINE_ATTR ALIGNED_ATTR DEFAULT_ALIGNED_ATTR WEAK_ATTR ALIAS_ATTR
+%token PACKED_ATTR GNU_INLINE_ATTR ALIGNED_ATTR DEFAULT_ALIGNED_ATTR WEAK_ATTR ALIAS_ATTR IFUNC_ATTR
 %token WEAKREF_ATTR TARGETED_WEAKREF_ATTR
 %token PACK_PRAGMA "#pragma pack"
 %token WEAK_PRAGMA "#pragma weak"
@@ -185,20 +218,20 @@ static Decl *with_member_attributes(Context *c, Decl *d, Specs spec)
 %precedence VISIBILITY_ATTR
 %precedence <token> LIFECYCLE_ATTR DEFAULT_LIFECYCLE_ATTR MARKER_ATTR
 %precedence <token> CALL_DIAGNOSTIC_ATTR
-%precedence ALLOC_SIZE_ATTR PATCHABLE_ENTRY_ATTR ACCESS_ATTR SENTINEL_ATTR DEFAULT_SENTINEL_ATTR
+%precedence ALLOC_SIZE_ATTR ALLOC_ALIGN_ATTR ASSUME_ALIGNED_ATTR PATCHABLE_ENTRY_ATTR ACCESS_ATTR SENTINEL_ATTR DEFAULT_SENTINEL_ATTR
 %precedence NONNULL_ATTR DEFAULT_NONNULL_ATTR RETURNS_NONNULL_ATTR
-%precedence CLEANUP_ATTR
+%precedence FORMAT_ATTR FORMAT_ARG_ATTR CLEANUP_ATTR
 %precedence SECTION_ATTR
 %precedence DEPRECATED_ATTR DEPRECATED_MESSAGE TRANSPARENT_UNION_ATTR DESIGNATED_INIT_ATTR
 %precedence VECTOR_SIZE_ATTR MODE_ATTR
 %precedence IF_WITHOUT_ELSE
 %precedence ELSE
 
-%type <name> name label_name tag_opt asm_name asm_operand_name
+%type <name> name label_name tag_opt asm_name
 %type <name> queried_attribute
 %type <flags> mod_flags builtin enum_scalar
 %type <specs> specs declaration_head enum_spec mods mod builtin_list extended_float alignas_spec aligned_spec pointer_quals alias_spec
-%type <specs> nested_attributes allocation_size_attribute sentinel_attribute nullability_attribute
+%type <specs> nested_attributes allocation_size_attribute sentinel_attribute nullability_attribute format_attribute format_argument_attribute
 %type <specs> cleanup_spec
 %type <specs> section_spec
 %type <specs> vector_size_spec mode_spec
@@ -225,12 +258,6 @@ static Decl *with_member_attributes(Context *c, Decl *d, Specs spec)
 %type <nodes> attribute_query_arguments
 %type <nodes> local_label_declarations local_label_list
 %type <op> assignment_op unary_op
-%type <flags> asm_qualifiers
-%type <asm_operand> asm_operand
-%type <asm_operands> asm_operands asm_operands_opt
-%type <strings> asm_clobbers asm_clobbers_opt
-%type <nodes> asm_labels
-%type <assembly> asm_outputs asm_inputs asm_clobber_section asm_sections
 
 %%
 
@@ -244,8 +271,7 @@ external:
   | function_definition
   | static_assertion
   | declaration_pragma
-  | ASM '(' string_list ')' ';' { asm_statement(c, $3, true, @1); }
-  | ASM '(' string_list asm_sections ')' ';' { extended_asm(c, $3, $4, 0, @1); }
+  | ASM { error(c, @1, "inline assembly is not supported"); YYERROR; }
   | extension_prefix external { c->extension_depth--; }
   ;
 
@@ -334,6 +360,8 @@ declarator_attributes:
   | declarator_attributes patchable_entry_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | declarator_attributes access_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | declarator_attributes sentinel_attribute { $$ = combine_specs(c, $1, $2, @2); }
+  | declarator_attributes format_attribute { $$ = combine_specs(c, $1, $2, @2); }
+  | declarator_attributes format_argument_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | declarator_attributes nullability_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | declarator_attributes deprecated_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | declarator_attributes call_diagnostic_attribute { $$ = combine_specs(c, $1, $2, @2); }
@@ -475,6 +503,8 @@ mod:
   | patchable_entry_attribute
   | access_attribute
   | sentinel_attribute
+  | format_attribute
+  | format_argument_attribute
   | nullability_attribute
   | cleanup_spec
   | deprecated_attribute
@@ -541,7 +571,16 @@ ignored_call_diagnostic:
   ;
 
 allocation_size_attribute:
-    ALLOC_SIZE_ATTR '(' conditional ')' {
+    ASSUME_ALIGNED_ATTR '(' conditional ')' {
+      $$ = (Specs){.assumed_alignment = assumed_alignment_spec(c, $3, NULL, @1)};
+    }
+  | ASSUME_ALIGNED_ATTR '(' conditional ',' conditional ')' {
+      $$ = (Specs){.assumed_alignment = assumed_alignment_spec(c, $3, $5, @1)};
+    }
+  | ALLOC_ALIGN_ATTR '(' conditional ')' {
+      $$ = (Specs){.allocation_alignment = allocation_alignment_spec(c, $3, @1)};
+    }
+  | ALLOC_SIZE_ATTR '(' conditional ')' {
       $$ = (Specs){.allocation = allocation_size_spec(c, $3, NULL, @1)};
     }
   | ALLOC_SIZE_ATTR '(' conditional ',' conditional ')' {
@@ -568,6 +607,18 @@ patchable_entry_attribute:
     }
   | PATCHABLE_ENTRY_ATTR '(' conditional ',' conditional ')' {
       $$ = (Specs){.patchable_entries = patchable_entry_spec(c, $3, $5, @1)};
+    }
+  ;
+
+format_argument_attribute:
+    FORMAT_ARG_ATTR '(' conditional ')' {
+      $$ = (Specs){.format_args = format_argument_spec(c, $3, @1)};
+    }
+  ;
+
+format_attribute:
+    FORMAT_ATTR '(' ATTRIBUTE_NAME ',' conditional ',' conditional ')' {
+      $$ = (Specs){.format_spec = format_attribute_spec(c, $3.text, $5, $7, @1)};
     }
   ;
 
@@ -603,7 +654,11 @@ marker_attribute:
       Attribute kind = attribute_kind(c, $1.text);
       unsigned marker = kind == ATTR_USED ? MARK_USED :
                         kind == ATTR_NORETURN ? MARK_NORETURN :
+                        kind == ATTR_RETURNS_TWICE ? MARK_RETURNS_TWICE :
                         kind == ATTR_NOPLT ? MARK_NOPLT :
+                        kind == ATTR_LEAF ? MARK_LEAF :
+                        kind == ATTR_HOT ? MARK_HOT :
+                        kind == ATTR_COLD ? MARK_COLD :
                         kind == ATTR_WARN_UNUSED_RESULT ? MARK_WARN_UNUSED_RESULT : MARK_NOINLINE;
       $$ = (Specs){.attribute_markers = marker};
     }
@@ -621,6 +676,7 @@ visibility_spec:
 
 alias_spec:
     ALIAS_ATTR '(' string_list ')' { $$ = (Specs){.alias = asm_string(c, $3, @1)}; }
+  | IFUNC_ATTR '(' string_list ')' { $$ = (Specs){.ifunc = asm_string(c, $3, @1)}; }
   | TARGETED_WEAKREF_ATTR '(' string_list ')' {
       $$ = (Specs){.flags = S_WEAKREF, .alias = asm_string(c, $3, @1)};
     }
@@ -747,6 +803,11 @@ record_attrs:
   | record_attrs marker_attribute {
       $$ = $1;
       warn_invalid_noplt(c, $2, NULL, @2);
+      if ($2.attribute_markers & MARK_LEAF)
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'leaf' attribute ignored");
+      if ($2.attribute_markers & (MARK_HOT | MARK_COLD))
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'%s' attribute ignored",
+                   $2.attribute_markers & MARK_HOT ? "hot" : "cold");
       $$.attribute_markers |= $2.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT);
     }
   | record_attrs cleanup_spec { $$ = combine_specs(c, $1, $2, @2); }
@@ -763,6 +824,8 @@ tag_opt:
 record:
     record_intro name {
       if ($1.visibility) warning_at(c, WARNING_ATTRIBUTES, @1, "visibility attribute ignored on type");
+      if ($1.attribute_markers & MARK_RETURNS_TWICE)
+        warning_at(c, WARNING_ATTRIBUTES, @1, "returns_twice attribute ignored on record type");
       if ($1.attribute_markers & MARK_NORETURN)
         warning_at(c, WARNING_ATTRIBUTES, @1, "noreturn attribute ignored on record type");
       if ($1.attribute_markers & MARK_WARN_UNUSED_RESULT)
@@ -777,6 +840,8 @@ record:
       access_type(c, $$, $1.accesses);
       deprecated_type(c, $$, $2, $1.deprecated, @2);
       allocation_size_type(c, $$, $1.allocation, @1);
+      allocation_alignment_type(c, $$, $1.allocation_alignment, @1);
+      $$ = assumed_alignment_type(c, $$, $1.assumed_alignment, @1);
       if ($1.flags & S_PACKED) record_attributes(c, $$, true, 0, 0, @1);
       if ($1.transparent_union)
         $$ = transparent_union_type(c, $$, true, @1);
@@ -793,6 +858,8 @@ record:
       nullability_type(c, $$, attrs.nullability, loc);
       access_type(c, $$, attrs.accesses);
       if (attrs.visibility) warning_at(c, WARNING_ATTRIBUTES, loc, "visibility attribute ignored on type");
+      if (attrs.attribute_markers & MARK_RETURNS_TWICE)
+        warning_at(c, WARNING_ATTRIBUTES, loc, "returns_twice attribute ignored on record type");
       if (attrs.attribute_markers & MARK_NORETURN)
         warning_at(c, WARNING_ATTRIBUTES, loc, "noreturn attribute ignored on record type");
       if (attrs.attribute_markers & MARK_WARN_UNUSED_RESULT)
@@ -802,6 +869,8 @@ record:
       if (attrs.section) warning_at(c, WARNING_ATTRIBUTES, loc, "section attribute ignored on type");
       if (attrs.type_attributes.len) error(c, loc, "numeric type attribute cannot be applied to a structure or union type");
       allocation_size_type(c, $$, attrs.allocation, loc);
+      allocation_alignment_type(c, $$, attrs.allocation_alignment, loc);
+      $$ = assumed_alignment_type(c, $$, attrs.assumed_alignment, loc);
       if ((attrs.flags & S_PACKED) || attrs.gnu_alignment)
         record_attributes(c, $$, (attrs.flags & S_PACKED) != 0, attrs.gnu_alignment,
                           attrs.alignment_attributes, loc);
@@ -880,7 +949,14 @@ enum_keyword:
   | enum_keyword aligned_spec { $$ = $1; }
   | enum_keyword visibility_spec { $$ = $1; warning_at(c, WARNING_ATTRIBUTES, @2, "visibility attribute ignored on type"); }
   | enum_keyword lifecycle_attribute { $$ = $1; warn_lifecycle_attributes(c, $2, @2); }
-  | enum_keyword marker_attribute { $$ = $1; warn_invalid_noplt(c, $2, NULL, @2); }
+  | enum_keyword marker_attribute {
+      $$ = $1; warn_invalid_noplt(c, $2, NULL, @2);
+      if ($2.attribute_markers & MARK_LEAF)
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'leaf' attribute ignored");
+      if ($2.attribute_markers & (MARK_HOT | MARK_COLD))
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'%s' attribute ignored",
+                   $2.attribute_markers & MARK_HOT ? "hot" : "cold");
+    }
   | enum_keyword patchable_entry_attribute { $$ = $1; }
   | enum_keyword deprecated_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | enum_keyword ignored_call_diagnostic { $$ = $1; }
@@ -900,6 +976,8 @@ enum_keyword:
   | enum_keyword allocation_size_attribute {
       $$ = $1;
       if ($2.allocation.first) warning(c, @2, "alloc_size applies to function types only");
+      if ($2.allocation_alignment) warning(c, @2, "alloc_align applies to function types only");
+      if ($2.assumed_alignment) warning(c, @2, "assume_aligned applies to function types only");
     }
   ;
 
@@ -910,7 +988,14 @@ enum_attributes:
   | enum_attributes aligned_spec { $$ = $1; }
   | enum_attributes visibility_spec { $$ = $1; warning_at(c, WARNING_ATTRIBUTES, @2, "visibility attribute ignored on type"); }
   | enum_attributes lifecycle_attribute { $$ = $1; warn_lifecycle_attributes(c, $2, @2); }
-  | enum_attributes marker_attribute { $$ = $1; warn_invalid_noplt(c, $2, NULL, @2); }
+  | enum_attributes marker_attribute {
+      $$ = $1; warn_invalid_noplt(c, $2, NULL, @2);
+      if ($2.attribute_markers & MARK_LEAF)
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'leaf' attribute ignored");
+      if ($2.attribute_markers & (MARK_HOT | MARK_COLD))
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'%s' attribute ignored",
+                   $2.attribute_markers & MARK_HOT ? "hot" : "cold");
+    }
   | enum_attributes patchable_entry_attribute { $$ = $1; }
   | enum_attributes deprecated_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | enum_attributes ignored_call_diagnostic { $$ = $1; }
@@ -930,6 +1015,8 @@ enum_attributes:
   | enum_attributes allocation_size_attribute {
       $$ = $1;
       if ($2.allocation.first) warning(c, @2, "alloc_size applies to function types only");
+      if ($2.allocation_alignment) warning(c, @2, "alloc_align applies to function types only");
+      if ($2.assumed_alignment) warning(c, @2, "assume_aligned applies to function types only");
     }
   ;
 
@@ -986,7 +1073,14 @@ enumerator_attrs:
   | enumerator_attrs ignored_sentinel { $$ = $1; }
   | enumerator_attrs ignored_nullability { $$ = $1; }
   | enumerator_attrs ignored_access { $$ = $1; }
-  | enumerator_attrs marker_attribute { $$ = $1; warn_invalid_noplt(c, $2, NULL, @2); }
+  | enumerator_attrs marker_attribute {
+      $$ = $1; warn_invalid_noplt(c, $2, NULL, @2);
+      if ($2.attribute_markers & MARK_LEAF)
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'leaf' attribute ignored");
+      if ($2.attribute_markers & (MARK_HOT | MARK_COLD))
+        warning_at(c, WARNING_ATTRIBUTES, @2, "'%s' attribute ignored",
+                   $2.attribute_markers & MARK_HOT ? "hot" : "cold");
+    }
   | enumerator_attrs patchable_entry_attribute { $$ = $1; }
   ;
 
@@ -995,9 +1089,14 @@ pointers:
       $$ = decl(c, D_POINTER, NULL, @1);
       $$->qualifiers = $2.flags;
       $$->alignment = $2.gnu_alignment;
-      $$->attribute_markers = $2.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT | MARK_NOPLT);
+      $$->allocation = $2.allocation;
+      $$->allocation_alignment = $2.allocation_alignment;
+      $$->assumed_alignment = $2.assumed_alignment;
+      $$->attribute_markers = $2.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT | MARK_NOPLT | MARK_RETURNS_TWICE);
       $$->patchable_entries = $2.patchable_entries;
       $$->sentinels = $2.sentinels;
+      $$->format_spec = $2.format_spec;
+      $$->format_args = $2.format_args;
       $$->nullability = $2.nullability;
       $$->accesses = $2.accesses;
       $$->cleanup = $2.cleanup;
@@ -1007,9 +1106,14 @@ pointers:
       $$ = decl(c, D_POINTER, $3, @1);
       $$->qualifiers = $2.flags;
       $$->alignment = $2.gnu_alignment;
-      $$->attribute_markers = $2.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT | MARK_NOPLT);
+      $$->allocation = $2.allocation;
+      $$->allocation_alignment = $2.allocation_alignment;
+      $$->assumed_alignment = $2.assumed_alignment;
+      $$->attribute_markers = $2.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT | MARK_NOPLT | MARK_RETURNS_TWICE);
       $$->patchable_entries = $2.patchable_entries;
       $$->sentinels = $2.sentinels;
+      $$->format_spec = $2.format_spec;
+      $$->format_args = $2.format_args;
       $$->nullability = $2.nullability;
       $$->accesses = $2.accesses;
       $$->cleanup = $2.cleanup;
@@ -1026,16 +1130,20 @@ pointer_quals:
         $$.gnu_alignment = $2.gnu_alignment;
     }
   | pointer_quals cleanup_spec { $$ = combine_specs(c, $1, $2, @2); }
+  | pointer_quals allocation_size_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | pointer_quals mode_spec { $$ = combine_specs(c, $1, $2, @2); }
   | pointer_quals vector_size_spec { $$ = combine_specs(c, $1, $2, @2); }
   | pointer_quals ignored_call_diagnostic { $$ = $1; }
   | pointer_quals patchable_entry_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | pointer_quals sentinel_attribute { $$ = combine_specs(c, $1, $2, @2); }
+  | pointer_quals format_attribute { $$ = combine_specs(c, $1, $2, @2); }
+  | pointer_quals format_argument_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | pointer_quals nullability_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | pointer_quals access_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | pointer_quals marker_attribute {
       $$ = $1;
-      $$.attribute_markers |= $2.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT | MARK_NOPLT);
+      $$.attribute_markers = combine_markers(c, $1.attribute_markers,
+          $2.attribute_markers & (MARK_NORETURN | MARK_WARN_UNUSED_RESULT | MARK_NOPLT | MARK_LEAF | MARK_HOT | MARK_COLD | MARK_RETURNS_TWICE), @2);
     }
   ;
 
@@ -1068,12 +1176,16 @@ direct_declarator:
       $$ = decl(c, D_ALIGNED, $3, @2);
       $$->alignment = $2.gnu_alignment;
       $$->allocation = $2.allocation;
+      $$->allocation_alignment = $2.allocation_alignment;
+      $$->assumed_alignment = $2.assumed_alignment;
       $$->sentinels = $2.sentinels;
+      $$->format_spec = $2.format_spec;
+      $$->format_args = $2.format_args;
       $$->nullability = $2.nullability;
       $$->accesses = $2.accesses;
       $$->cleanup = $2.cleanup;
       $$->type_attributes = $2.type_attributes;
-      $$->attribute_markers = $2.attribute_markers & (MARK_WARN_UNUSED_RESULT | MARK_NOPLT);
+      $$->attribute_markers = $2.attribute_markers & (MARK_WARN_UNUSED_RESULT | MARK_NOPLT | MARK_LEAF | MARK_HOT | MARK_COLD | MARK_RETURNS_TWICE);
       $$->patchable_entries = $2.patchable_entries;
     }
   | direct_declarator brackets { $$ = $2; $$->inner = $1; }
@@ -1085,6 +1197,8 @@ nested_attributes:
   | allocation_size_attribute
   | patchable_entry_attribute
   | sentinel_attribute
+  | format_attribute
+  | format_argument_attribute
   | nullability_attribute
   | access_attribute
   | cleanup_spec
@@ -1099,6 +1213,8 @@ nested_attributes:
   | nested_attributes allocation_size_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | nested_attributes patchable_entry_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | nested_attributes sentinel_attribute { $$ = combine_specs(c, $1, $2, @2); }
+  | nested_attributes format_attribute { $$ = combine_specs(c, $1, $2, @2); }
+  | nested_attributes format_argument_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | nested_attributes nullability_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | nested_attributes access_attribute { $$ = combine_specs(c, $1, $2, @2); }
   | nested_attributes cleanup_spec { $$ = combine_specs(c, $1, $2, @2); }
@@ -1106,7 +1222,8 @@ nested_attributes:
   | nested_attributes vector_size_spec { $$ = combine_specs(c, $1, $2, @2); }
   | nested_attributes marker_attribute {
       $$ = $1;
-      $$.attribute_markers |= $2.attribute_markers & (MARK_WARN_UNUSED_RESULT | MARK_NOPLT);
+      $$.attribute_markers = combine_markers(c, $1.attribute_markers,
+          $2.attribute_markers & (MARK_WARN_UNUSED_RESULT | MARK_NOPLT | MARK_LEAF | MARK_HOT | MARK_COLD | MARK_RETURNS_TWICE), @2);
     }
   | nested_attributes ignored_call_diagnostic { $$ = $1; }
   ;
@@ -1172,7 +1289,11 @@ direct_abstract:
       $$ = decl(c, D_ALIGNED, $3, @2);
       $$->alignment = $2.gnu_alignment;
       $$->allocation = $2.allocation;
+      $$->allocation_alignment = $2.allocation_alignment;
+      $$->assumed_alignment = $2.assumed_alignment;
       $$->sentinels = $2.sentinels;
+      $$->format_spec = $2.format_spec;
+      $$->format_args = $2.format_args;
       $$->nullability = $2.nullability;
       $$->accesses = $2.accesses;
       $$->cleanup = $2.cleanup;
@@ -1218,13 +1339,16 @@ type_name:
       if ($1.cleanup) warning_at(c, WARNING_ATTRIBUTES, @1, "cleanup attribute ignored on type");
       $$ = declaration_type(c, $1, $2, @1);
       $$ = allocation_size_type(c, $$, $1.allocation, @1);
+      $$ = allocation_alignment_type(c, $$, $1.allocation_alignment, @1);
+      $$ = assumed_alignment_type(c, $$, $1.assumed_alignment, @1);
       $$ = aligned_type(c, $$, $1.gnu_alignment);
     }
   ;
 
 compound:
-    '{' { if (c->function_body) c->function_body = false; else enter_scope(c); }
+    '{' { $<flag>$ = c->function_body; if (c->function_body) c->function_body = false; else enter_scope(c); }
     local_label_declarations block_items '}' {
+      if ($<flag>2) c->function->function_end_loc = @5;
       Nodes items = $3;
       if (items.len) {
         for (size_t i = 0; i < $4.len; i++)
@@ -1311,85 +1435,8 @@ statement_body:
   | CONTINUE ';' { $$ = node(c, N_CONTINUE, @1, NULL, NULL); }
   | GOTO name ';' { $$ = labeled_statement(c, $2, NULL, false, @2); }
   | GOTO '*' expression ';' { $$ = indirect_goto(c, $3, @1); }
-  | ASM asm_qualifiers '(' string_list ')' ';' {
-      if ($2 & ASM_GOTO) error(c, @1, "asm goto requires a list of destination labels");
-      $$ = asm_statement(c, $4, false, @1);
-    }
-  | ASM asm_qualifiers '(' string_list asm_sections ')' ';' {
-      $$ = extended_asm(c, $4, $5, $2, @1);
-    }
+  | ASM { error(c, @1, "inline assembly is not supported"); YYERROR; }
   | label_name ':' statement { $$ = labeled_statement(c, $1, $3, true, @1); }
-  ;
-
-asm_qualifiers:
-    %empty { $$ = 0; }
-  | asm_qualifiers VOLATILE { $$ = $1 | ASM_VOLATILE; }
-  | asm_qualifiers INLINE { $$ = $1 | ASM_INLINE; }
-  | asm_qualifiers GOTO { $$ = $1 | ASM_GOTO; }
-  ;
-
-asm_sections:
-    asm_outputs
-  | asm_inputs
-  | asm_clobber_section
-  | asm_clobber_section ':' asm_labels { $$ = $1; $$->labels = $3; }
-  ;
-
-asm_outputs:
-    ':' asm_operands_opt {
-      $$ = alloc(c, sizeof *$$);
-      $$->operands = $2;
-      $$->outputs = $2.len;
-    }
-  ;
-
-asm_inputs:
-    asm_outputs ':' asm_operands_opt {
-      $$ = $1;
-      for (size_t i = 0; i < $3.len; i++)
-        PUSH(c, $$->operands, $3.data[i]);
-    }
-  ;
-
-asm_clobber_section:
-    asm_inputs ':' asm_clobbers_opt { $$ = $1; $$->clobbers = $3; }
-  ;
-
-asm_operand_name:
-    %empty { $$ = NULL; }
-  | '[' name ']' { $$ = $2; }
-  ;
-
-asm_operand:
-    asm_operand_name string_list '(' expression ')' {
-      $$ = (AsmOperand){.name = $1, .constraint = asm_string(c, $2, @2), .expression = $4,
-                        .loc = @2};
-    }
-  ;
-
-asm_operands_opt:
-    %empty { $$ = (AsmOperands){0}; }
-  | asm_operands
-  ;
-
-asm_operands:
-    asm_operand { $$ = (AsmOperands){0}; PUSH(c, $$, $1); }
-  | asm_operands ',' asm_operand { $$ = $1; PUSH(c, $$, $3); }
-  ;
-
-asm_clobbers_opt:
-    %empty { $$ = (Strings){0}; }
-  | asm_clobbers
-  ;
-
-asm_clobbers:
-    string_list { $$ = (Strings){0}; PUSH(c, $$, asm_string(c, $1, @1)); }
-  | asm_clobbers ',' string_list { $$ = $1; PUSH(c, $$, asm_string(c, $3, @3)); }
-  ;
-
-asm_labels:
-    name { $$ = (Nodes){0}; PUSH(c, $$, asm_goto_label(c, $1, @1)); }
-  | asm_labels ',' name { $$ = $1; PUSH(c, $$, asm_goto_label(c, $3, @3)); }
   ;
 
 expression_opt:
@@ -1591,12 +1638,12 @@ queried_attribute:
     name {
       $$ = $1;
       Attribute kind = attribute_kind(c, $1);
-      if (kind == ATTR_MODE || kind == ATTR_ACCESS) {
+      if (kind == ATTR_MODE || kind == ATTR_ACCESS || kind == ATTR_FORMAT) {
         size_t i = c->current;
         if (i && equal(c->tokens.data[i - 1].text, "("))
           i--;
         if (i + 2 < c->tokens.len && equal(c->tokens.data[i].text, "(") &&
-            c->tokens.data[i + 1].kind == WORD && (kind == ATTR_ACCESS || equal(c->tokens.data[i + 2].text, ")")))
+            c->tokens.data[i + 1].kind == WORD && (kind == ATTR_ACCESS || kind == ATTR_FORMAT || equal(c->tokens.data[i + 2].text, ")")))
           c->tokens.data[i + 1].kind = ATTRIBUTE_IDENTIFIER;
       }
     }
@@ -1762,16 +1809,16 @@ static bool attributes(Context *c, Loc loc, bool bracketed)
             warning_at(c, WARNING_ATTRIBUTES, attr.loc, "stdcall is ignored on %s", c->target->display_name);
         bool lifecycle = kind == ATTR_CONSTRUCTOR || kind == ATTR_DESTRUCTOR;
         bool call_diagnostic = kind == ATTR_ERROR || kind == ATTR_WARNING;
-        if (kind == ATTR_ALIGNED || kind == ATTR_ALIAS || kind == ATTR_WEAKREF || kind == ATTR_VISIBILITY ||
-            kind == ATTR_ALLOC_SIZE || kind == ATTR_PATCHABLE_FUNCTION_ENTRY || kind == ATTR_ACCESS ||
+        if (kind == ATTR_ALIGNED || kind == ATTR_ALIAS || kind == ATTR_IFUNC || kind == ATTR_WEAKREF || kind == ATTR_VISIBILITY ||
+            kind == ATTR_ALLOC_SIZE || kind == ATTR_ALLOC_ALIGN || kind == ATTR_ASSUME_ALIGNED || kind == ATTR_PATCHABLE_FUNCTION_ENTRY || kind == ATTR_ACCESS || kind == ATTR_FORMAT || kind == ATTR_FORMAT_ARG ||
             kind == ATTR_SENTINEL || kind == ATTR_NONNULL ||
             kind == ATTR_CLEANUP || kind == ATTR_SECTION ||
             kind == ATTR_VECTOR_SIZE || kind == ATTR_MODE || kind == ATTR_DEPRECATED || lifecycle ||
             call_diagnostic) {
             attr.kind = ATTRIBUTE;
             if (!arguments || next_token(c, ")")) {
-                if (kind == ATTR_ALIAS || kind == ATTR_VISIBILITY || kind == ATTR_ALLOC_SIZE ||
-                    kind == ATTR_PATCHABLE_FUNCTION_ENTRY || kind == ATTR_ACCESS ||
+                if (kind == ATTR_ALIAS || kind == ATTR_IFUNC || kind == ATTR_VISIBILITY || kind == ATTR_ALLOC_SIZE || kind == ATTR_ALLOC_ALIGN || kind == ATTR_ASSUME_ALIGNED ||
+                    kind == ATTR_PATCHABLE_FUNCTION_ENTRY || kind == ATTR_ACCESS || kind == ATTR_FORMAT || kind == ATTR_FORMAT_ARG ||
                     kind == ATTR_CLEANUP || kind == ATTR_SECTION || kind == ATTR_VECTOR_SIZE ||
                     kind == ATTR_MODE || call_diagnostic) {
                     error(c, attr.loc, "%s attribute requires an argument", name);
@@ -1796,7 +1843,7 @@ static bool attributes(Context *c, Loc loc, bool bracketed)
                     attr.kind = WEAKREF_ARGUMENT;
                 if (kind == ATTR_DEPRECATED)
                     attr.kind = DEPRECATION_ARGUMENT;
-                if ((kind == ATTR_ACCESS || (kind == ATTR_MODE && c->current - first == 3)) &&
+                if ((kind == ATTR_ACCESS || kind == ATTR_FORMAT || (kind == ATTR_MODE && c->current - first == 3)) &&
                     c->tokens.data[first + 1].kind == WORD)
                     c->tokens.data[first + 1].kind = ATTRIBUTE_IDENTIFIER;
                 if (call_diagnostic) {
@@ -1813,13 +1860,15 @@ static bool attributes(Context *c, Loc loc, bool bracketed)
                 output += count;
             }
         } else if (arguments && !((kind == ATTR_NORETURN || kind == ATTR_WARN_UNUSED_RESULT ||
-                                    kind == ATTR_RETURNS_NONNULL || kind == ATTR_NOPLT) &&
+                                    kind == ATTR_RETURNS_NONNULL || kind == ATTR_RETURNS_TWICE || kind == ATTR_NOPLT || kind == ATTR_LEAF ||
+                                    kind == ATTR_HOT || kind == ATTR_COLD) &&
                                   next_token(c, ")"))) {
             error(c, attr.loc, "attribute '%s' does not take arguments", attr.text);
             return false;
         } else if (kind == ATTR_PACKED || kind == ATTR_GNU_INLINE || kind == ATTR_WEAK ||
                    kind == ATTR_NOINLINE || kind == ATTR_USED || kind == ATTR_NORETURN ||
-                   kind == ATTR_WARN_UNUSED_RESULT || kind == ATTR_RETURNS_NONNULL || kind == ATTR_NOPLT ||
+                   kind == ATTR_WARN_UNUSED_RESULT || kind == ATTR_RETURNS_NONNULL || kind == ATTR_RETURNS_TWICE || kind == ATTR_NOPLT ||
+                   kind == ATTR_LEAF || kind == ATTR_HOT || kind == ATTR_COLD ||
                    kind == ATTR_TRANSPARENT_UNION || kind == ATTR_DESIGNATED_INIT) {
             attr.kind = ATTRIBUTE;
             c->tokens.data[output++] = attr;
@@ -1902,13 +1951,19 @@ static int read_token(YYSTYPE *value, Loc *loc, Context *c)
         switch (kind) {
         case ATTR_PACKED: return PACKED_ATTR;
         case ATTR_NOINLINE: case ATTR_USED: case ATTR_NORETURN: case ATTR_WARN_UNUSED_RESULT: case ATTR_NOPLT:
+        case ATTR_LEAF: case ATTR_HOT: case ATTR_COLD: case ATTR_RETURNS_TWICE:
             return MARKER_ATTR;
         case ATTR_GNU_INLINE: return GNU_INLINE_ATTR;
         case ATTR_WEAK: return WEAK_ATTR;
         case ATTR_WEAKREF: return WEAKREF_ATTR;
         case ATTR_ALIAS: return ALIAS_ATTR;
+        case ATTR_IFUNC: return IFUNC_ATTR;
+        case ATTR_FORMAT: return FORMAT_ATTR;
+        case ATTR_FORMAT_ARG: return FORMAT_ARG_ATTR;
         case ATTR_VISIBILITY: return VISIBILITY_ATTR;
         case ATTR_ALLOC_SIZE: return ALLOC_SIZE_ATTR;
+        case ATTR_ALLOC_ALIGN: return ALLOC_ALIGN_ATTR;
+        case ATTR_ASSUME_ALIGNED: return ASSUME_ALIGNED_ATTR;
         case ATTR_PATCHABLE_FUNCTION_ENTRY: return PATCHABLE_ENTRY_ATTR;
         case ATTR_ACCESS: return ACCESS_ATTR;
         case ATTR_SENTINEL: return SENTINEL_ATTR;

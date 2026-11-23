@@ -3,7 +3,7 @@
 #include "integer_bits.h"
 #include "integer_overflow.h"
 #include "int128_float.h"
-#include "inline_asm.h"
+#include "register.h"
 #include "complex_ops.h"
 #include "quad.h"
 
@@ -707,6 +707,159 @@ Type *access_type(Context *c, Type *t, const AccessClauses *clauses)
     return with_function_type(c, t, annotated);
 }
 
+const ParameterIndices *combine_format_arguments(Context *c, const ParameterIndices *a, const ParameterIndices *b)
+{
+    if (!a) return b;
+    if (!b || a == b) return a;
+    ParameterIndices *merged = alloc(c, sizeof *merged);
+    for (size_t i = 0; i < a->len; i++) PUSH(c, *merged, a->data[i]);
+    for (size_t i = 0; i < b->len; i++) {
+        bool found = false;
+        for (size_t j = 0; j < merged->len; j++)
+            if (merged->data[j] == b->data[i]) found = true;
+        if (!found) PUSH(c, *merged, b->data[i]);
+    }
+    return merged;
+}
+
+static bool same_format_arguments(const ParameterIndices *a, const ParameterIndices *b)
+{
+    if (a == b) return true;
+    if (!a || !b || a->len != b->len) return false;
+    for (size_t i = 0; i < a->len; i++) {
+        bool found = false;
+        for (size_t j = 0; j < b->len; j++)
+            if (a->data[i] == b->data[j]) found = true;
+        if (!found) return false;
+    }
+    return true;
+}
+
+static bool format_string_type(Type *t)
+{
+    return t->kind == TY_PTR && t->base->kind == TY_INT && t->base->plain_char;
+}
+
+Type *format_argument_type(Context *c, Type *t, const ParameterIndices *indices, Loc loc)
+{
+    if (!indices) return t;
+    Type *fn = t->kind == TY_PTR ? t->base : t;
+    if (fn->kind != TY_FUNC || !fn->prototype) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "format_arg requires a function prototype");
+        return t;
+    }
+    if (!format_string_type(fn->base)) {
+        error(c, loc, "format_arg requires a function returning a character pointer");
+        return t;
+    }
+    ParameterIndices valid = {0};
+    for (size_t i = 0; i < indices->len; i++) {
+        unsigned index = indices->data[i];
+        if (!index || index > fn->members.len) {
+            warning_at(c, WARNING_ATTRIBUTES, loc, "format_arg index is outside the parameter list");
+        } else if (!format_string_type(fn->members.data[index - 1].type)) {
+            error(c, loc, "format_arg parameter must be a character pointer");
+        } else {
+            PUSH(c, valid, index);
+        }
+    }
+    if (!valid.len) return t;
+    const ParameterIndices *merged = combine_format_arguments(c, fn->format_args, &valid);
+    if (same_format_arguments(fn->format_args, merged)) return t;
+    ParameterIndices *saved = alloc(c, sizeof *saved);
+    *saved = *merged;
+    Type *annotated = alloc(c, sizeof *annotated);
+    *annotated = *fn;
+    annotated->format_args = saved;
+    return with_function_type(c, t, annotated);
+}
+
+static bool format_spec_equal(const FormatSpec *a, const FormatSpec *b)
+{
+    return equal(a->style, b->style) && a->index == b->index && a->first == b->first;
+}
+
+static bool format_spec_contains(const FormatSpec *list, const FormatSpec *spec)
+{
+    for (; list; list = list->next)
+        if (format_spec_equal(list, spec)) return true;
+    return false;
+}
+
+static bool same_format_specs(const FormatSpec *a, const FormatSpec *b)
+{
+    for (const FormatSpec *p = a; p; p = p->next)
+        if (!format_spec_contains(b, p)) return false;
+    for (const FormatSpec *p = b; p; p = p->next)
+        if (!format_spec_contains(a, p)) return false;
+    return true;
+}
+
+const FormatSpec *combine_format_specs(Context *c, const FormatSpec *a, const FormatSpec *b)
+{
+    if (!a) return b;
+    if (!b || a == b) return a;
+    const FormatSpec *pending = NULL;
+    for (const FormatSpec *p = b; p; p = p->next) {
+        if (format_spec_contains(a, p) || format_spec_contains(pending, p)) continue;
+        FormatSpec *copy = alloc(c, sizeof *copy);
+        *copy = *p;
+        copy->next = pending;
+        pending = copy;
+    }
+    const FormatSpec *result = a;
+    for (const FormatSpec *p = pending; p; p = p->next) {
+        FormatSpec *copy = alloc(c, sizeof *copy);
+        *copy = *p;
+        copy->next = result;
+        result = copy;
+    }
+    return result;
+}
+
+Type *format_attribute_type(Context *c, Type *t, const FormatSpec *spec)
+{
+    if (!spec) return t;
+    Type *fn = t->kind == TY_PTR ? t->base : t;
+    if (fn->kind != TY_FUNC || !fn->prototype) {
+        warning_at(c, WARNING_ATTRIBUTES, spec->loc, "format attribute requires a function prototype");
+        return t;
+    }
+    FormatSpec *added = NULL, *last = NULL;
+    for (const FormatSpec *p = spec; p; p = p->next) {
+        if (!p->index || p->index > fn->members.len) {
+            warning_at(c, WARNING_ATTRIBUTES, p->loc, "format string argument is outside the parameter list");
+            continue;
+        }
+        if (!format_string_type(fn->members.data[p->index - 1].type)) {
+            error(c, p->loc, "format string argument must be a character pointer");
+            continue;
+        }
+        if (p->first && (equal(p->style, "strftime") || equal(p->style, "gnu_strftime"))) {
+            error(c, p->loc, "strftime formats cannot format arguments");
+            continue;
+        }
+        if (p->first && (!fn->variadic || p->first != fn->members.len + 1)) {
+            error(c, p->loc, "format arguments must start at the variadic parameter");
+            continue;
+        }
+        if (!format_spec_contains(fn->format_spec, p) && !format_spec_contains(added, p)) {
+            FormatSpec *copy = alloc(c, sizeof *copy);
+            *copy = *p;
+            copy->next = NULL;
+            if (last) last->next = copy;
+            else added = copy;
+            last = copy;
+        }
+    }
+    const FormatSpec *valid = combine_format_specs(c, fn->format_spec, added);
+    if (same_format_specs(valid, fn->format_spec)) return t;
+    Type *annotated = alloc(c, sizeof *annotated);
+    *annotated = *fn;
+    annotated->format_spec = valid;
+    return with_function_type(c, t, annotated);
+}
+
 Type *sentinel_type(Context *c, Type *t, Sentinels sentinels, Loc loc)
 {
     if (!sentinels.len)
@@ -756,6 +909,71 @@ Type *allocation_size_type(Context *c, Type *t, AllocationSize allocation, Loc l
     Type *annotated = alloc(c, sizeof *annotated);
     *annotated = *fn;
     annotated->allocation = allocation;
+    return with_function_type(c, t, annotated);
+}
+
+const AssumedAlignment *assumed_alignment_spec(Context *c, Node *first, Node *second, Loc loc)
+{
+    uint64_t alignment, offset = 0;
+    if (!constant_int(c, first, &alignment) || !alignment || (alignment & (alignment - 1)) ||
+        (second && (!constant_int(c, second, &offset) || (int64_t)offset < 0))) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "assume_aligned requires a power-of-two alignment and nonnegative constant offset");
+        return NULL;
+    }
+    AssumedAlignment *result = alloc(c, sizeof *result);
+    *result = (AssumedAlignment){alignment, offset};
+    return result;
+}
+
+static bool same_assumed_alignment(const AssumedAlignment *a, const AssumedAlignment *b)
+{
+    return a == b || (a && b && a->alignment == b->alignment && a->offset == b->offset);
+}
+
+Type *assumed_alignment_type(Context *c, Type *t, const AssumedAlignment *value, Loc loc)
+{
+    if (!value) return t;
+    Type *fn = t->kind == TY_PTR ? t->base : t;
+    if (fn->kind != TY_FUNC || fn->base->kind != TY_PTR) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "assume_aligned requires a function returning a pointer");
+        return t;
+    }
+    if (fn->assumed_alignment) {
+        if (!same_assumed_alignment(fn->assumed_alignment, value))
+            warning_at(c, WARNING_ATTRIBUTES, loc, "conflicting assume_aligned attributes; keeping the first");
+        return t;
+    }
+    Type *annotated = alloc(c, sizeof *annotated);
+    *annotated = *fn;
+    annotated->assumed_alignment = value;
+    return with_function_type(c, t, annotated);
+}
+
+Type *allocation_alignment_type(Context *c, Type *t, unsigned position, Loc loc)
+{
+    if (!position)
+        return t;
+    Type *fn = t->kind == TY_PTR ? t->base : t;
+    if (fn->kind != TY_FUNC || fn->base->kind != TY_PTR) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "alloc_align requires a function type returning a pointer");
+        return t;
+    }
+    if (fn->prototype && position > fn->members.len) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "alloc_align argument %u exceeds the number of parameters", position);
+        return t;
+    }
+    if (position <= fn->members.len && !integer_type(fn->members.data[position - 1].type)) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "alloc_align argument %u requires an integer parameter", position);
+        return t;
+    }
+    if (fn->allocation_alignment) {
+        if (fn->allocation_alignment != position)
+            warning_at(c, WARNING_ATTRIBUTES, loc, "conflicting alloc_align attributes; keeping the first");
+        return t;
+    }
+    Type *annotated = alloc(c, sizeof *annotated);
+    *annotated = *fn;
+    annotated->allocation_alignment = position;
     return with_function_type(c, t, annotated);
 }
 
@@ -809,6 +1027,10 @@ static Type *composite_type(Context *c, Type *a, Type *b, bool expression)
         Type *result = alloc(c, sizeof *result);
         *result = *signature;
         result->warn_unused_result = a->warn_unused_result || b->warn_unused_result;
+        result->format_args = expression && !same_format_arguments(a->format_args, b->format_args) ? NULL :
+                              combine_format_arguments(c, a->format_args, b->format_args);
+        result->format_spec = expression && !same_format_specs(a->format_spec, b->format_spec) ? NULL :
+                              combine_format_specs(c, a->format_spec, b->format_spec);
         result->nullability = combine_nullability(c, a->nullability, b->nullability);
         result->accesses = expression ? combine_accesses(c, a->accesses, b->accesses, false) :
                                         combine_accesses(c, b->accesses, a->accesses, true);
@@ -821,6 +1043,12 @@ static Type *composite_type(Context *c, Type *a, Type *b, bool expression)
             result->allocation = (AllocationSize){0};
         else
             result->allocation = a->allocation.first ? a->allocation : b->allocation;
+        result->assumed_alignment = expression ?
+            (same_assumed_alignment(a->assumed_alignment, b->assumed_alignment) ? a->assumed_alignment : NULL) :
+            (b->assumed_alignment ? b->assumed_alignment : a->assumed_alignment);
+        result->allocation_alignment = expression ?
+            (a->allocation_alignment == b->allocation_alignment ? a->allocation_alignment : 0) :
+            (b->allocation_alignment ? b->allocation_alignment : a->allocation_alignment);
         result->base = composite_type(c, a->base, b->base, expression);
         if (a->prototype && b->prototype) {
             result->members = (Members){0};
@@ -1097,7 +1325,11 @@ Type *apply_decl(Context *c, Type *base, Decl *d)
         base = apply_type_attributes(c, base, d->type_attributes);
         t = aligned_type(c, base, d->alignment);
         t = allocation_size_type(c, t, d->allocation, d->loc);
+        t = allocation_alignment_type(c, t, d->allocation_alignment, d->loc);
+        t = assumed_alignment_type(c, t, d->assumed_alignment, d->loc);
         t = sentinel_type(c, t, d->sentinels, d->loc);
+        t = format_attribute_type(c, t, d->format_spec);
+        t = format_argument_type(c, t, d->format_args, d->loc);
         t = nullability_type(c, t, d->nullability, d->loc);
         t = access_type(c, t, d->accesses);
         if (d->attribute_markers & MARK_WARN_UNUSED_RESULT)
@@ -1109,7 +1341,12 @@ Type *apply_decl(Context *c, Type *base, Decl *d)
         set_qualifiers(t, d->qualifiers);
         check_restrict(c, t, t->qualifiers, d->loc);
         t = aligned_type(c, t, d->alignment);
+        t = allocation_size_type(c, t, d->allocation, d->loc);
+        t = allocation_alignment_type(c, t, d->allocation_alignment, d->loc);
+        t = assumed_alignment_type(c, t, d->assumed_alignment, d->loc);
         t = sentinel_type(c, t, d->sentinels, d->loc);
+        t = format_attribute_type(c, t, d->format_spec);
+        t = format_argument_type(c, t, d->format_args, d->loc);
         t = nullability_type(c, t, d->nullability, d->loc);
         t = access_type(c, t, d->accesses);
         if (d->attribute_markers & MARK_NORETURN) {
@@ -1126,6 +1363,8 @@ Type *apply_decl(Context *c, Type *base, Decl *d)
             error(c, d->loc, "attributes inside array brackets require a parameter array declarator");
         uint64_t count = 0;
         bool variable = d->bound && !constant_int(c, d->bound, &count);
+        if (variable && integer_type(d->bound->type))
+            warning_at(c, WARNING_VLA, d->loc, "ISO C90 forbids variable length arrays");
         if (variable && !integer_type(d->bound->type))
             error(c, d->loc, "array bound must be an integer expression");
         else if (!variable && d->bound && (int64_t)count <= 0) {
@@ -1175,6 +1414,10 @@ Type *declaration_type(Context *c, Specs s, Decl *d, Loc loc)
     t = apply_type_attributes(c, t, s.type_attributes);
     Sentinels sentinels = d ? combine_sentinels(c, d->member_sentinels, s.sentinels) : s.sentinels;
     t = sentinel_type(c, t, sentinels, loc);
+    if (d) t = format_attribute_type(c, t, d->member_format_spec);
+    t = format_attribute_type(c, t, s.format_spec);
+    if (d) t = format_argument_type(c, t, d->member_format_args, loc);
+    t = format_argument_type(c, t, s.format_args, loc);
     FunctionNullability attributes = d ? combine_nullability(c, d->member_nullability, s.nullability) : s.nullability;
     t = nullability_type(c, t, attributes, loc);
     if (d)
@@ -1624,6 +1867,14 @@ void add_member(Context *c, Members *list, Specs s, Decl *d, bool parameter, Loc
 {
     warn_lifecycle_attributes(c, s, loc);
     warn_invalid_noplt(c, s, d, loc);
+    unsigned function_attributes = s.attribute_markers | (d ? d->member_attribute_markers : 0);
+    for (const Decl *part = d; part; part = part->inner)
+        function_attributes |= part->attribute_markers;
+    if (function_attributes & MARK_LEAF)
+        warning_at(c, WARNING_ATTRIBUTES, loc, "'leaf' attribute ignored");
+    if (function_attributes & (MARK_HOT | MARK_COLD))
+        warning_at(c, WARNING_ATTRIBUTES, loc, "'%s' attribute ignored",
+                   function_attributes & MARK_HOT ? "hot" : "cold");
     warn_call_diagnostic_attributes(c, s.call_diagnostics, loc);
     if (s.visibility)
         warning_at(c, WARNING_ATTRIBUTES, loc, "visibility attribute ignored on %s", parameter ? "parameter" : "member");
@@ -1662,6 +1913,10 @@ void add_member(Context *c, Members *list, Specs s, Decl *d, bool parameter, Loc
     m.deprecated = d && d->deprecated ? d->deprecated : s.deprecated;
     AllocationSize allocation = d && d->member_allocation.first ? d->member_allocation : s.allocation;
     m.type = allocation_size_type(c, m.type, allocation, loc);
+    unsigned alloc_align = d && d->member_allocation_alignment ? d->member_allocation_alignment :
+                           s.allocation_alignment;
+    m.type = allocation_alignment_type(c, m.type, alloc_align, loc);
+    m.type = assumed_alignment_type(c, m.type, d && d->member_assumed_alignment ? d->member_assumed_alignment : s.assumed_alignment, loc);
     if (d && d->bit_width) {
         uint64_t width = 0;
         m.bit_field = true;
@@ -2112,6 +2367,18 @@ static bool library_builtin_enabled(Context *c, const Symbol *s)
     return true;
 }
 
+bool function_returns_twice(Context *c, const Symbol *s)
+{
+    if (!s || s->type->kind != TY_FUNC)
+        return false;
+    if (s->attribute_markers & MARK_RETURNS_TWICE)
+        return true;
+    if (!library_builtin_enabled(c, s) || s->type->base->kind != TY_INT)
+        return false;
+    return equal(s->name, "setjmp") || equal(s->name, "_setjmp") ||
+           equal(s->name, "__sigsetjmp") || equal(s->name, "sigsetjmp") || equal(s->name, "vfork");
+}
+
 typedef struct {
     const char *name;
     unsigned position;
@@ -2263,11 +2530,16 @@ Attribute attribute_kind(Context *c, const char *name)
     if (equal(name, "aligned")) return ATTR_ALIGNED;
     if (equal(name, "weak")) return ATTR_WEAK;
     if (equal(name, "alias")) return ATTR_ALIAS;
+    if (equal(name, "ifunc")) return ATTR_IFUNC;
+    if (equal(name, "format")) return ATTR_FORMAT;
+    if (equal(name, "format_arg")) return ATTR_FORMAT_ARG;
     if (equal(name, "weakref")) return ATTR_WEAKREF;
     if (equal(name, "visibility")) return ATTR_VISIBILITY;
     if (equal(name, "constructor")) return ATTR_CONSTRUCTOR;
     if (equal(name, "destructor")) return ATTR_DESTRUCTOR;
     if (equal(name, "alloc_size")) return ATTR_ALLOC_SIZE;
+    if (equal(name, "alloc_align")) return ATTR_ALLOC_ALIGN;
+    if (equal(name, "assume_aligned")) return ATTR_ASSUME_ALIGNED;
     if (equal(name, "cleanup")) return ATTR_CLEANUP;
     if (equal(name, "section")) return ATTR_SECTION;
     if (equal(name, "vector_size")) return ATTR_VECTOR_SIZE;
@@ -2278,6 +2550,7 @@ Attribute attribute_kind(Context *c, const char *name)
     if (equal(name, "noinline")) return ATTR_NOINLINE;
     if (equal(name, "used")) return ATTR_USED;
     if (equal(name, "noreturn")) return ATTR_NORETURN;
+    if (equal(name, "returns_twice")) return ATTR_RETURNS_TWICE;
     if (equal(name, "warn_unused_result")) return ATTR_WARN_UNUSED_RESULT;
     if (equal(name, "fallthrough")) return ATTR_FALLTHROUGH;
     if (equal(name, "error")) return ATTR_ERROR;
@@ -2286,6 +2559,9 @@ Attribute attribute_kind(Context *c, const char *name)
     if (equal(name, "nonnull")) return ATTR_NONNULL;
     if (equal(name, "returns_nonnull")) return ATTR_RETURNS_NONNULL;
     if (equal(name, "noplt")) return ATTR_NOPLT;
+    if (equal(name, "leaf")) return ATTR_LEAF;
+    if (equal(name, "hot")) return ATTR_HOT;
+    if (equal(name, "cold")) return ATTR_COLD;
     if (equal(name, "patchable_function_entry")) return ATTR_PATCHABLE_FUNCTION_ENTRY;
     if (equal(name, "access")) return ATTR_ACCESS;
     if (equal(name, "stdcall")) return ATTR_STDCALL;
@@ -3038,7 +3314,21 @@ static bool lvalue(Node *n)
 Symbol *explicit_register_object(Context *c, Node *n, size_t *displacement)
 {
     size_t offset = 0;
-    while (n->kind == N_MEMBER || n->kind == N_DEREF) {
+    while (n->kind == N_MEMBER || n->kind == N_DEREF || n->kind == N_VECTOR_ELEMENT) {
+        if (n->kind == N_VECTOR_ELEMENT) {
+            uint64_t index;
+            if (!constant_int(c, n->right, &index)) {
+                if (displacement)
+                    return NULL;
+            } else if (index >= n->left->type->size / n->type->size) {
+                if (displacement)
+                    return NULL;
+            } else {
+                offset += (size_t)index * n->type->size;
+            }
+            n = n->left;
+            continue;
+        }
         if (n->kind == N_MEMBER) {
             offset += n->integer;
             n = n->left;
@@ -3221,90 +3511,6 @@ const char *asm_string(Context *c, Node *literal, Loc loc)
     return (const char *)s->bytes;
 }
 
-Node *asm_statement(Context *c, Node *literal, bool file_scope, Loc loc)
-{
-    const char *text = asm_string(c, literal, loc);
-    if (file_scope) {
-        Symbol *s = alloc(c, sizeof *s);
-        s->asm_text = text;
-        PUSH(c, c->globals, s);
-        return NULL;
-    }
-    Node *n = node(c, N_ASM, loc, NULL, NULL);
-    n->name = text;
-    return n;
-}
-
-Node *asm_goto_label(Context *c, const char *name, Loc loc)
-{
-    Node *target = node(c, N_GOTO, loc, NULL, NULL);
-    target->name = name;
-    if (!c->function) {
-        error(c, loc, "asm goto requires function scope");
-        return target;
-    }
-    Symbol *s = resolve_label(c, name, loc);
-    if (s->owner != c->function)
-        error(c, loc, "asm goto label must belong to the current function");
-    s->label_referenced = true;
-    target->symbol = s;
-    return target;
-}
-
-Node *extended_asm(Context *c, Node *literal, InlineAssembly *assembly, unsigned qualifiers, Loc loc)
-{
-    assembly->text = asm_string(c, literal, loc);
-    if ((assembly->labels.len != 0) != ((qualifiers & ASM_GOTO) != 0))
-        error(c, loc, "asm goto requires a list of destination labels");
-    for (size_t i = 0; i < assembly->operands.len; i++) {
-        AsmOperand *operand = &assembly->operands.data[i];
-        Node *expression = operand->expression;
-        Type *type = expression->type;
-        bool output = i < assembly->outputs;
-        if (output && expression->kind == N_SYMBOL && type->kind == TY_PTR)
-            expression->symbol->pointer_size_untracked = true;
-        if (output && (!lvalue(expression) || const_subobject(type) ||
-                       type->kind == TY_FUNC || type->kind == TY_VOID))
-            error(c, operand->loc, "asm output requires a modifiable lvalue");
-        if (output && operand->constraint[0] != '=' && operand->constraint[0] != '+')
-            error(c, operand->loc, "asm output constraint requires '=' or '+'");
-        if (!output && (operand->constraint[0] == '=' || operand->constraint[0] == '+'))
-            error(c, operand->loc, "asm input constraint cannot start with '=' or '+'");
-        if (output && operand->constraint[0] == '+')
-            assembly->extra_inputs++;
-        operand->addressable = lvalue(expression) && !expression->width &&
-                               type->kind != TY_VOID && type->kind != TY_FUNC &&
-                               !explicit_register_object(c, expression, NULL);
-        for (size_t j = 0; operand->name && j < i; j++) {
-            const char *prior = assembly->operands.data[j].name;
-            if (prior && equal(operand->name, prior))
-                error(c, operand->loc, "duplicate asm operand name '%s'", operand->name);
-        }
-    }
-    if (assembly->operands.len + assembly->extra_inputs + assembly->labels.len > ASM_MAX_OPERANDS)
-        error(c, loc, "too many extended asm operands");
-    if (!c->function) {
-        if (assembly->outputs || assembly->clobbers.len || assembly->labels.len)
-            error(c, loc, "file-scope extended asm requires immediate inputs and no clobbers or labels");
-        if (!c->failed) {
-            AsmPlan *plan = alloc(c, sizeof *plan);
-            plan->assembly = assembly;
-            plan->loc = loc;
-            plan->serial = c->unique++;
-            plan->file_scope = true;
-            if (plan_inline_asm(c, plan)) {
-                Symbol *definition = alloc(c, sizeof *definition);
-                definition->asm_plan = plan;
-                PUSH(c, c->globals, definition);
-            }
-        }
-        return NULL;
-    }
-    Node *n = node(c, N_ASM, loc, NULL, NULL);
-    n->inline_asm = assembly;
-    return n;
-}
-
 Node *decay(Context *c, Node *n)
 {
     if (n->type->kind == TY_ARRAY)
@@ -3320,7 +3526,11 @@ Node *convert(Context *c, Node *n, Type *to, Loc loc)
     bool changed_attributes = to->kind == TY_PTR && to->base->kind == TY_FUNC &&
                               n->type->kind == TY_PTR && n->type->base->kind == TY_FUNC &&
                               (!same_allocation_size(n->type->base->allocation, to->base->allocation) ||
+                               n->type->base->allocation_alignment != to->base->allocation_alignment ||
+                               !same_assumed_alignment(n->type->base->assumed_alignment, to->base->assumed_alignment) ||
                                n->type->base->warn_unused_result != to->base->warn_unused_result ||
+                               !same_format_specs(n->type->base->format_spec, to->base->format_spec) ||
+                               !same_format_arguments(n->type->base->format_args, to->base->format_args) ||
                                !same_sentinels(n->type->base->sentinels, to->base->sentinels) ||
                                !same_nullability(n->type->base->nullability, to->base->nullability));
     if ((!changed_attributes && compatible(n->type, to, true)) ||
@@ -3984,6 +4194,7 @@ static Type *save_array_sizes(Context *c, Type *t, Nodes *evaluations, Loc loc)
     if (t->kind == TY_ARRAY && t->complete && t->variable_size && !t->runtime_size && !t->array_star) {
         Node *slot = save_layout_value(c, evaluations, "array size", size_expression(c, t, loc), loc);
         t->runtime_size = slot->symbol;
+        t->runtime_size->array_layout_size = true;
     }
     return t;
 }
@@ -4284,7 +4495,7 @@ Node *assign(Context *c, int op, Node *lhs, Node *rhs, bool postfix, Loc loc)
         if (s->owner != c->function)
             s->pointer_size_untracked = true;
         else
-            PUSH(c, s->pointer_assignments, op == '=' ? n->right : NULL);
+            PUSH(c, s->pointer_assignments, n->right);
     }
     return n;
 }
@@ -4710,9 +4921,94 @@ static bool tracks_pointer_size(Symbol *function, Symbol *s)
            !(s->type->qualifiers & (S_VOLATILE | S_ATOMIC));
 }
 
+/* Access diagnostics have a control-flow walk that accounts for aliasing writes. */
+static bool tracks_access_pointer_size(Symbol *function, Symbol *s)
+{
+    return function && s->type->kind == TY_PTR && s->local && s->owner == function &&
+           !s->register_binding && !s->captured_in_nested_function &&
+           (!s->pointer_size_untracked || s->address_taken) &&
+           !(s->type->qualifiers & (S_VOLATILE | S_ATOMIC));
+}
+
 static Symbol *copied_pointer(Context *c, Node *n)
 {
     return n && n->kind == N_SYMBOL && tracks_pointer_size(c->function, n->symbol) ? n->symbol : NULL;
+}
+
+/* Find tracked pointer inputs, including all arms of a conditional value. */
+static void collect_pointer_sources(Context *c, Node *n, Symbols *sources)
+{
+    n = pointer_value_source(n);
+    Symbol *copy = copied_pointer(c, n);
+    if (copy) {
+        if (copy->object_extent)
+            return;
+        for (size_t i = 0; i < sources->len; i++)
+            if (sources->data[i] == copy)
+                return;
+        PUSH(c, *sources, copy);
+    } else if (n && n->kind == N_BINARY && n->type->kind == TY_PTR &&
+               (n->op == '+' || n->op == '-')) {
+        collect_pointer_sources(c, n->left, sources);
+    } else if (n && n->kind == N_COND && n->type->kind == TY_PTR) {
+        collect_pointer_sources(c, n->right, sources);
+        collect_pointer_sources(c, n->third, sources);
+    }
+}
+
+/* Runtime member offsets are saved layout values; reject any other expression
+   whose evaluation would repeat an effect of forming the original address. */
+static Node *ordinary_object_root(Context *c, Node *n, Node **displacement)
+{
+    if (!n || n->kind != N_ADDR)
+        return NULL;
+    Node *object = n->left;
+    Node *offset = layout_number(c, n->loc, 0);
+    while (object->kind == N_MEMBER) {
+        if (object->right && expression_has_effect(c, object->right))
+            return NULL;
+        offset = layout_op(c, '+', offset, layout_number(c, n->loc, object->integer), n->loc);
+        if (object->right)
+            offset = layout_op(c, '+', offset, object->right, n->loc);
+        object = object->left;
+    }
+    if (object->kind != N_SYMBOL || !object->type->complete || !object_type(object->type) ||
+        (object->type->variable_size && !object->type->runtime_size))
+        return NULL;
+    if (displacement) *displacement = offset;
+    return object;
+}
+
+/* With defer set, pointer inputs can become trackable after their assignments
+   have been analyzed. Otherwise only already prepared inputs are available. */
+static bool pointer_extent_available(Context *c, Node *n, bool defer)
+{
+    n = pointer_value_source(n);
+    Symbol *copy = copied_pointer(c, n);
+    if (copy)
+        return defer || copy->object_extent;
+    if (allocation_arguments(n).first || ordinary_object_root(c, n, NULL))
+        return true;
+    if (n && n->kind == N_BINARY && n->type->kind == TY_PTR && (n->op == '+' || n->op == '-'))
+        return pointer_extent_available(c, n->left, defer);
+    if (n && n->kind == N_COND && n->type->kind == TY_PTR)
+        return pointer_extent_available(c, n->right, defer) || pointer_extent_available(c, n->third, defer);
+    return false;
+}
+
+/* Defer local-address queries until all writes to the pointer are known. */
+static bool object_address_source(Node *n)
+{
+    n = pointer_value_source(n);
+    if (!n)
+        return false;
+    if (n->kind == N_ADDR)
+        return true;
+    if (n->kind == N_BINARY && n->type->kind == TY_PTR && (n->op == '+' || n->op == '-'))
+        return object_address_source(n->left);
+    if (n->kind == N_COND && n->type->kind == TY_PTR)
+        return object_address_source(n->right) || object_address_source(n->third);
+    return false;
 }
 
 /* Visit the initializer and each subsequent assignment using the same source rules. */
@@ -4755,6 +5051,54 @@ static bool constant_pointer_extent(Context *c, Symbol *s, uint64_t *result)
     return fixed;
 }
 
+/* Capture the metadata selected by each pointer-valued expression. */
+static void capture_pointer_value(Context *c, Node *n, Symbol *destination)
+{
+    n = pointer_value_source(n);
+    if (!n)
+        return;
+    Symbol *extent = destination->object_extent;
+    Node *displacement;
+    if (ordinary_object_root(c, n, &displacement)) {
+        ObjectSizeQuery query = {.context = c, .type = extent->type, .loc = n->loc, .dynamic = true};
+        Node *whole = pointer_object_size(&query, n, (ObjectOffset){0});
+        query.mode = 1;
+        Node *subobject = pointer_object_size(&query, n, (ObjectOffset){0});
+        n->symbol = extent;
+        n->third = whole ? whole : integer(c, n->loc, UINT64_MAX, extent->type);
+        n->object_subsize = subobject ? subobject : integer(c, n->loc, UINT64_MAX, extent->type);
+        uint64_t constant_displacement;
+        n->object_displacement = constant_int(c, displacement, &constant_displacement) && !constant_displacement ?
+                                 NULL : displacement;
+    } else if (allocation_arguments(n).first) {
+        capture_allocation_size(c, n, extent);
+    } else if (n->kind == N_COND && n->type->kind == TY_PTR &&
+               pointer_extent_available(c, n, false)) {
+        n->symbol = extent;
+        n->extent_source = destination;
+        capture_pointer_value(c, n->right, destination);
+        capture_pointer_value(c, n->third, destination);
+    } else if (n->kind == N_BINARY && n->type->kind == TY_PTR &&
+               (n->op == '+' || n->op == '-') && pointer_extent_available(c, n->left, false)) {
+        Node *left = pointer_value_source(n->left);
+        Symbol *base = copied_pointer(c, left);
+        if (!base) {
+            base = frame_local(c, c->function, "intermediate object pointer", left->type, left->loc);
+            base->object_extent = frame_local(c, c->function, "intermediate object size", extent->type, left->loc);
+            Type *base_type = pointer(c, type(c, TY_VOID, 0, 1));
+            base->object_extent->object_base = frame_local(c, c->function, "intermediate object base", base_type, left->loc);
+            base->object_subextent = frame_local(c, c->function, "intermediate subobject size", extent->type, left->loc);
+            base->object_subextent->object_base = frame_local(c, c->function, "intermediate subobject base", base_type, left->loc);
+            base->object_extent->object_subextent = base->object_subextent;
+            capture_pointer_value(c, left, base);
+        }
+        if (base->object_extent) {
+            n->symbol = extent;
+            n->extent_source = base;
+        }
+    }
+}
+
 static void prepare_pointer_extents(Context *c, Type *size_type, Symbol *root)
 {
     Symbols copies = {0};
@@ -4764,14 +5108,7 @@ static void prepare_pointer_extents(Context *c, Type *size_type, Symbol *root)
         if (s->object_extent)
             continue;
         for (size_t j = 0; j <= s->pointer_assignments.len; j++) {
-            Symbol *copied = copied_pointer(c, pointer_write_source(s, j));
-            if (!copied || copied->object_extent)
-                continue;
-            size_t k = 0;
-            while (k < copies.len && copies.data[k] != copied)
-                k++;
-            if (k == copies.len)
-                PUSH(c, copies, copied);
+            collect_pointer_sources(c, pointer_write_source(s, j), &copies);
         }
     }
     /* Start at allocations, then follow copies back to the queried pointer. */
@@ -4785,23 +5122,33 @@ static void prepare_pointer_extents(Context *c, Type *size_type, Symbol *root)
             bool has_extent = false;
             for (size_t j = 0; j <= s->pointer_assignments.len && !has_extent; j++) {
                 Node *source = pointer_write_source(s, j);
-                Symbol *copied = copied_pointer(c, source);
-                has_extent = allocation_arguments(source).first || (copied && copied->object_extent);
+                has_extent = pointer_extent_available(c, source, false);
             }
             if (!has_extent)
                 continue;
             s->object_extent = frame_local(c, c->function, "allocated object size", size_type, s->loc);
-            for (size_t j = 0; j <= s->pointer_assignments.len; j++)
-                capture_allocation_size(c, pointer_write_source(s, j), s->object_extent);
+            Type *base_type = pointer(c, type(c, TY_VOID, 0, 1));
+            s->object_extent->object_base = frame_local(c, c->function, "allocated object base", base_type, s->loc);
+            s->object_subextent = frame_local(c, c->function, "allocated subobject size", size_type, s->loc);
+            s->object_subextent->object_base = frame_local(c, c->function, "allocated subobject base", base_type, s->loc);
+            s->object_extent->object_subextent = s->object_subextent;
             changed = true;
         }
     } while (changed);
+    for (size_t i = 0; i < copies.len; i++) {
+        Symbol *s = copies.data[i];
+        if (!s->object_extent)
+            continue;
+        for (size_t j = 0; j <= s->pointer_assignments.len; j++) {
+            capture_pointer_value(c, pointer_write_source(s, j), s);
+        }
+    }
 }
 
 static Node *access_pointer_size(const ObjectSizeQuery *q, Symbol *s, ObjectOffset offset)
 {
     size_t point = q->ranges.point;
-    if (!q->ranges.pointer_stores || point == SIZE_MAX || !tracks_pointer_size(q->access_caller, s) ||
+    if (!q->ranges.pointer_stores || point == SIZE_MAX || !tracks_access_pointer_size(q->access_caller, s) ||
         !*q->pointer_search_budget)
         return NULL;
     --*q->pointer_search_budget;
@@ -4846,13 +5193,40 @@ static Node *allocated_object_size(const ObjectSizeQuery *q, Symbol *s, ObjectOf
     if (q->defer) {
         for (size_t i = 0; i <= s->pointer_assignments.len && !*q->defer; i++) {
             Node *source = pointer_write_source(s, i);
-            *q->defer = allocation_arguments(source).first || copied_pointer(c, source);
+            *q->defer = pointer_extent_available(c, source, true) || object_address_source(source);
         }
         return NULL;
     }
-    if (c->function->labels.len || c->function->has_switch)
-        return NULL;
-
+    /* For ordinary objects, all writes must have a constant, known extent.
+       The dynamic query can use a constant only when every possible write
+       has the same extent. */
+    bool recursive = false;
+    for (const ObjectOrigin *o = q->origin; o; o = o->parent)
+        if (o->symbol == s && o->point == SIZE_MAX)
+            recursive = true;
+    if (!recursive && s->init) {
+        ObjectOrigin origin = {.parent = q->origin, .symbol = s, .point = SIZE_MAX};
+        ObjectSizeQuery source_query = *q;
+        source_query.origin = &origin;
+        Node *best = NULL;
+        uint64_t best_size = 0;
+        bool known = true;
+        for (size_t i = 0; i <= s->pointer_assignments.len; i++) {
+            Node *source = pointer_write_source(s, i);
+            Node *size = source ? pointer_object_size(&source_query, source, offset) : NULL;
+            uint64_t bytes;
+            if (!constant_int(c, size, &bytes) || (best && q->dynamic && bytes != best_size)) {
+                known = false;
+                break;
+            }
+            if (!best || ((q->mode & 2) ? bytes < best_size : bytes > best_size)) {
+                best = size;
+                best_size = bytes;
+            }
+        }
+        if (known && best)
+            return best;
+    }
     uint64_t size;
     if (constant_pointer_extent(c, s, &size))
         return object_remaining(q, integer(c, q->loc, size, q->type), offset, NULL);
@@ -4863,7 +5237,7 @@ static Node *allocated_object_size(const ObjectSizeQuery *q, Symbol *s, ObjectOf
     if (!s->object_extent)
         return NULL;
     Node *extent = node(c, N_SYMBOL, q->loc, NULL, NULL);
-    extent->symbol = s->object_extent;
+    extent->symbol = (q->mode & 1) ? s->object_subextent : s->object_extent;
     extent->type = q->type;
     if (q->mode & 2) {
         Node *unknown = integer(c, q->loc, UINT64_MAX, q->type);
@@ -4882,6 +5256,12 @@ static Node *lvalue_object_size(const ObjectSizeQuery *q, Node *n, ObjectOffset 
         if (!t->complete || !object_type(t))
             return NULL;
         if (t->variable_size) {
+            IntegerRange extent;
+            if (q->access_caller && t->runtime_size && q->ranges.layout &&
+                q->ranges.point != SIZE_MAX &&
+                q->ranges.layout(q->ranges.data, t->runtime_size, q->ranges.point, &extent) &&
+                !extent.upper.hi && extent.upper.lo <= PTRDIFF_MAX)
+                return object_remaining(q, integer(c, q->loc, extent.upper.lo, q->type), offset, NULL);
             if (!q->dynamic || !t->runtime_size)
                 return NULL;
             return object_remaining(q, size_expression(c, t, q->loc), offset, NULL);
@@ -4930,8 +5310,22 @@ static Node *pointer_object_size(const ObjectSizeQuery *q, Node *n, ObjectOffset
     if (n->type->kind != TY_PTR)
         return NULL;
     switch (n->kind) {
-    case N_SYMBOL:
-        return allocated_object_size(q, n->symbol, offset);
+    case N_SYMBOL: {
+        Symbol *s = n->symbol;
+        /* An internal const pointer cannot be changed by another translation
+           unit or by a defined write through an alias. */
+        if (!s->local && s->internal && (s->type->qualifiers & S_CONST) &&
+            !(s->type->qualifiers & (S_VOLATILE | S_ATOMIC)) && s->init) {
+            for (const ObjectOrigin *origin = q->origin; origin; origin = origin->parent)
+                if (origin->symbol == s && origin->point == SIZE_MAX)
+                    return NULL;
+            ObjectOrigin origin = {.parent = q->origin, .symbol = s, .point = SIZE_MAX};
+            ObjectSizeQuery initializer = *q;
+            initializer.origin = &origin;
+            return pointer_object_size(&initializer, pointer_value_source(s->init), offset);
+        }
+        return allocated_object_size(q, s, offset);
+    }
     case N_ADDR: {
         Type *object = n->left->type;
         bool array_decay = object->kind == TY_ARRAY && n->type->base != object;
@@ -5107,12 +5501,102 @@ static bool atomic_order(Context *c, Node **arg, unsigned operation, bool failur
     *arg = convert(c, *arg, type_int(c, 3, false), loc);
     if (!constant_int(c, *arg, order))
         return false;
+    uint64_t extension = *order & ~UINT64_C(0xffff);
+    *order &= UINT64_C(0xffff);
     bool load_only = operation == AT_LOAD || failure;
     bool store_only = operation == AT_STORE || operation == AT_CLEAR;
     if (*order > 5 || (load_only && (*order == 3 || *order == 4)) ||
         (store_only && (*order == 1 || *order == 2 || *order == 4)))
         warning_at(c, WARNING_INVALID_MEMORY_MODEL, loc, "invalid memory order for atomic operation");
+    if (extension) {
+        if (c->target != &x86_64_linux || (extension != AT_HLE_ACQUIRE && extension != AT_HLE_RELEASE))
+            warning_at(c, WARNING_INVALID_MEMORY_MODEL, loc, "unknown architecture-specific memory order");
+        else if (extension == AT_HLE_ACQUIRE && *order != 2 && *order != 4 && *order != 5)
+            warning_at(c, WARNING_INVALID_MEMORY_MODEL, loc, "HLE acquire requires acquire or stronger ordering");
+        else if (extension == AT_HLE_RELEASE && *order != 3 && *order != 4 && *order != 5)
+            warning_at(c, WARNING_INVALID_MEMORY_MODEL, loc, "HLE release requires release or stronger ordering");
+    }
     return true;
+}
+
+/* Pointer arithmetic is already scaled to bytes in the expression tree. */
+static bool atomic_offset_multiple(Context *c, Node *n, uint64_t width, unsigned depth)
+{
+    uint64_t value;
+    if (!n || depth > 32)
+        return false;
+    if (constant_int(c, n, &value))
+        return !(value & (width - 1));
+    if (n->kind == N_CAST && integer_type(n->left->type) && integer_type(n->type) &&
+        n->type->kind != TY_BOOL)
+        return atomic_offset_multiple(c, n->left, width, depth + 1);
+    if (n->kind != N_BINARY)
+        return false;
+    if (n->op == '*')
+        return atomic_offset_multiple(c, n->left, width, depth + 1) ||
+               atomic_offset_multiple(c, n->right, width, depth + 1);
+    if (n->op == '+' || n->op == '-')
+        return atomic_offset_multiple(c, n->left, width, depth + 1) &&
+               atomic_offset_multiple(c, n->right, width, depth + 1);
+    return false;
+}
+
+static bool atomic_pointer_aligned(Context *, Node *, uint64_t, unsigned);
+
+static bool atomic_object_aligned(Context *c, Node *n, uint64_t width, uint64_t offset, unsigned depth)
+{
+    if (!n || depth > 32)
+        return false;
+    switch (n->kind) {
+    case N_SYMBOL: case N_COMPOUND:
+        return n->symbol && symbol_alignment(n->symbol) >= width && !(offset & (width - 1));
+    case N_MEMBER:
+        return (!n->right || atomic_offset_multiple(c, n->right, width, depth + 1)) &&
+               atomic_object_aligned(c, n->left, width, offset + n->integer, depth + 1);
+    case N_DEREF:
+        return !(offset & (width - 1)) && atomic_pointer_aligned(c, n->left, width, depth + 1);
+    default:
+        return false;
+    }
+}
+
+static bool atomic_pointer_aligned(Context *c, Node *n, uint64_t width, unsigned depth)
+{
+    if (!n || depth > 32 || n->type->kind != TY_PTR)
+        return false;
+    if (width == 1)
+        return true;
+    switch (n->kind) {
+    case N_ADDR:
+        return atomic_object_aligned(c, n->left, width, 0, depth + 1);
+    case N_CAST:
+        return n->left->type->kind == TY_PTR && atomic_pointer_aligned(c, n->left, width, depth + 1);
+    case N_BINARY:
+        return (n->op == '+' || n->op == '-') &&
+               atomic_offset_multiple(c, n->right, width, depth + 1) &&
+               atomic_pointer_aligned(c, n->left, width, depth + 1);
+    case N_SEQUENCE: case N_ASSIGN:
+        return atomic_pointer_aligned(c, n->right, width, depth + 1);
+    case N_COND:
+        return atomic_pointer_aligned(c, n->postfix ? n->left : n->right, width, depth + 1) &&
+               atomic_pointer_aligned(c, n->third, width, depth + 1);
+    case N_CALL: {
+        Type *callee = n->left->type;
+        Type *function = callee->kind == TY_PTR ? callee->base : callee;
+        unsigned position = function->kind == TY_FUNC ? function->allocation_alignment : 0;
+        const AssumedAlignment *assumed = function->kind == TY_FUNC ? function->assumed_alignment : NULL;
+        if (assumed && assumed->alignment >= width && !(assumed->offset & (width - 1)))
+            return true;
+        uint64_t alignment;
+        if (position && position <= n->list.len &&
+            constant_int(c, n->list.data[position - 1], &alignment) && alignment >= width &&
+            !(alignment & (alignment - 1)))
+            return true;
+        return n->type->base->align >= width;
+    }
+    default:
+        return n->type->base->align >= width;
+    }
 }
 
 static Node *atomic_builtin(Context *c, const AtomicBuiltin *builtin, Nodes args, Loc loc)
@@ -5133,6 +5617,8 @@ static Node *atomic_builtin(Context *c, const AtomicBuiltin *builtin, Nodes args
     Node *node_value = node(c, N_ATOMIC, loc, NULL, NULL);
     node_value->op = (int)(flags & (AT_OPERATION_MASK | AT_POINTER_ARGUMENTS | AT_RETURN_NEW |
                                     AT_EXPECTED_VALUE | AT_RETURN_OBSERVED));
+    if (!legacy)
+        node_value->op |= AT_HAS_ORDER;
     node_value->type = nothing;
     node_value->list = args;
     if (operation == AT_THREAD_FENCE || operation == AT_SIGNAL_FENCE) {
@@ -5153,12 +5639,10 @@ static Node *atomic_builtin(Context *c, const AtomicBuiltin *builtin, Nodes args
                 error(c, loc, "__atomic_always_lock_free requires a constant size");
                 return integer(c, loc, 0, boolean);
             }
-            bool aligned = null_pointer_constant(c, address) ||
-                           (address->type->kind == TY_PTR && address->type->base->align >= width);
-            if (address->kind == N_CAST && address->left->type->kind == TY_PTR)
-                aligned |= address->left->type->base->align >= width;
-            return integer(c, loc, (width == 1 || width == 2 || width == 4 || width == 8) &&
-                           aligned, boolean);
+            bool supported = width == 1 || width == 2 || width == 4 || width == 8;
+            bool aligned = supported && (null_pointer_constant(c, address) ||
+                                         atomic_pointer_aligned(c, address, width, 0));
+            return integer(c, loc, aligned, boolean);
         }
         node_value->type = boolean;
         return node_value;
@@ -5287,8 +5771,9 @@ static Node *stack_allocation(Context *c, Builtin builtin, Nodes args, Loc loc)
         error(c, loc, "%s requires a power-of-two alignment from 8 to 2147483648 bits", name);
         return integer(c, loc, 0, result);
     }
+    Node *maximum = NULL;
     if (expected == 3) {
-        Node *maximum = implicitly(c, args.data[2], size_type, loc);
+        maximum = implicitly(c, args.data[2], size_type, loc);
         uint64_t ignored;
         if (!constant_int(c, maximum, &ignored))
             error(c, loc, "%s requires a constant size bound", name);
@@ -5297,6 +5782,7 @@ static Node *stack_allocation(Context *c, Builtin builtin, Nodes args, Loc loc)
     Node *n = node(c, N_ALLOCA, loc, size, NULL);
     n->type = result;
     n->integer = alignment / CHAR_BIT;
+    n->fourth = maximum;
     n->flags = aligned ? BLOCK_STACK_ALLOCATION : 0;
     c->function->has_stack_alloca = true;
     c->scope->aligned_alloca |= aligned;
@@ -5319,6 +5805,102 @@ static Type *library_allocator_type(Context *c, Symbol *s, Type *fn)
     Type *result = nullability_type(c, known->type, fn->nullability, s->loc);
     result = access_type(c, result, fn->accesses);
     return fn->warn_unused_result ? warn_unused_result_type(c, result, s->loc) : result;
+}
+
+static Type *library_format_argument_type(Context *c, Symbol *s, Type *fn, Loc loc)
+{
+    if (!c->dialect.gnu || !library_builtin_enabled(c, s) || !fn->prototype || fn->variadic)
+        return fn;
+    unsigned index = equal(s->name, "gettext") ? 1u :
+                     equal(s->name, "dgettext") || equal(s->name, "dcgettext") ? 2u : 0u;
+    size_t count = equal(s->name, "dcgettext") ? 3u : index;
+    if (!index || fn->members.len != count || !format_string_type(fn->base) ||
+        !format_string_type(fn->members.data[index - 1].type) ||
+        (index == 2 && !format_string_type(fn->members.data[0].type)) ||
+        (count == 3 && (!integer_type(fn->members.data[2].type) || fn->members.data[2].type->rank != 3)))
+        return fn;
+    ParameterIndices *indices = alloc(c, sizeof *indices);
+    PUSH(c, *indices, index);
+    return format_argument_type(c, fn, indices, loc);
+}
+
+typedef enum { FORMAT_PREFIX_NONE, FORMAT_PREFIX_STREAM, FORMAT_PREFIX_STRING, FORMAT_PREFIX_BUFFER_SIZE, FORMAT_PREFIX_TIME, FORMAT_PREFIX_MONEY,
+               FORMAT_PREFIX_CHECKED } FormatPrefix;
+typedef struct {
+    const char *name, *style;
+    unsigned index;
+    CStandard minimum;
+    FormatPrefix prefix;
+    bool gnu_only, explicit_builtin, valist;
+} LibraryFormat;
+
+static Type *library_format_type(Context *c, Symbol *symbol, Type *fn, Loc loc)
+{
+    static const LibraryFormat formats[] = {
+        {"printf", "printf", 1, C90, FORMAT_PREFIX_NONE, false, false, false},
+        {"fprintf", "printf", 2, C90, FORMAT_PREFIX_STREAM, false, false, false},
+        {"sprintf", "printf", 2, C90, FORMAT_PREFIX_STRING, false, false, false},
+        {"snprintf", "printf", 3, C99, FORMAT_PREFIX_BUFFER_SIZE, false, false, false},
+        {"scanf", "scanf", 1, C90, FORMAT_PREFIX_NONE, false, false, false},
+        {"fscanf", "scanf", 2, C90, FORMAT_PREFIX_STREAM, false, false, false},
+        {"sscanf", "scanf", 2, C90, FORMAT_PREFIX_STRING, false, false, false},
+        {"strftime", "strftime", 3, C90, FORMAT_PREFIX_TIME, false, false, true},
+        {"strfmon", "strfmon", 3, C90, FORMAT_PREFIX_MONEY, true, false, false},
+        {"printf_unlocked", "printf", 1, C90, FORMAT_PREFIX_NONE, true, false, false},
+        {"fprintf_unlocked", "printf", 2, C90, FORMAT_PREFIX_STREAM, true, false, false},
+        {"__builtin___printf_chk", "printf", 2, C90, FORMAT_PREFIX_CHECKED, false, true, false},
+        {"__builtin___fprintf_chk", "printf", 3, C90, FORMAT_PREFIX_CHECKED, false, true, false},
+        {"__builtin___sprintf_chk", "printf", 4, C90, FORMAT_PREFIX_CHECKED, false, true, false},
+        {"__builtin___snprintf_chk", "printf", 5, C90, FORMAT_PREFIX_CHECKED, false, true, false},
+        {"vprintf", "printf", 1, C90, FORMAT_PREFIX_NONE, false, false, true},
+        {"vfprintf", "printf", 2, C90, FORMAT_PREFIX_STREAM, false, false, true},
+        {"vsprintf", "printf", 2, C90, FORMAT_PREFIX_STRING, false, false, true},
+        {"vsnprintf", "printf", 3, C99, FORMAT_PREFIX_BUFFER_SIZE, false, false, true},
+        {"vscanf", "scanf", 1, C99, FORMAT_PREFIX_NONE, false, false, true},
+        {"vfscanf", "scanf", 2, C99, FORMAT_PREFIX_STREAM, false, false, true},
+        {"vsscanf", "scanf", 2, C99, FORMAT_PREFIX_STRING, false, false, true},
+        {"__builtin___vprintf_chk", "printf", 2, C90, FORMAT_PREFIX_CHECKED, false, true, true},
+        {"__builtin___vfprintf_chk", "printf", 3, C90, FORMAT_PREFIX_CHECKED, false, true, true},
+        {"__builtin___vsprintf_chk", "printf", 4, C90, FORMAT_PREFIX_CHECKED, false, true, true},
+        {"__builtin___vsnprintf_chk", "printf", 5, C90, FORMAT_PREFIX_CHECKED, false, true, true},
+    };
+    if (!symbol || !fn->prototype || !integer_type(fn->base))
+        return fn;
+    const LibraryFormat *entry = NULL;
+    for (size_t i = 0; i < sizeof formats / sizeof *formats; i++)
+        if (equal(formats[i].name, symbol->name)) { entry = &formats[i]; break; }
+    if (!entry || (!entry->explicit_builtin && !library_builtin_enabled(c, symbol)) ||
+        (entry->prefix == FORMAT_PREFIX_TIME ? (fn->base->rank != 4 || !fn->base->uns) :
+         entry->prefix == FORMAT_PREFIX_MONEY ? (fn->base->rank != 4 || fn->base->uns) :
+                                               (fn->base->rank != 3 || fn->base->uns)) ||
+        (!c->dialect.gnu && (entry->gnu_only || c->dialect.standard < entry->minimum)) ||
+        fn->variadic == entry->valist || fn->members.len != entry->index + (entry->valist ? 1u : 0u) ||
+        !format_string_type(fn->members.data[entry->index - 1].type))
+        return fn;
+    if (entry->prefix == FORMAT_PREFIX_STREAM && fn->members.data[0].type->kind != TY_PTR)
+        return fn;
+    if ((entry->prefix == FORMAT_PREFIX_STRING || entry->prefix == FORMAT_PREFIX_BUFFER_SIZE ||
+         entry->prefix == FORMAT_PREFIX_TIME || entry->prefix == FORMAT_PREFIX_MONEY) &&
+        !format_string_type(fn->members.data[0].type))
+        return fn;
+    if ((entry->prefix == FORMAT_PREFIX_BUFFER_SIZE || entry->prefix == FORMAT_PREFIX_TIME ||
+         entry->prefix == FORMAT_PREFIX_MONEY) &&
+        (!integer_type(fn->members.data[1].type) || fn->members.data[1].type->rank != 4 ||
+         !fn->members.data[1].type->uns))
+        return fn;
+    if (entry->prefix == FORMAT_PREFIX_TIME && fn->members.data[3].type->kind != TY_PTR)
+        return fn;
+    for (const FormatSpec *existing = fn->format_spec; existing; existing = existing->next)
+        if (existing->index == entry->index && existing->first == (entry->valist ? 0u : entry->index + 1) &&
+            (equal(existing->style, entry->style) ||
+             (equal(entry->style, "printf") && equal(existing->style, "gnu_printf")) ||
+             (equal(entry->style, "scanf") && equal(existing->style, "gnu_scanf")) ||
+             (equal(entry->style, "strftime") && equal(existing->style, "gnu_strftime")) ||
+             (equal(entry->style, "strfmon") && equal(existing->style, "gnu_strfmon"))))
+            return fn;
+    FormatSpec spec = {.style = entry->style, .index = entry->index,
+                       .first = entry->valist ? 0u : entry->index + 1, .loc = loc};
+    return format_attribute_type(c, fn, &spec);
 }
 
 Node *vector_convert(Context *c, Node *source, Type *target, Loc loc)
@@ -5726,10 +6308,6 @@ static bool valid_padding_type(Context *c, Type *t, Loc loc)
         return valid_padding_type(c, t->base, loc);
     }
     if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
-        if (t->variable_size) {
-            error(c, loc, "__builtin_clear_padding does not support variable-length records");
-            return false;
-        }
         for (size_t i = 0; i < t->members.len; i++)
             if (!valid_padding_type(c, t->members.data[i].type, loc))
                 return false;
@@ -5979,6 +6557,411 @@ bool call_returns_nonnull(Node *n)
     while (n->kind == N_CAST && n->type->kind == TY_PTR && n->left->type->kind == TY_PTR)
         n = n->left;
     return n->kind == N_CALL && n->left->type->base->nullability.returns_nonnull;
+}
+
+typedef struct {
+    Context *context;
+    Nodes arguments, original_arguments;
+    Loc loc;
+    size_t first, next, last_argument;
+    unsigned mode;
+    bool *used;
+    bool failed, check_arguments;
+} FormatArguments;
+
+static bool format_signedness_enabled(Context *c, Loc loc)
+{
+    Loc command_location = loc;
+    command_location.diagnostics = NULL;
+    return warning_enabled(c, WARNING_FORMAT_SIGNEDNESS, loc) ||
+           warning_enabled(c, WARNING_FORMAT_SIGNEDNESS, command_location);
+}
+
+/* Read a positional index without consuming ordinary field-width digits. */
+static bool format_position(const char **cursor, size_t *position)
+{
+    const char *p = *cursor;
+    size_t n = 0;
+    if (!isdigit((unsigned char)*p))
+        return false;
+    while (isdigit((unsigned char)*p)) {
+        unsigned digit = (unsigned)(*p++ - '0');
+        n = n > (SIZE_MAX - digit) / 10 ? SIZE_MAX : n * 10 + digit;
+    }
+    if (*p != '$')
+        return false;
+    *cursor = p + 1;
+    *position = n;
+    return true;
+}
+
+static Type *format_argument(FormatArguments *state, bool indexed, size_t position)
+{
+    unsigned mode = indexed ? 2u : 1u;
+    if (state->mode && state->mode != mode) {
+        warning_at(state->context, WARNING_FORMAT, state->loc, "cannot mix positional and ordinary format arguments");
+        state->failed = true;
+        return NULL;
+    }
+    state->mode = mode;
+    if (!state->check_arguments) {
+        if (indexed && !position) {
+            warning_at(state->context, WARNING_FORMAT, state->loc, "invalid positional format argument");
+            state->failed = true;
+            return NULL;
+        }
+        return type_int(state->context, 3, false);
+    }
+    size_t index = indexed ? (position && position - 1 <= SIZE_MAX - state->first ?
+                              state->first + position - 1 : SIZE_MAX) : state->next++;
+    if (index >= state->arguments.len) {
+        warning_at(state->context, WARNING_FORMAT, state->loc, "not enough arguments for format string");
+        state->failed = true;
+        return NULL;
+    }
+    state->used[index] = true;
+    state->last_argument = index;
+    return state->arguments.data[index]->type;
+}
+
+static void check_strfmon_literal(Context *c, const FormatSpec *spec, Nodes args, Nodes original,
+                                  const char *text, Loc loc)
+{
+    static const char flags[] = "=^+(!-";
+    FormatArguments state = {.context = c, .arguments = args, .original_arguments = original, .loc = loc,
+                             .first = spec->first ? spec->first - 1 : args.len,
+                             .next = spec->first ? spec->first - 1 : args.len,
+                             .used = alloc(c, args.len * sizeof(bool)), .check_arguments = spec->first != 0};
+    while (*text) {
+        if (*text++ != '%') continue;
+        if (*text == '%') { text++; continue; }
+        unsigned seen = 0;
+        while (*text && strchr(flags, *text)) {
+            const char *flag = strchr(flags, *text++);
+            unsigned bit = 1u << (unsigned)(flag - flags);
+            if (seen & bit)
+                warning_at(c, WARNING_FORMAT, loc, "repeated '%c' flag in strfmon format", *flag);
+            seen |= bit;
+            if (*flag == '=') {
+                if (!*text) {
+                    warning_at(c, WARNING_FORMAT, loc, "missing strfmon fill character");
+                    return;
+                }
+                text++;
+            }
+        }
+        if ((seen & (1u << 2)) && (seen & (1u << 3)))
+            warning_at(c, WARNING_FORMAT, loc, "strfmon '+' and '(' flags cannot be combined");
+        while (isdigit((unsigned char)*text)) text++;
+        if (*text == '#') {
+            text++;
+            if (!isdigit((unsigned char)*text))
+                warning_at(c, WARNING_FORMAT, loc, "empty strfmon left precision");
+            while (isdigit((unsigned char)*text)) text++;
+        }
+        if (*text == '.') {
+            text++;
+            if (!isdigit((unsigned char)*text))
+                warning_at(c, WARNING_FORMAT, loc, "empty strfmon precision");
+            while (isdigit((unsigned char)*text)) text++;
+        }
+        bool extended = false;
+        if (*text == 'L') { extended = true; text++; }
+        char conversion = *text;
+        if (!conversion) {
+            warning_at(c, WARNING_FORMAT, loc, "unterminated strfmon conversion");
+            break;
+        }
+        text++;
+        if (conversion != 'n' && conversion != 'i') {
+            warning_at(c, WARNING_FORMAT, loc, "unknown strfmon conversion '%%%c'", conversion);
+            continue;
+        }
+        Type *actual = format_argument(&state, false, 0);
+        if (!actual) return;
+        if (state.check_arguments &&
+            (actual->kind != TY_FLOAT || actual->size != (extended ? c->target->long_double_size : 8u)))
+            warning_at(c, WARNING_FORMAT, loc, "strfmon conversion '%%%c' has an incompatible argument", conversion);
+    }
+    for (size_t i = state.first; i < args.len; i++)
+        if (!state.used[i]) {
+            warning_at(c, WARNING_FORMAT, loc, "too many arguments for strfmon format");
+            break;
+        }
+}
+
+static void check_strftime_literal(Context *c, const char *text, Loc loc)
+{
+    while (*text) {
+        if (*text++ != '%') continue;
+        if (*text == '%') { text++; continue; }
+        while (*text && strchr("_-0^#", *text)) text++;
+        while (isdigit((unsigned char)*text)) text++;
+        char modifier = 0;
+        if (*text == 'E' || *text == 'O') modifier = *text++;
+        char conversion = *text;
+        if (!conversion) {
+            warning_at(c, WARNING_FORMAT, loc, "unterminated strftime conversion");
+            return;
+        }
+        text++;
+        if (!strchr("abcdeghjklmnprstuwxyzABCDFGHIMPRSTUVWXYZ", conversion)) {
+            warning_at(c, WARNING_FORMAT, loc, "unknown strftime conversion '%%%c'", conversion);
+            continue;
+        }
+        if ((modifier == 'E' && !strchr("cCxXyY", conversion)) ||
+            (modifier == 'O' && !strchr("deHImMSuUVwWy", conversion)))
+            warning_at(c, WARNING_FORMAT, loc, "invalid strftime modifier '%c' for '%%%c'", modifier, conversion);
+        if (strchr("ygDxc", conversion))
+            warning_at(c, WARNING_FORMAT_Y2K, loc,
+                       "strftime conversion '%%%c' may yield only two digits of the year", conversion);
+    }
+}
+
+static void check_format_literal(Context *c, const FormatSpec *spec, Nodes args, Nodes original, Loc loc, Node *expression)
+{
+    if (!spec || spec->index > args.len)
+        return;
+    bool time_format = equal(spec->style, "strftime") || equal(spec->style, "gnu_strftime");
+    if (!time_format && !warning_enabled(c, WARNING_FORMAT, loc))
+        return;
+    Symbol *literal = NULL;
+    uint64_t offset = 0;
+    if (!address_constant(c, expression, &literal, &offset) ||
+        !literal || !literal->bytes || offset >= literal->byte_count)
+        return;
+    if (time_format) {
+        check_strftime_literal(c, (const char *)literal->bytes + offset, loc);
+        return;
+    }
+    if (equal(spec->style, "strfmon") || equal(spec->style, "gnu_strfmon")) {
+        check_strfmon_literal(c, spec, args, original, (const char *)literal->bytes + offset, loc);
+        return;
+    }
+    bool scan = equal(spec->style, "scanf") || equal(spec->style, "gnu_scanf");
+    const char *text = (const char *)literal->bytes + offset;
+    FormatArguments state = {.context = c, .arguments = args, .original_arguments = original, .loc = loc,
+                             .first = spec->first ? spec->first - 1 : args.len,
+                             .next = spec->first ? spec->first - 1 : args.len,
+                             .used = alloc(c, args.len * sizeof(bool)), .check_arguments = spec->first != 0};
+    while (*text) {
+        if (*text++ != '%')
+            continue;
+        if (*text == '%') { text++; continue; }
+        size_t position = 0;
+        bool indexed = format_position(&text, &position);
+        bool suppressed = false, allocated = false;
+        if (scan) {
+            if (*text == '*') { suppressed = true; text++; }
+            while (isdigit((unsigned char)*text)) text++;
+            if (*text == 'm') { allocated = true; text++; }
+        } else {
+            while (*text && strchr("#0- +'I", *text)) text++;
+            for (unsigned part = 0; part < 2; part++) {
+                if (part && *text != '.') break;
+                if (part) text++;
+                if (*text == '*') {
+                    text++;
+                    size_t width_position = 0;
+                    bool width_indexed = format_position(&text, &width_position);
+                    Type *width = format_argument(&state, width_indexed, width_position);
+                    if (!width) return;
+                    if (!integer_type(width) || width->rank != 3)
+                        warning_at(c, WARNING_FORMAT, loc, "format width or precision requires an int argument");
+                    else if (state.check_arguments && width->uns && format_signedness_enabled(c, loc))
+                        warning_at(c, WARNING_FORMAT, loc, "format width or precision requires a signed int argument");
+                } else {
+                    while (isdigit((unsigned char)*text)) text++;
+                }
+            }
+        }
+        unsigned rank = 3, pointed_rank = 3;
+        unsigned decimal_float = 0;
+        bool large_float = false;
+        if (*text == 'h') { text++; pointed_rank = 2; if (*text == 'h') { pointed_rank = 1; text++; } }
+        else if (*text == 'l') { text++; rank = pointed_rank = 4; if (*text == 'l') { rank = pointed_rank = 5; text++; } }
+        else if (*text == 'j' || *text == 'z' || *text == 'Z' || *text == 't') { rank = pointed_rank = 4; text++; }
+        else if (*text == 'q') { rank = pointed_rank = 5; text++; }
+        else if (*text == 'H') { decimal_float = 4; text++; }
+        else if (*text == 'D') { decimal_float = 8; text++; if (*text == 'D') { decimal_float = 16; text++; } }
+        else if (*text == 'L') { large_float = true; text++; }
+        char conversion = *text;
+        if (!conversion) {
+            warning_at(c, WARNING_FORMAT, loc, "unterminated format conversion");
+            return;
+        }
+        text++;
+        if (scan && conversion == '[') {
+            if (*text == '^') text++;
+            if (*text == ']') text++;
+            while (*text && *text != ']') text++;
+            if (!*text) {
+                warning_at(c, WARNING_FORMAT, loc, "unterminated scan set");
+                return;
+            }
+            text++;
+        }
+        if (!scan && conversion == 'm') continue;
+        if (!strchr(scan ? "diouxXbBcCsSpnfFeEgGaA[" : "diouxXbBcCsSpnfFeEgGaA", conversion)) {
+            warning_at(c, WARNING_FORMAT, loc, "unknown format conversion '%%%c'", conversion);
+            return;
+        }
+        if (conversion == 'C' || conversion == 'S') {
+            rank = pointed_rank = 4;
+            conversion = conversion == 'C' ? 'c' : 's';
+        }
+        if (scan && suppressed) {
+            if (conversion == 'n')
+                warning_at(c, WARNING_FORMAT, loc, "assignment suppression used with %%n");
+            continue;
+        }
+        Type *actual = format_argument(&state, indexed, position);
+        if (!actual) return;
+        if (!state.check_arguments) continue;
+        bool valid = true;
+        if (scan) {
+            valid = actual->kind == TY_PTR && !(actual->base->qualifiers & S_CONST);
+            Type *object = valid ? actual->base : NULL;
+            if (valid && allocated) {
+                valid = object->kind == TY_PTR;
+                object = valid ? object->base : NULL;
+            }
+            if (valid && strchr("diouxXbBn", conversion))
+                valid = integer_type(object) && object->rank == pointed_rank;
+            else if (valid && strchr("fFeEgGaA", conversion))
+                valid = decimal_float ? object->kind == TY_DECIMAL && object->size == decimal_float :
+                        object->kind == TY_FLOAT && object->size ==
+                        (large_float ? c->target->long_double_size : rank == 4 ? 8u : 4u);
+            else if (valid && strchr("cs[", conversion))
+                valid = object->kind == TY_INT && object->size == (rank == 4 ? 4u : 1u);
+            else if (valid && conversion == 'p')
+                valid = object->kind == TY_PTR && object->base->kind == TY_VOID;
+        } else if (strchr("diouxXbBc", conversion)) {
+            unsigned expected = conversion == 'c' && rank == 4 ? 3 : rank;
+            valid = integer_type(actual) && actual->rank == expected;
+        } else if (strchr("fFeEgGaA", conversion)) {
+            valid = decimal_float ? actual->kind == TY_DECIMAL && actual->size == decimal_float :
+                    actual->kind == TY_FLOAT && actual->size ==
+                    (large_float ? c->target->long_double_size : 8);
+        } else if (conversion == 'p') {
+            valid = actual->kind == TY_PTR;
+        } else if (conversion == 's') {
+            valid = actual->kind == TY_PTR && actual->base->kind == TY_INT &&
+                    actual->base->size == (rank == 4 ? 4u : 1u);
+        } else if (conversion == 'n') {
+            valid = actual->kind == TY_PTR && integer_type(actual->base) &&
+                    actual->base->rank == pointed_rank && !(actual->base->qualifiers & S_CONST);
+        }
+        if (!valid)
+            warning_at(c, WARNING_FORMAT, loc, "format conversion '%%%c' has an incompatible argument", conversion);
+        else if (format_signedness_enabled(c, loc)) {
+            bool check = false, expected_unsigned = false, actual_unsigned = false, plain_character = false;
+            if (scan && strchr("diouxXbBn", conversion)) {
+                Type *object = actual->base;
+                if (allocated) object = object->base;
+                check = true;
+                expected_unsigned = strchr("ouxXbB", conversion) != NULL;
+                actual_unsigned = object->uns;
+                plain_character = pointed_rank == 1 && object->plain_char;
+            } else if (!scan && conversion == 'n') {
+                check = true;
+                actual_unsigned = actual->base->uns;
+                plain_character = pointed_rank == 1 && actual->base->plain_char;
+            } else if (!scan && strchr("diouxXbBc", conversion)) {
+                check = true;
+                expected_unsigned = conversion == 'c' ? rank == 4 :
+                                    pointed_rank >= 3 && strchr("ouxXbB", conversion) != NULL;
+                actual_unsigned = actual->uns;
+                if (expected_unsigned && !actual_unsigned && rank == 3 &&
+                    state.last_argument < state.original_arguments.len) {
+                    Node *source_arg = state.original_arguments.data[state.last_argument];
+                    while (source_arg->kind == N_CAST && integer_type(source_arg->type) &&
+                           integer_type(source_arg->left->type) && source_arg->type->rank >= source_arg->left->type->rank)
+                        source_arg = source_arg->left;
+                    if (source_arg->type->kind == TY_INT && source_arg->type->rank < 3 && source_arg->type->uns)
+                        actual_unsigned = true;
+                }
+            }
+            if (check && (plain_character || actual_unsigned != expected_unsigned))
+                warning_at(c, WARNING_FORMAT, loc, "format conversion '%%%c' has an argument with different signedness", conversion);
+        }
+    }
+    for (size_t i = state.first; i < args.len; i++)
+        if (!state.used[i]) {
+            warning_at(c, WARNING_FORMAT, loc, "too many or unused arguments for format string");
+            break;
+        }
+}
+
+static void check_format_expression(Context *c, const FormatSpec *spec, Nodes args, Nodes original, Loc loc,
+                                    Node *expression, unsigned depth, bool *nonliteral_reported)
+{
+    if (!expression || depth > 64)
+        return;
+    while (expression->kind == N_CAST && expression->left->type->kind == TY_PTR)
+        expression = expression->left;
+    if (expression->kind == N_SEQUENCE) {
+        check_format_expression(c, spec, args, original, loc, expression->right, depth + 1, nonliteral_reported);
+        return;
+    }
+    if (expression->kind == N_COND) {
+        bool selected;
+        Node *yes = expression->postfix ? expression->left : expression->right;
+        if (constant_truth(c, expression->left, &selected)) {
+            check_format_expression(c, spec, args, original, loc, selected ? yes : expression->third, depth + 1, nonliteral_reported);
+        } else {
+            check_format_expression(c, spec, args, original, loc, yes, depth + 1, nonliteral_reported);
+            check_format_expression(c, spec, args, original, loc, expression->third, depth + 1, nonliteral_reported);
+        }
+        return;
+    }
+    if (expression->kind == N_CALL && expression->left->type->kind == TY_PTR &&
+        expression->left->type->base->kind == TY_FUNC) {
+        const ParameterIndices *indices = expression->left->type->base->format_args;
+        if (indices) {
+            for (size_t i = 0; i < indices->len; i++) {
+                unsigned index = indices->data[i];
+                if (index && index <= expression->list.len)
+                    check_format_expression(c, spec, args, original, loc, expression->list.data[index - 1], depth + 1, nonliteral_reported);
+            }
+            return;
+        }
+    }
+    Symbol *literal = NULL;
+    uint64_t offset = 0;
+    if (address_constant(c, expression, &literal, &offset) && literal && literal->bytes && offset < literal->byte_count) {
+        check_format_literal(c, spec, args, original, loc, expression);
+        return;
+    }
+    bool time_format = equal(spec->style, "strftime") || equal(spec->style, "gnu_strftime");
+    if ((!spec->first && !time_format) || *nonliteral_reported || known_null_pointer(c, expression))
+        return;
+    bool no_arguments = spec->first && args.len < spec->first;
+    Loc command_location = loc;
+    command_location.diagnostics = NULL;
+    if (no_arguments && (warning_enabled(c, WARNING_FORMAT_SECURITY, loc) ||
+                         warning_enabled(c, WARNING_FORMAT_SECURITY, command_location))) {
+        warning_at(c, WARNING_FORMAT_SECURITY, loc, "format is not a string literal and has no format arguments");
+        *nonliteral_reported = true;
+    } else if (warning_enabled(c, WARNING_FORMAT_NONLITERAL, loc)) {
+        warning_at(c, WARNING_FORMAT_NONLITERAL, loc, no_arguments ?
+                   "format is not a string literal and has no format arguments" :
+                   "format is not a string literal; argument types are not checked");
+        *nonliteral_reported = true;
+    }
+}
+
+static void check_printf_format(Context *c, Type *fn, Nodes args, Nodes original, Loc loc)
+{
+    Loc command_location = loc;
+    command_location.diagnostics = NULL;
+    if (!warning_enabled(c, WARNING_FORMAT, loc) && !warning_enabled(c, WARNING_FORMAT, command_location))
+        return;
+    for (const FormatSpec *spec = fn->format_spec; spec; spec = spec->next) {
+        bool reported = false;
+        if (spec->index <= args.len)
+            check_format_expression(c, spec, args, original, loc, args.data[spec->index - 1], 0, &reported);
+    }
 }
 
 static void check_sentinel(Context *c, Type *fn, Nodes args, Loc loc)
@@ -6268,6 +7251,11 @@ Symbol *access_local_object(Context *c, Symbol *caller, const Node *address)
 Node *call(Context *c, Node *callee, Nodes args, Loc loc)
 {
     Symbol *direct = callee->kind == N_SYMBOL ? callee->symbol : NULL;
+    Node *attribute_target = callee;
+    while ((attribute_target->kind == N_ADDR || attribute_target->kind == N_DEREF) && attribute_target->left)
+        attribute_target = attribute_target->left;
+    Symbol *returns_twice_target = attribute_target->kind == N_SYMBOL && attribute_target->type->kind == TY_FUNC ?
+                                   attribute_target->symbol : NULL;
     const char *name = direct ? direct->name : "";
     Builtin builtin = direct && direct->type->kind == TY_FUNC ? builtin_kind(name) : BUILTIN_NONE;
     const AtomicBuiltin *atomic = builtin == BUILTIN_ATOMIC ? find_atomic_builtin(name) : NULL;
@@ -6361,8 +7349,17 @@ Node *call(Context *c, Node *callee, Nodes args, Loc loc)
         fn = allocation_type;
         callee->type = pointer(c, fn);
     }
+    Type *format_type = library_format_argument_type(c, direct, fn, loc);
+    format_type = library_format_type(c, direct, format_type, loc);
+    if (format_type != fn) {
+        fn = format_type;
+        callee->type = pointer(c, fn);
+    }
     if (fn->prototype && (args.len < fn->members.len || (!fn->variadic && args.len != fn->members.len)))
         error(c, loc, "incorrect number of function arguments");
+    Nodes original_arguments = {0};
+    if (fn->format_spec && format_signedness_enabled(c, loc))
+        for (size_t i = 0; i < args.len; i++) PUSH(c, original_arguments, args.data[i]);
     for (size_t i = 0; i < args.len; i++) {
         Node *arg = decay(c, args.data[i]);
         if (i < fn->members.len) {
@@ -6375,9 +7372,12 @@ Node *call(Context *c, Node *callee, Nodes args, Loc loc)
             arg = promote(c, arg);
         args.data[i] = arg;
     }
+    check_printf_format(c, fn, args, original_arguments, loc);
     check_sentinel(c, fn, args, loc);
     check_nonnull_arguments(c, fn, direct, args, loc);
     if (c->function) {
+        if (function_returns_twice(c, returns_twice_target))
+            c->function->has_returns_twice = true;
         c->function->has_variable_temporary |= fn->base->variable_size;
         for (size_t i = 0; i < args.len; i++)
             c->function->has_variable_temporary |= args.data[i]->type->variable_size;
@@ -6562,6 +7562,16 @@ AllocationSize allocation_size_spec(Context *c, Node *first, Node *second, Loc l
     return (AllocationSize){(unsigned)a, (unsigned)b};
 }
 
+unsigned allocation_alignment_spec(Context *c, Node *argument, Loc loc)
+{
+    uint64_t position;
+    if (!constant_int(c, argument, &position) || !position || position > UINT_MAX) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "alloc_align argument must be a positive integer parameter number");
+        return 0;
+    }
+    return (unsigned)position;
+}
+
 static bool patchable_entry_value(Context *c, Node *argument, Loc loc, unsigned *value)
 {
     Integer128 number;
@@ -6642,6 +7652,42 @@ FunctionNullability nonnull_spec(Context *c, Nodes args, Loc loc)
     return result;
 }
 
+const ParameterIndices *format_argument_spec(Context *c, Node *argument, Loc loc)
+{
+    uint64_t index;
+    if (!constant_int(c, argument, &index) || index > UINT_MAX) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "format_arg requires a valid constant parameter index");
+        return NULL;
+    }
+    ParameterIndices *indices = alloc(c, sizeof *indices);
+    PUSH(c, *indices, (unsigned)index);
+    return indices;
+}
+
+const FormatSpec *format_attribute_spec(Context *c, const char *style, Node *format_arg, Node *first_arg, Loc loc)
+{
+    size_t length = strlen(style);
+    if (length > 4 && !strncmp(style, "__", 2) && equal(style + length - 2, "__"))
+        style = copy(c, style + 2, length - 4);
+    if (!equal(style, "printf") && !equal(style, "gnu_printf") &&
+        !equal(style, "scanf") && !equal(style, "gnu_scanf") &&
+        !equal(style, "strftime") && !equal(style, "gnu_strftime") &&
+        !equal(style, "strfmon") && !equal(style, "gnu_strfmon")) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "unsupported format archetype '%s'", style);
+        return NULL;
+    }
+    uint64_t format_index, first_index;
+    if (!constant_int(c, format_arg, &format_index) || !constant_int(c, first_arg, &first_index) ||
+        !format_index || format_index > UINT_MAX || first_index > UINT_MAX) {
+        error(c, loc, "format attribute requires valid constant argument indexes");
+        return NULL;
+    }
+    FormatSpec *spec = alloc(c, sizeof *spec);
+    *spec = (FormatSpec){.style = style, .index = (unsigned)format_index,
+                         .first = (unsigned)first_index, .loc = loc};
+    return spec;
+}
+
 Sentinels sentinel_spec(Context *c, Node *argument, Loc loc)
 {
     Sentinels result = {0};
@@ -6690,11 +7736,11 @@ static size_t attribute_query_arity(Attribute attribute)
     switch (attribute) {
     case ATTR_NONNULL:
         return SIZE_MAX;
-    case ATTR_ACCESS:
+    case ATTR_ACCESS: case ATTR_FORMAT:
         return 3;
-    case ATTR_ALLOC_SIZE: case ATTR_PATCHABLE_FUNCTION_ENTRY:
+    case ATTR_ALLOC_SIZE: case ATTR_ASSUME_ALIGNED: case ATTR_PATCHABLE_FUNCTION_ENTRY:
         return 2;
-    case ATTR_ALIGNED: case ATTR_ALIAS: case ATTR_WEAKREF: case ATTR_VISIBILITY:
+    case ATTR_ALIGNED: case ATTR_ALLOC_ALIGN: case ATTR_ALIAS: case ATTR_IFUNC: case ATTR_FORMAT_ARG: case ATTR_WEAKREF: case ATTR_VISIBILITY:
     case ATTR_CONSTRUCTOR: case ATTR_DESTRUCTOR: case ATTR_CLEANUP: case ATTR_SECTION:
     case ATTR_VECTOR_SIZE: case ATTR_MODE: case ATTR_DEPRECATED: case ATTR_ERROR: case ATTR_WARNING: case ATTR_SENTINEL:
         return 1;
@@ -6785,6 +7831,21 @@ static bool attribute_query_matches(Context *c, Attribute attribute, Type *t, No
             error(c, arg->loc, "mode attribute requires a machine mode name");
         warning_at(c, WARNING_ATTRIBUTES, loc, "mode attribute is unsupported in __builtin_has_attribute");
         return false;
+    case ATTR_ASSUME_ALIGNED: {
+        const AssumedAlignment *actual = t->kind == TY_FUNC ? t->assumed_alignment : NULL;
+        if (!arg) return actual != NULL;
+        const AssumedAlignment *requested = assumed_alignment_spec(c, arg, args.len == 2 ? args.data[1] : NULL, loc);
+        return actual && requested && actual->alignment == requested->alignment;
+    }
+    case ATTR_ALLOC_ALIGN: {
+        unsigned actual = t->kind == TY_FUNC ? t->allocation_alignment : 0;
+        if (!arg)
+            return actual != 0;
+        unsigned requested = allocation_alignment_spec(c, arg, loc);
+        if (actual && requested && actual != requested)
+            warning_at(c, WARNING_ATTRIBUTES, loc, "conflicting alloc_align attribute in query");
+        return actual && actual == requested;
+    }
     case ATTR_ALLOC_SIZE: {
         AllocationSize actual = t->kind == TY_FUNC ? t->allocation : (AllocationSize){0};
         if (!arg)
@@ -6798,8 +7859,8 @@ static bool attribute_query_matches(Context *c, Attribute attribute, Type *t, No
         if (arg)
             attribute_query_string(c, arg);
         return !arg && s && s->weak_reference;
-    case ATTR_ALIAS: case ATTR_SECTION: {
-        const char *actual = s ? (attribute == ATTR_ALIAS ? s->alias : s->section) : NULL;
+    case ATTR_ALIAS: case ATTR_IFUNC: case ATTR_SECTION: {
+        const char *actual = s ? (attribute == ATTR_ALIAS ? s->alias : attribute == ATTR_IFUNC ? s->ifunc : s->section) : NULL;
         if (!actual && attribute == ATTR_ALIAS) {
             const WeakPragma *pragma = attribute_weak_pragma(c, s, true);
             if (pragma)
@@ -6856,7 +7917,11 @@ static bool attribute_query_matches(Context *c, Attribute attribute, Type *t, No
         }
         return false;
     case ATTR_GNU_INLINE: return s && (s->inline_declarations & S_GNU_INLINE);
+    case ATTR_RETURNS_TWICE: return s && (s->attribute_markers & MARK_RETURNS_TWICE);
     case ATTR_NOINLINE: return s && (s->attribute_markers & MARK_NOINLINE);
+    case ATTR_LEAF: return s && (s->attribute_markers & MARK_LEAF);
+    case ATTR_HOT: return s && (s->attribute_markers & MARK_HOT);
+    case ATTR_COLD: return s && (s->attribute_markers & MARK_COLD);
     case ATTR_NOPLT: return s && (s->attribute_markers & MARK_NOPLT);
     case ATTR_ACCESS: {
         if (!args.len)
@@ -6895,6 +7960,26 @@ static bool attribute_query_matches(Context *c, Attribute attribute, Type *t, No
         return (s && (s->attribute_markers & MARK_NORETURN)) || function_noreturn(c, s) ||
                (member && (member->attribute_markers & MARK_NORETURN));
     case ATTR_WARN_UNUSED_RESULT: return t->kind == TY_FUNC && t->warn_unused_result;
+    case ATTR_FORMAT_ARG: {
+        if (t->kind != TY_FUNC) return false;
+        if (!arg) return t->format_args != NULL;
+        uint64_t requested;
+        if (!constant_int(c, arg, &requested)) {
+            error(c, loc, "format_arg query requires a constant index");
+            return false;
+        }
+        if (!requested || requested > t->members.len) {
+            warning_at(c, WARNING_ATTRIBUTES, loc, "format_arg index is outside the parameter list");
+            return false;
+        }
+        if (!t->format_args) return false;
+        for (size_t i = 0; i < t->format_args->len; i++)
+            if (t->format_args->data[i] == requested) return true;
+        return false;
+    }
+    case ATTR_FORMAT:
+        return t->kind == TY_FUNC && t->format_spec &&
+               (!args.len || (arg && arg->kind == N_DESIGNATE && equal(arg->name, t->format_spec->style)));
     case ATTR_SENTINEL: {
         Sentinel requested;
         if (!sentinel_position(c, arg, loc, &requested) || t->kind != TY_FUNC)
@@ -7519,6 +8604,20 @@ void define_enumerator(Context *c, const char *name, Node *expr, const char *dep
     enumeration->next_overflow = !negative && !wide_nonzero(enumeration->next);
 }
 
+static void warn_allocation_alignment_redeclaration(Context *c, Type *current, Type *prior, Loc loc)
+{
+    if (current->kind == TY_PTR && prior->kind == TY_PTR) {
+        current = current->base;
+        prior = prior->base;
+    }
+    if (current->kind == TY_FUNC && prior->kind == TY_FUNC && current->assumed_alignment &&
+        prior->assumed_alignment && !same_assumed_alignment(current->assumed_alignment, prior->assumed_alignment))
+        warning_at(c, WARNING_ATTRIBUTES, loc, "conflicting assume_aligned attributes; keeping the first");
+    if (current->kind == TY_FUNC && prior->kind == TY_FUNC && current->allocation_alignment &&
+        prior->allocation_alignment && current->allocation_alignment != prior->allocation_alignment)
+        warning_at(c, WARNING_ATTRIBUTES, loc, "conflicting alloc_align attributes; keeping the first");
+}
+
 static Symbol *global(Context *c, const char *name, Type *t, unsigned flags,
                       unsigned alignment, Loc loc)
 {
@@ -7538,6 +8637,7 @@ static Symbol *global(Context *c, const char *name, Type *t, unsigned flags,
         error(c, loc, "conflicting declaration of '%s'", name);
     } else {
         warn_transparent_redeclaration(c, t, s->type, loc);
+        warn_allocation_alignment_redeclaration(c, t, s->type, loc);
         unsigned prior = symbol_alignment(s);
         unsigned current = alignment ? alignment : t->align;
         bool explicit_alignment = alignment || s->alignment ||
@@ -7571,6 +8671,7 @@ static Symbol *nested_function(Context *c, const char *name, Type *t, Loc loc)
             error(c, loc, "conflicting declaration of nested function '%s'", name);
         else {
             warn_transparent_redeclaration(c, t, s->type, loc);
+            warn_allocation_alignment_redeclaration(c, t, s->type, loc);
             if (transparent_function_conversion(t, s->type))
                 s->type = composite_type(c, t, s->type, false);
             else {
@@ -7578,6 +8679,8 @@ static Symbol *nested_function(Context *c, const char *name, Type *t, Loc loc)
                     s->type = warn_unused_result_type(c, s->type, loc);
                 Sentinels sentinels = combine_sentinels(c, s->type->sentinels, t->sentinels);
                 s->type = sentinel_type(c, s->type, sentinels, loc);
+                s->type = format_attribute_type(c, s->type, t->format_spec);
+                s->type = format_argument_type(c, s->type, t->format_args, loc);
                 s->type = nullability_type(c, s->type, t->nullability, loc);
                 s->type = access_type(c, s->type, t->accesses);
             }
@@ -7667,8 +8770,38 @@ static void declare_lifecycle(Context *c, Symbol *s, Specs specs, Loc loc)
     }
 }
 
-static void declare_query_attributes(Symbol *s, Specs specs)
+static void declare_query_attributes(Context *c, Symbol *s, Specs specs, const Decl *d, Loc loc)
 {
+    unsigned leaf = specs.attribute_markers & MARK_LEAF;
+    for (const Decl *part = d; part && !leaf; part = part->inner)
+        leaf = part->attribute_markers & MARK_LEAF;
+    if (leaf && (s->is_typedef || s->type->kind != TY_FUNC))
+        warning_at(c, WARNING_ATTRIBUTES, loc, "'leaf' attribute ignored");
+    else if (leaf && s->internal)
+        warning_at(c, WARNING_ATTRIBUTES, loc, "'leaf' attribute has no effect on unit local functions");
+    else if (leaf)
+        s->attribute_markers |= MARK_LEAF;
+    unsigned temperature = specs.attribute_markers & (MARK_HOT | MARK_COLD);
+    for (const Decl *part = d; part && !temperature; part = part->inner)
+        temperature = part->attribute_markers & (MARK_HOT | MARK_COLD);
+    if (temperature && (s->is_typedef || s->type->kind != TY_FUNC)) {
+        warning_at(c, WARNING_ATTRIBUTES, loc, "'%s' attribute ignored",
+                   temperature & MARK_HOT ? "hot" : "cold");
+    } else if (temperature) {
+        unsigned prior = s->attribute_markers & (MARK_HOT | MARK_COLD);
+        if (prior && prior != temperature)
+            warning_at(c, WARNING_ATTRIBUTES, loc, "ignoring '%s' attribute because it conflicts with '%s'",
+                       temperature & MARK_HOT ? "hot" : "cold", prior & MARK_HOT ? "hot" : "cold");
+        else
+            s->attribute_markers |= temperature;
+    }
+    unsigned returns_twice = specs.attribute_markers & MARK_RETURNS_TWICE;
+    for (const Decl *part = d; part && !returns_twice; part = part->inner)
+        returns_twice = part->attribute_markers & MARK_RETURNS_TWICE;
+    if (returns_twice && (s->is_typedef || s->type->kind != TY_FUNC))
+        warning_at(c, WARNING_ATTRIBUTES, loc, "'returns_twice' attribute ignored");
+    else if (returns_twice)
+        s->attribute_markers |= MARK_RETURNS_TWICE;
     if (s->is_typedef)
         return;
     s->alignment_attributes |= specs.alignment_attributes;
@@ -7805,6 +8938,8 @@ Node *declare(Context *c, Specs specs, Decl *d, Node *init, Loc loc)
     Type *t = declaration_type(c, specs, d, loc);
     t = apply_noreturn(c, t, d, &specs, false, loc);
     t = allocation_size_type(c, t, specs.allocation, loc);
+    t = allocation_alignment_type(c, t, specs.allocation_alignment, loc);
+    t = assumed_alignment_type(c, t, specs.assumed_alignment, loc);
     if (specs.designated_init)
         designated_init_type(c, t, false, loc);
     bool is_typedef = specs.flags & S_TYPEDEF;
@@ -7915,7 +9050,7 @@ Node *declare(Context *c, Specs specs, Decl *d, Node *init, Loc loc)
         specs.attribute_markers |= declarator_noplt(specs, d);
     else
         warn_invalid_noplt(c, specs, d, loc);
-    declare_query_attributes(s, specs);
+    declare_query_attributes(c, s, specs, d, loc);
     declare_patchable_entry(c, s, specs, d);
     declare_call_diagnostics(c, s, specs.call_diagnostics, loc);
     declare_visibility(c, s, specs.visibility, loc);
@@ -7934,6 +9069,16 @@ Node *declare(Context *c, Specs specs, Decl *d, Node *init, Loc loc)
             error(c, loc, "'%s' is both defined and declared as an alias", id);
         else
             declare_alias(c, s, specs.alias, loc);
+    }
+    if (specs.ifunc) {
+        if (is_typedef || t->kind != TY_FUNC)
+            warning_at(c, WARNING_ATTRIBUTES, loc, "ifunc attribute ignored on non-function '%s'", id);
+        else if (!file_scope || global_register(s))
+            error(c, loc, "ifunc '%s' requires a file-scope function", id);
+        else if (s->ifunc && !equal(s->ifunc, specs.ifunc))
+            error(c, loc, "conflicting ifunc resolvers for '%s'", id);
+        else
+            s->ifunc = specs.ifunc;
     }
     Node *n = node(c, N_DECL, loc, NULL, NULL);
     n->symbol = s;
@@ -8431,6 +9576,7 @@ static void discard_function_objects(Context *c, Symbol *function)
     function->trampolines = NULL;
     function->has_nonlocal_labels = false;
     function->has_builtin_setjmp = false;
+    function->has_returns_twice = false;
     function->has_explicit_stack = false;
     function->has_stack_alloca = false;
     function->has_variable_temporary = false;
@@ -8446,6 +9592,8 @@ Node *begin_function(Context *c, Specs specs, Decl *d, Loc loc)
     if (specs.designated_init)
         designated_init_type(c, t, false, loc);
     t = allocation_size_type(c, t, specs.allocation, loc);
+    t = allocation_alignment_type(c, t, specs.allocation_alignment, loc);
+    t = assumed_alignment_type(c, t, specs.assumed_alignment, loc);
     const char *name = decl_name(d)->name;
     if (specs.has_alignas)
         error(c, loc, "_Alignas cannot be used with a function definition");
@@ -8482,6 +9630,7 @@ Node *begin_function(Context *c, Specs specs, Decl *d, Loc loc)
             }
         }
     }
+    s->function_definition_loc = decl_name(d)->loc;
     if (s->defined) {
         if (s->inline_definition == INLINE_GNU_EXTERN && definition == INLINE_ORDINARY)
             discard_function_objects(c, s);
@@ -8497,21 +9646,36 @@ Node *begin_function(Context *c, Specs specs, Decl *d, Loc loc)
     if (s->type->warn_unused_result)
         declared = warn_unused_result_type(c, declared, loc);
     declared = sentinel_type(c, declared, s->type->sentinels, loc);
+    declared = format_attribute_type(c, declared, s->type->format_spec);
+    declared = format_argument_type(c, declared, s->type->format_args, loc);
     declared = nullability_type(c, declared, s->type->nullability, loc);
     declared = access_type(c, declared, s->type->accesses);
-    s->type = allocation_size_type(c, declared, s->type->allocation, loc);
+    declared = allocation_size_type(c, declared, s->type->allocation, loc);
+    if (declared->allocation_alignment != s->type->allocation_alignment) {
+        Type *with_alignment = alloc(c, sizeof *with_alignment);
+        *with_alignment = *declared;
+        with_alignment->allocation_alignment = s->type->allocation_alignment;
+        declared = with_alignment;
+    }
+    if (!same_assumed_alignment(declared->assumed_alignment, s->type->assumed_alignment)) {
+        Type *with_alignment = alloc(c, sizeof *with_alignment);
+        *with_alignment = *declared;
+        with_alignment->assumed_alignment = s->type->assumed_alignment;
+        declared = with_alignment;
+    }
+    s->type = declared;
     declare_exec_sentinel(c, s, loc);
     if (specs.deprecated)
         s->deprecated = specs.deprecated;
     specs.attribute_markers |= declarator_noplt(specs, d);
-    declare_query_attributes(s, specs);
+    declare_query_attributes(c, s, specs, d, loc);
     declare_patchable_entry(c, s, specs, d);
     declare_call_diagnostics(c, s, specs.call_diagnostics, loc);
     declare_visibility(c, s, specs.visibility, loc);
     declare_lifecycle(c, s, specs, loc);
     declare_cleanup(c, s, cleanup_name(specs, d), specs.flags, loc);
     declare_section(c, s, specs.section, loc);
-    if (s->alias || specs.alias)
+    if (s->alias || specs.alias || s->ifunc || specs.ifunc)
         error(c, loc, "'%s' is both defined and declared as an alias", name);
     if (specs.flags & S_WEAK)
         mark_weak(c, s, loc);
@@ -8617,6 +9781,20 @@ static void resolve_symbol_aliases(Context *c)
 {
     for (size_t i = 0; i < c->globals.len && !c->failed; i++) {
         Symbol *s = c->globals.data[i];
+        if (s->ifunc) {
+            Symbol *resolver = find_assembly_symbol(c, s->ifunc);
+            if (s->weak || s->weak_reference || s->alias || s->body)
+                error(c, s->loc, "ifunc '%s' conflicts with another definition or attribute", s->name);
+            else if (!resolver || resolver->type->kind != TY_FUNC || !resolver->body)
+                error(c, s->loc, "ifunc '%s' requires a defined resolver '%s'", s->name, s->ifunc);
+            else if (resolver->type->base->kind != TY_PTR)
+                error(c, resolver->loc, "ifunc resolver '%s' must return a pointer", resolver->name);
+            else if (resolver->type->base->base->kind != TY_VOID &&
+                     !compatible(resolver->type->base->base, s->type, false))
+                warning_at(c, WARNING_ATTRIBUTE_ALIAS, resolver->loc,
+                           "ifunc resolver '%s' returns a pointer incompatible with '%s'",
+                           resolver->name, s->name);
+        }
         if (s->weak_reference && !s->alias) {
             warning_at(c, WARNING_ATTRIBUTES, s->loc, "weakref attribute requires an alias target");
             s->weak_reference = false;
@@ -8636,7 +9814,7 @@ static void resolve_symbol_aliases(Context *c)
                 error(c, s->loc, "weakref '%s' is part of an alias cycle", s->name);
             continue;
         }
-        if (!target || target->alias || (target->type->kind == TY_FUNC ? !target->body :
+        if (!target || target->alias || (target->type->kind == TY_FUNC ? !target->body && !target->ifunc :
                                         (!target->defined && !target->tentative))) {
             error(c, s->loc, "alias '%s' requires a defined target '%s'", s->name, s->alias);
             return;
@@ -8647,6 +9825,9 @@ static void resolve_symbol_aliases(Context *c)
         } else if ((s->type->kind == TY_FUNC) != (target->type->kind == TY_FUNC) ||
                    s->thread_local_storage != target->thread_local_storage) {
             error(c, s->loc, "alias '%s' and '%s' have different symbol kinds", s->name, s->alias);
+        } else if (s->type->kind == TY_FUNC && !compatible(s->type, target->type, false)) {
+            warning_at(c, WARNING_ATTRIBUTE_ALIAS, s->loc,
+                       "alias '%s' has an incompatible function type with '%s'", s->name, s->alias);
         }
     }
 }
@@ -8670,7 +9851,7 @@ void finish_translation_unit(Context *c)
     for (size_t i = 0; i < c->globals.len; i++) {
         Symbol *s = c->globals.data[i];
         if (s->type && !s->internal && !s->visibility && !s->weak_reference &&
-            (s->alias || (s->type->kind == TY_FUNC ? s->body != NULL : s->defined || s->tentative)))
+            (s->alias || s->ifunc || (s->type->kind == TY_FUNC ? s->body != NULL : s->defined || s->tentative)))
             s->visibility = c->default_visibility;
     }
 }
