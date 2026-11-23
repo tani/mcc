@@ -1,6 +1,7 @@
 #include "as.h"
 
 #include <string.h>
+#include <strings.h>
 
 typedef struct { unsigned id; char kind; bool stack; } Register;
 
@@ -15,7 +16,7 @@ static bool reg(const char *text, Register *result)
         return true;
     }
     uint64_t n;
-    if (!*text || !strchr("xwsdq", *text) || !mas_integer(text + 1, &n) || n > 31 ||
+    if (!*text || !strchr("xwhsdq", *text) || !mas_integer(text + 1, &n) || n > 31 ||
         (n == 31 && (*text == 'x' || *text == 'w')))
         return false;
     *result = (Register){(unsigned)n, *text, false};
@@ -285,6 +286,31 @@ static bool address(char *text, Address *result)
            (result->base.id < 31 || result->base.stack);
 }
 
+static bool prefetch(Assembler *a, AsmArgs *args)
+{
+    static const char *const operations[32] = {
+        [0] = "pldl1keep", "pldl1strm", "pldl2keep", "pldl2strm", "pldl3keep", "pldl3strm",
+        [8] = "plil1keep", "plil1strm", "plil2keep", "plil2strm", "plil3keep", "plil3strm",
+        [16] = "pstl1keep", "pstl1strm", "pstl2keep", "pstl2strm", "pstl3keep", "pstl3strm",
+    };
+    Address mem;
+    uint64_t offset = 0;
+    if (args->len != 2 || !address(args->data[1], &mem) || mem.pre ||
+        (mem.offset && (!immediate(mem.offset, &offset) || offset > 32760 || offset % 8)))
+        return false;
+    uint64_t operation;
+    if (!immediate(args->data[0], &operation)) {
+        for (operation = 0; operation < 32; operation++)
+            if (operations[operation] && !strcasecmp(args->data[0], operations[operation]))
+                break;
+    }
+    if (operation >= 32)
+        return false;
+    mas_emit(a, UINT32_C(0xf9800000) | ((uint32_t)(offset / 8) << 10) |
+             (mem.base.id << 5) | (uint32_t)operation, 4);
+    return true;
+}
+
 static bool memory(Assembler *a, const char *op, AsmArgs *args)
 {
     bool pair = equal(op, "stp") || equal(op, "ldp");
@@ -306,7 +332,8 @@ static bool memory(Assembler *a, const char *op, AsmArgs *args)
         return false;
     const char *offset = post ? p[at + 1] : mem.offset;
     uint32_t word;
-    unsigned scale = first.kind == 'q' ? 16 : first.kind == 'x' || first.kind == 'd' ? 8 : 4;
+    unsigned scale = first.kind == 'q' ? 16 : first.kind == 'x' || first.kind == 'd' ? 8 :
+                     first.kind == 'h' ? 2 : 4;
     if (pair) {
         if (first.kind != 'x' && first.kind != 'w' && first.kind != 'q')
             return false;
@@ -323,7 +350,7 @@ static bool memory(Assembler *a, const char *op, AsmArgs *args)
             return false;
         word |= ((uint32_t)((int64_t)raw / (int64_t)scale) & 127) << 15 | (second.id << 10);
     } else {
-        word = first.kind == 'w' ? 0xb9400000 : first.kind == 'x' ? 0xf9400000 :
+        word = first.kind == 'w' ? 0xb9400000 : first.kind == 'x' ? 0xf9400000 : first.kind == 'h' ? 0x7d400000 :
                first.kind == 's' ? 0xbd400000 : first.kind == 'd' ? 0xfd400000 : 0x3dc00000;
         if (narrow) {
             if (!gp(first))
@@ -378,6 +405,27 @@ static bool memory(Assembler *a, const char *op, AsmArgs *args)
     return true;
 }
 
+static bool system_register_access(Assembler *a, const char *op, AsmArgs *args)
+{
+    bool read = equal(op, "mrs");
+    Register reg64;
+    if (args->len != 2 || !reg(args->data[read ? 0 : 1], &reg64) ||
+        reg64.kind != 'x' || reg64.stack)
+        return false;
+    const char *name = args->data[read ? 1 : 0];
+    static const struct { const char *name; uint32_t field; bool writable; } registers[] = {
+        {"tpidr_el0", 0x1bd040, true}, {"ctr_el0", 0x1b0020, false},
+        {"fpcr", 0x1b4400, true}, {"fpsr", 0x1b4420, true},
+    };
+    for (size_t i = 0; i < sizeof registers / sizeof *registers; i++) {
+        if (equal(name, registers[i].name) && (read || registers[i].writable)) {
+            mas_emit(a, (read ? 0xd5200000 : 0xd5000000) | registers[i].field | reg64.id, 4);
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool integer_misc(Assembler *a, const char *op, AsmArgs *args)
 {
     char **p = args->data;
@@ -389,10 +437,6 @@ static bool integer_misc(Assembler *a, const char *op, AsmArgs *args)
         if (cond < 0)
             return false;
         mas_emit(a, UINT32_C(0x1a9f07e0) | sf(d) | ((unsigned)(cond ^ 1) << 12) | d.id, 4);
-        return true;
-    }
-    if (args->len == 2 && equal(op, "mrs") && d.kind == 'x' && equal(p[1], "tpidr_el0")) {
-        mas_emit(a, 0xd53bd040 | d.id, 4);
         return true;
     }
     if (args->len == 2 && (equal(op, "adr") || equal(op, "adrp")) && d.kind == 'x') {
@@ -496,10 +540,19 @@ static bool floating(Assembler *a, const char *op, AsmArgs *args)
 
 bool mas_aarch64(Assembler *a, const char *op, AsmArgs *args)
 {
-    if (a->sections[SECTION_TEXT].size % 4)
+    if (a->sections.data[a->section].size % 4)
         return false;
     if (!args->len && equal(op, "nop")) {
         mas_emit(a, 0xd503201f, 4);
+        return true;
+    }
+    bool full_barrier = args->len == 1 && equal(args->data[0], "sy");
+    if (full_barrier && equal(op, "dsb")) {
+        mas_emit(a, 0xd5033f9f, 4);
+        return true;
+    }
+    if ((!args->len || full_barrier) && equal(op, "isb")) {
+        mas_emit(a, 0xd5033fdf, 4);
         return true;
     }
     if (args->len == 2 && equal(op, "movi") && *args->data[0] == 'v') {
@@ -524,6 +577,10 @@ bool mas_aarch64(Assembler *a, const char *op, AsmArgs *args)
     }
     if (equal(op, "mov") || equal(op, "movz") || equal(op, "movk") || equal(op, "movn"))
         return move(a, op, args);
+    if (equal(op, "prfm"))
+        return prefetch(a, args);
+    if (equal(op, "mrs") || equal(op, "msr"))
+        return system_register_access(a, op, args);
     return branch(a, op, args) || arithmetic(a, op, args) || memory(a, op, args) ||
            integer_misc(a, op, args) || floating(a, op, args);
 }

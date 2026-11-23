@@ -41,6 +41,9 @@ struct dl_find_object {
 };
 
 int _dl_find_object(void *, struct dl_find_object *);
+#if defined(__aarch64__)
+unsigned long getauxval(unsigned long);
+#endif
 _Noreturn void abort(void);
 void mcc_capture_frame(uintptr_t regs[REG_COUNT]);
 _Noreturn void mcc_install_frame(const uintptr_t regs[REG_COUNT]);
@@ -76,7 +79,7 @@ typedef struct { Rule regs[REG_COUNT]; Rule cfa; unsigned cfa_register; bool sig
 
 static bool available(Reader *r, uint64_t count)
 {
-    if (r->failed || count > (uint64_t)(r->end - r->at)) {
+    if (r->failed || (uintptr_t)r->at > (uintptr_t)r->end || count > (uintptr_t)r->end - (uintptr_t)r->at) {
         r->failed = true;
         return false;
     }
@@ -152,7 +155,8 @@ static uintptr_t address(Reader *r, unsigned encoding, uintptr_t data, uintptr_t
         return value;
     if (value < bounds.lo || value > bounds.hi || bounds.hi - value < sizeof value) {
         struct dl_find_object segment;
-        if (_dl_find_object((void *)value, &segment) != 0 || (uintptr_t)segment.map_end - value < sizeof value) {
+        if (_dl_find_object((void *)value, &segment) != 0 || (uintptr_t)segment.map_end < value ||
+            (uintptr_t)segment.map_end - value < sizeof value) {
             r->failed = true;
             return 0;
         }
@@ -231,6 +235,8 @@ static bool find_frame(uintptr_t pc, Frame *frame)
         if (_dl_find_object(object.eh_frame, &segment) != 0)
             return false;
         bounds = (Bounds){(uintptr_t)segment.map_start, (uintptr_t)segment.map_end};
+        if (header < bounds.lo || header >= bounds.hi)
+            return false;
     }
     Reader r = {object.eh_frame, (const uint8_t *)bounds.hi, false};
     if (fixed(&r, 1) != 1)
@@ -383,6 +389,63 @@ static uintptr_t load_word(uintptr_t address_value)
     return value;
 }
 
+static bool signal_frame(UnwindContext *ctx)
+{
+#if defined(__aarch64__)
+    /* Linux returns from signal handlers through the vDSO rt_sigreturn stub. */
+    uintptr_t vdso = getauxval(33); /* AT_SYSINFO_EHDR */
+    uintptr_t pc = ctx->regs[PC];
+    if (!vdso || pc < vdso || (pc & 3))
+        return false;
+    Reader header = {(const uint8_t *)vdso + 32, (const uint8_t *)vdso + 64, false};
+    uint64_t phoff = fixed(&header, 8);
+    header.at += 14;
+    uint64_t stride = fixed(&header, 2), count = fixed(&header, 2);
+    if (stride != 56 || phoff > 4096 || count > (4096 - phoff) / stride)
+        return false;
+    bool executable = false;
+    for (uint64_t i = 0; i < count; i++) {
+        const uint8_t *start = (const uint8_t *)vdso + phoff + i * stride;
+        Reader ph = {start, start + stride, false};
+        unsigned type = (unsigned)fixed(&ph, 4), flags = (unsigned)fixed(&ph, 4);
+        ph.at += 8;
+        uint64_t begin = fixed(&ph, 8);
+        ph.at += 16;
+        uint64_t size = fixed(&ph, 8);
+        if (type == 1 && (flags & 1) && size >= 12 && pc - vdso >= begin && pc - vdso - begin <= size - 12)
+            executable = true;
+    }
+    if (!executable)
+        return false;
+    Reader code = {(const uint8_t *)pc, (const uint8_t *)pc + 12, false};
+    uint64_t first = fixed(&code, 4);
+    if (first == 0xd503245f) /* bti c */
+        first = fixed(&code, 4);
+    if (first != 0xd2801168 || fixed(&code, 4) != 0xd4000001) /* mov x8, #139; svc #0 */
+        return false;
+
+    /* The signal frame contains siginfo followed by ucontext. The latter's
+       machine context starts at byte 176 and begins with the fault address. */
+    const uint8_t *machine = (const uint8_t *)ctx->regs[STACK] + 128 + 176;
+    uintptr_t restored[33];
+    memcpy(restored, machine + 8, sizeof restored);
+    if (!restored[PC] || !restored[STACK] || (restored[STACK] & 15))
+        return false;
+    memcpy(ctx->regs, restored, sizeof restored);
+    const uint8_t *extra = machine + 288;
+    Reader fpsimd = {extra, extra + 528, false};
+    if (fixed(&fpsimd, 4) == 0x46508001 && fixed(&fpsimd, 4) == 528)
+        for (unsigned i = 8; i < 16; i++)
+            ctx->regs[64 + i] = load_word((uintptr_t)extra + 16 + i * 16);
+    ctx->cfa = restored[STACK];
+    ctx->signal = true;
+    return true;
+#else
+    (void)ctx;
+    return false;
+#endif
+}
+
 static bool evaluate(Rule rule, const UnwindContext *context, uintptr_t cfa, uintptr_t *value)
 {
     Reader r = {rule.expression, rule.expression + rule.value, false};
@@ -505,11 +568,14 @@ int _Unwind_Backtrace(Trace trace, void *argument)
     UnwindContext ctx = {0};
     mcc_capture_frame(ctx.regs);
     ctx.cfa = ctx.regs[STACK];
-    Frame frame;
-    do {
+    for (;;) {
         if (trace(&ctx, argument) != NO_REASON)
             break;
-    } while (find_frame(instruction(&ctx), &frame) && step(&ctx, &frame, instruction(&ctx)));
+        uintptr_t pc = instruction(&ctx);
+        Frame frame;
+        if (!(find_frame(pc, &frame) ? step(&ctx, &frame, pc) : signal_frame(&ctx)))
+            break;
+    }
     return END_OF_STACK;
 }
 
@@ -520,14 +586,15 @@ static int forced_unwind(UnwindException *exception, UnwindContext *ctx, bool re
         Frame frame;
         bool found = find_frame(pc, &frame);
         UnwindContext next = *ctx;
-        bool has_caller = found && step(&next, &frame, pc);
+        bool has_caller = found ? step(&next, &frame, pc) : signal_frame(&next);
         int actions = FORCE_UNWIND | CLEANUP_PHASE;
         if (!resume || !has_caller) {
-            int reason = exception->stop(1, actions | (!found ? END_ACTION : 0), exception->exception_class,
+            bool end = !found && !has_caller;
+            int reason = exception->stop(1, actions | (end ? END_ACTION : 0), exception->exception_class,
                                          exception, ctx, exception->argument);
-            if (reason != NO_REASON || !found)
+            if (reason != NO_REASON || end)
                 return reason != NO_REASON ? FATAL_PHASE2 : END_OF_STACK;
-            if (!resume && frame.cie.personality) {
+            if (!resume && found && frame.cie.personality) {
                 Personality personality = (Personality)frame.cie.personality;
                 ctx->start = frame.start;
                 ctx->lsda = frame.lsda;

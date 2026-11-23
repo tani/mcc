@@ -5,9 +5,11 @@ LINKER := $(BUILD)/mld
 RUNTIME := $(BUILD)/rt
 SEED := $(RUNTIME)/mcc-seed
 RT_ARCHS := aarch64 x86_64
+RT_NATIVE := $(shell uname -m)
 RT_FILES := $(foreach arch,$(RT_ARCHS),$(addprefix $(RUNTIME)/$(arch)/,crt-exe.o crt-shared.o libmccrt.a))
 RT_EMBEDDED := $(RUNTIME)/embedded.o
-CC_OBJECTS := $(addprefix $(BUILD)/cc/,driver.o cpp.o frontend.o ir.o data.o aarch64.o x86_64.o parser.o scanner.o)
+RT_SEED := $(RUNTIME)/seed-quad.o $(RUNTIME)/seed-quad-complex.o $(RUNTIME)/seed-decimal.o $(RUNTIME)/seed-float-bits.o $(RUNTIME)/$(RT_NATIVE)/fp.o
+CC_OBJECTS := $(addprefix $(BUILD)/cc/,driver.o cpp.o frontend.o ir.o data.o inline_asm.o aarch64.o x86_64.o parser.o scanner.o)
 ELF_COMMON := $(addprefix $(BUILD)/,elf_tools.o core.o)
 AS_OBJECTS := $(addprefix $(BUILD)/as/,as.o aarch64.o x86_64.o)
 LD_OBJECTS := $(addprefix $(BUILD)/ld/,ld.o driver.o input.o reloc.o)
@@ -26,7 +28,7 @@ WARN := -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-Wframe-larger-than=65536 -Wstack-usage=65536
 PARSER_WARN ?= $(if $(filter -Wall,$(WARN)),-Wno-unused-but-set-variable)
 
-.PHONY: all mas mld clean check check-suite check-strict check-extended check-bootstrap check-gcc
+.PHONY: all mas mld clean check check-suite check-strict check-extended check-bootstrap check-gcc check-gnu-extensions
 all: $(PROGRAM) $(ASSEMBLER) $(LINKER)
 
 mas: $(ASSEMBLER)
@@ -41,23 +43,30 @@ $(BUILD)/cc/parser.c $(BUILD)/cc/parser.h &: src/cc/parser.y | $(BUILD)/cc
 $(BUILD)/cc/scanner.c: src/cc/scanner.l | $(BUILD)/cc
 	flex -o $@ $<
 
-$(BUILD)/%.o: src/%.c src/compiler.h
+$(BUILD)/%.o: src/%.c src/compiler.h src/atomic.h src/int128.h src/decimal.h src/float_builtins.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -Isrc -I$(BUILD)/cc -c -o $@ $<
 
 $(BUILD)/cc/driver.o: override CPPFLAGS += -DMCC_BUILTIN_INCLUDE='"$(CURDIR)/include"'
 $(BUILD)/cc/driver.o: src/as/as.h src/ld/ld.h src/elf_tools.h
 $(addprefix $(BUILD)/cc/,frontend.o ir.o aarch64.o x86_64.o): $(BUILD)/cc/parser.h
+$(BUILD)/cc/frontend.o: src/integer_bits.h src/integer_overflow.h src/complex_ops.h
+$(addprefix $(BUILD)/cc/,frontend.o data.o): src/int128_float.h
+$(addprefix $(BUILD)/cc/,frontend.o data.o ir.o): src/int128_math.h
+$(addprefix $(BUILD)/cc/,frontend.o data.o): src/quad.h
+$(BUILD)/cc/data.o: src/float16.h src/quad_bits.h
+$(addprefix $(BUILD)/cc/,frontend.o inline_asm.o ir.o aarch64.o x86_64.o): src/cc/inline_asm.h
 $(BUILD)/as/main.o $(AS_OBJECTS): src/as/as.h src/elf_tools.h
 $(BUILD)/ld/main.o $(BUILD)/ld/runtime.o $(LD_OBJECTS): src/ld/ld.h src/elf_tools.h
 $(BUILD)/elf_tools.o: src/elf_tools.h
 
-$(BUILD)/cc/%.o: $(BUILD)/cc/%.c src/compiler.h
+$(BUILD)/cc/%.o: $(BUILD)/cc/%.c src/compiler.h src/atomic.h src/int128.h src/decimal.h src/float_builtins.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(GENERATED_WARN) -Isrc -I$(BUILD)/cc -c -o $@ $<
 
 $(BUILD)/cc/parser.o: GENERATED_WARN = $(PARSER_WARN)
+$(BUILD)/cc/scanner.o: GENERATED_WARN = $(SCANNER_WARN)
 
-$(PROGRAM): $(CC_OBJECTS) $(AS_OBJECTS) $(LD_OBJECTS) $(ELF_COMMON) $(BUILD)/ld/runtime.o $(RT_EMBEDDED)
+$(PROGRAM): $(CC_OBJECTS) $(AS_OBJECTS) $(LD_OBJECTS) $(ELF_COMMON) $(BUILD)/ld/runtime.o $(RT_EMBEDDED) $(RUNTIME)/$(RT_NATIVE)/libmccrt.a
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(ASSEMBLER): $(BUILD)/as/main.o $(AS_OBJECTS) $(ELF_COMMON)
@@ -70,7 +79,23 @@ $(RUNTIME)/seed.o: src/ld/runtime.c src/ld/ld.h src/elf_tools.h src/compiler.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -DMCC_RUNTIME_SEED -Isrc -c -o $@ $<
 
-$(SEED): $(CC_OBJECTS) $(AS_OBJECTS) $(LD_OBJECTS) $(ELF_COMMON) $(RUNTIME)/seed.o
+$(RUNTIME)/seed-quad.o: src/rt/quad.c src/rt/types.h src/rt/fp-round.h src/quad_bits.h src/int128_float.h src/int128_math.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -c -o $@ $<
+
+$(RUNTIME)/seed-quad-complex.o: src/rt/quad-complex.c src/rt/types.h src/complex_ops.h src/quad.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -c -o $@ $<
+
+$(RUNTIME)/seed-decimal.o: src/rt/decimal.c src/rt/types.h src/rt/decimal-internal.h src/decimal.h src/float_builtins.h src/int128_math.h src/int128_float.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -c -o $@ $<
+
+$(RUNTIME)/seed-float-bits.o: src/rt/float-bits.c src/rt/types.h src/float_builtins.h src/decimal.h src/int128_math.h src/int128_float.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) -c -o $@ $<
+
+$(SEED): $(CC_OBJECTS) $(AS_OBJECTS) $(LD_OBJECTS) $(ELF_COMMON) $(RUNTIME)/seed.o $(RT_SEED)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(RUNTIME)/%/crt-exe.o: src/rt/crt-exe.s $(ASSEMBLER)
@@ -90,15 +115,23 @@ define rt_c
 $(RUNTIME)/$(1)/$(2).o: src/rt/$(2).c src/rt/types.h $(SEED) $(ASSEMBLER)
 	@mkdir -p $$(@D)
 	$(SEED) --target=$(1)-linux-gnu -std=c11 -pedantic-errors -S -o $$(@:.o=.s) $$<
-	awk '{ print } $$$$1 == ".global" { print ".hidden " $$$$2 }' $$(@:.o=.s) > $$(@:.o=.hidden.s)
+	awk '{ print } $$$$1 == ".global" && $$$$2 != "__mcc_decimal_environment" { print ".hidden " $$$$2 }' $$(@:.o=.s) > $$(@:.o=.hidden.s)
 	$(ASSEMBLER) --target=$(1)-linux-gnu -o $$@ $$(@:.o=.hidden.s)
 endef
-$(foreach arch,$(RT_ARCHS),$(foreach part,quad unwind integer,$(eval $(call rt_c,$(arch),$(part)))))
+$(foreach arch,$(RT_ARCHS),$(foreach part,quad quad-complex half unwind integer atomic complex decimal decimal-runtime decimal-abi float-bits,$(eval $(call rt_c,$(arch),$(part)))))
+$(foreach arch,$(RT_ARCHS),$(eval $(call rt_c,$(arch),trampoline)))
+$(foreach arch,$(RT_ARCHS),$(RUNTIME)/$(arch)/integer.o): src/integer_bits.h src/integer_overflow.h src/int128.h src/int128_math.h src/int128_float.h
+$(foreach arch,$(RT_ARCHS),$(RUNTIME)/$(arch)/atomic.o): src/atomic.h
+$(foreach arch,$(RT_ARCHS),$(RUNTIME)/$(arch)/complex.o): src/complex_ops.h include/float.h
+$(foreach arch,$(RT_ARCHS),$(RUNTIME)/$(arch)/half.o): src/float16.h src/int128_math.h include/float.h
 
-$(RUNTIME)/x86_64/quad-abi.o: src/rt/quad-x86_64.awk $(ASSEMBLER)
-	@mkdir -p $(@D)
-	awk -f $< > $(@:.o=.s)
-	$(ASSEMBLER) --target=x86_64-linux-gnu -o $@ $(@:.o=.s)
+$(foreach arch,$(RT_ARCHS),$(RUNTIME)/$(arch)/quad.o): src/quad_bits.h src/int128_float.h src/int128_math.h
+$(foreach arch,$(RT_ARCHS),$(addprefix $(RUNTIME)/$(arch)/,decimal.o decimal-runtime.o)): src/rt/decimal-internal.h
+$(foreach arch,$(RT_ARCHS),$(addprefix $(RUNTIME)/$(arch)/,decimal.o decimal-runtime.o decimal-abi.o)): src/decimal.h src/int128_math.h src/int128_float.h
+$(foreach arch,$(RT_ARCHS),$(addprefix $(RUNTIME)/$(arch)/,decimal.o decimal-runtime.o decimal-abi.o float-bits.o)): src/float_builtins.h
+$(foreach arch,$(RT_ARCHS),$(RUNTIME)/$(arch)/float-bits.o): src/decimal.h src/int128_math.h src/int128_float.h
+$(foreach arch,$(RT_ARCHS),$(addprefix $(RUNTIME)/$(arch)/,quad.o half.o integer.o)): src/rt/fp-round.h
+$(foreach arch,$(RT_ARCHS),$(RUNTIME)/$(arch)/quad-complex.o): src/complex_ops.h src/quad.h include/float.h
 
 $(RUNTIME)/%/frame.o: src/rt/frame-%.s $(ASSEMBLER)
 	@mkdir -p $(@D)
@@ -108,9 +141,12 @@ $(RUNTIME)/%/fp.o: src/rt/fp-%.s $(ASSEMBLER)
 	@mkdir -p $(@D)
 	$(ASSEMBLER) --target=$*-linux-gnu -o $@ $<
 
+$(RUNTIME)/%/atomic-arch.o: src/rt/atomic-%.s $(ASSEMBLER)
+	@mkdir -p $(@D)
+	$(ASSEMBLER) --target=$*-linux-gnu -o $@ $<
+
 $(RUNTIME)/aarch64/libmccrt.a: $(RUNTIME)/aarch64/atomics.o
-$(RUNTIME)/x86_64/libmccrt.a: $(RUNTIME)/x86_64/quad-abi.o
-$(RUNTIME)/%/libmccrt.a: $(addprefix $(RUNTIME)/%/,quad.o fp.o integer.o unwind.o frame.o)
+$(RUNTIME)/%/libmccrt.a: $(addprefix $(RUNTIME)/%/,quad.o quad-complex.o half.o fp.o integer.o unwind.o frame.o trampoline.o atomic.o atomic-arch.o complex.o decimal.o decimal-runtime.o decimal-abi.o float-bits.o)
 	@mkdir -p $(@D)
 	rm -f $@.tmp
 	$(AR) rcs $@.tmp $^
@@ -137,6 +173,9 @@ check-strict: $(PROGRAM)
 
 check-extended: $(PROGRAM)
 	python3 c-testsuite-extended/check.py $(PROGRAM)
+
+check-gnu-extensions: $(PROGRAM)
+	python3 tests/check_gnu_extensions.py $(PROGRAM)
 
 check-bootstrap:
 	python3 c-testsuite-extended/bootstrap.py

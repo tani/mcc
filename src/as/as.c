@@ -3,27 +3,35 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
 struct AsmSymbol {
     const char *name;
+    AsmSymbol *alias;
+    Loc alias_loc;
     unsigned section;
     size_t offset, size;
     unsigned type, visibility;
     uint32_t index;
-    bool global;
+    bool global, weak, weak_reference, referenced;
 };
 
-static const SectionKind *section_kind(unsigned index)
-{
-    static const SectionKind extra[] = {
-        {".tdata", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS},
-        {".tbss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS},
-        {".fini_array", SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE},
-    };
-    return index < SECTION_COUNT ? &elf_sections[index] : &extra[index - SECTION_COUNT];
-}
+struct AsmDifference {
+    AsmSymbol *left, *right;
+    size_t offset;
+    unsigned section, width;
+    Loc loc;
+};
+
+static const SectionKind extra_sections[] = {
+    {".tdata", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS},
+    {".tbss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS},
+    {".preinit_array", SHT_PREINIT_ARRAY, SHF_ALLOC | SHF_WRITE},
+    {".init_array", SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE},
+    {".fini_array", SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE},
+};
 
 char *mas_trim(char *text)
 {
@@ -94,8 +102,8 @@ bool mas_expression(Assembler *a, char *text, AsmExpr *expr)
 
 static void append(Assembler *a, const void *data, size_t size)
 {
-    AsmSection *section = &a->sections[a->section];
-    bool nobits = section_kind(a->section)->type == SHT_NOBITS;
+    AsmSection *section = &a->sections.data[a->section];
+    bool nobits = section->kind.type == SHT_NOBITS;
     if (a->section == SECTION_NONE || (nobits && data)) {
         error(a->context, a->loc, "cannot emit initialized bytes in this section");
         return;
@@ -119,8 +127,8 @@ void mas_emit(Assembler *a, uint64_t value, unsigned width)
 
 void mas_relocate(Assembler *a, uint32_t type, AsmExpr expr)
 {
-    AsmSection *section = &a->sections[a->section];
-    if (!expr.symbol || a->section == SECTION_NONE || section_kind(a->section)->type == SHT_NOBITS) {
+    AsmSection *section = &a->sections.data[a->section];
+    if (!expr.symbol || a->section == SECTION_NONE || section->kind.type == SHT_NOBITS) {
         error(a->context, a->loc, "invalid symbolic relocation");
         return;
     }
@@ -129,6 +137,7 @@ void mas_relocate(Assembler *a, uint32_t type, AsmExpr expr)
                                      type == R_AARCH64_TLSDESC_LD64_LO12 ||
                                      type == R_AARCH64_TLSDESC_ADD_LO12 || type == R_AARCH64_TLSDESC_CALL)))
         expr.symbol->type = STT_TLS;
+    expr.symbol->referenced = true;
     PUSH(a->context, section->relocations, ((AsmReloc){section->size, type, expr}));
 }
 
@@ -170,12 +179,12 @@ static bool split_args(char *text, AsmArgs *args)
 static bool define_label(Assembler *a, char *name)
 {
     AsmSymbol *s = symbol(a, name);
-    if (!s || a->section == SECTION_NONE || s->section) {
+    if (!s || a->section == SECTION_NONE || s->section || s->alias) {
         error(a->context, a->loc, "invalid or duplicate label '%s'", name);
         return false;
     }
     s->section = a->section;
-    s->offset = a->sections[a->section].size;
+    s->offset = a->sections.data[a->section].size;
     return true;
 }
 
@@ -183,15 +192,16 @@ static bool align_section(Assembler *a, uint64_t alignment)
 {
     if (!alignment || alignment > 65536 || (alignment & (alignment - 1)) || a->section == SECTION_NONE)
         return false;
-    AsmSection *s = &a->sections[a->section];
+    AsmSection *s = &a->sections.data[a->section];
     size_t boundary = (size_t)alignment;
     if (boundary > s->alignment)
         s->alignment = boundary;
     size_t padding = (0 - s->size) & (boundary - 1);
-    if (a->section == SECTION_TEXT && a->machine == EM_X86_64) {
+    bool code = (s->kind.flags & SHF_EXECINSTR) != 0;
+    if (code && a->machine == EM_X86_64) {
         for (size_t i = 0; i < padding; i++)
             mas_emit(a, 0x90, 1);
-    } else if (a->section == SECTION_TEXT && s->size % 4 == 0 && padding % 4 == 0) {
+    } else if (code && s->size % 4 == 0 && padding % 4 == 0) {
         for (size_t i = 0; i < padding; i += 4)
             mas_emit(a, 0xd503201f, 4);
     } else {
@@ -236,6 +246,12 @@ static bool symbol_directive(Assembler *a, const char *op, AsmArgs *args)
                 return false;
             if (equal(op, ".hidden"))
                 s->visibility = STV_HIDDEN;
+            else if (equal(op, ".internal"))
+                s->visibility = STV_INTERNAL;
+            else if (equal(op, ".protected"))
+                s->visibility = STV_PROTECTED;
+            else if (equal(op, ".weak"))
+                s->weak = true;
             else
                 s->global = true;
         }
@@ -262,11 +278,89 @@ static bool symbol_directive(Assembler *a, const char *op, AsmArgs *args)
     }
     uint64_t size = 0;
     if (!strncmp(value, ".-", 2) && equal(value + 2, s->name) && s->section == a->section)
-        size = a->sections[a->section].size - s->offset;
+        size = a->sections.data[a->section].size - s->offset;
     else if (!mas_integer(value, &size) || size > (uint64_t)PTRDIFF_MAX)
         return false;
     s->size = (size_t)size;
     return true;
+}
+
+static bool symbol_alias(Assembler *a, AsmArgs *args, bool weak_reference)
+{
+    if (args->len != 2)
+        return false;
+    AsmSymbol *name = symbol(a, args->data[0]);
+    AsmSymbol *target = symbol(a, args->data[1]);
+    if (!name || !target || name->section ||
+        (name->alias && (name->alias != target || name->weak_reference != weak_reference)))
+        return false;
+    name->alias = target;
+    name->alias_loc = a->loc;
+    name->weak_reference = weak_reference;
+    return true;
+}
+
+static void resolve_aliases(Assembler *a)
+{
+    for (size_t i = 0; i < a->symbols.len && !a->context->failed; i++) {
+        AsmSymbol *s = a->symbols.data[i];
+        if (!s->alias || s->weak_reference)
+            continue;
+        AsmSymbol *target = s->alias;
+        size_t steps = 0;
+        while (target->alias && ++steps < a->symbols.len)
+            target = target->alias;
+        if (target->alias || !target->section) {
+            error(a->context, s->alias_loc, "alias '%s' requires a defined target", s->name);
+            return;
+        }
+        s->section = target->section;
+        s->offset = target->offset;
+        if (!s->type)
+            s->type = target->type;
+        if (!s->size)
+            s->size = target->size;
+    }
+}
+
+static AsmSymbol *weak_referent(Assembler *a, AsmSymbol *alias)
+{
+    AsmSymbol *target = alias;
+    size_t steps = 0;
+    while (target->weak_reference && ++steps < a->symbols.len)
+        target = target->alias;
+    if (target->weak_reference)
+        error(a->context, alias->alias_loc, "weak reference '%s' is part of a cycle", alias->name);
+    return target;
+}
+
+static void resolve_weak_references(Assembler *a)
+{
+    for (size_t i = 0; i < a->symbols.len && !a->context->failed; i++)
+        if (a->symbols.data[i]->weak_reference)
+            weak_referent(a, a->symbols.data[i]);
+    if (a->context->failed)
+        return;
+    for (size_t section = 1; section < a->sections.len; section++) {
+        AsmSection *s = &a->sections.data[section];
+        for (size_t i = 0; i < s->relocations.len; i++) {
+            AsmExpr *e = &s->relocations.data[i].expr;
+            if (!e->symbol->weak_reference)
+                continue;
+            AsmSymbol *target = weak_referent(a, e->symbol);
+            if (!target->section && !target->referenced)
+                target->weak = true;
+            if (!target->type)
+                target->type = e->symbol->type;
+            target->referenced = true;
+            e->symbol = target;
+        }
+    }
+    for (size_t i = 0; i < a->differences.len; i++) {
+        AsmDifference *d = &a->differences.data[i];
+        d->left = weak_referent(a, d->left);
+        d->right = weak_referent(a, d->right);
+    }
 }
 
 static bool data_directive(Assembler *a, AsmArgs *args, unsigned width)
@@ -275,8 +369,22 @@ static bool data_directive(Assembler *a, AsmArgs *args, unsigned width)
                      (width == 8 ? R_AARCH64_ABS64 : R_AARCH64_ABS32) :
                      (width == 8 ? R_X86_64_64 : R_X86_64_32);
     for (size_t i = 0; i < args->len; i++) {
+        char *text = args->data[i];
+        char *minus = strchr(text, '-');
+        if (minus && symbol_char(*mas_trim(minus + 1), true)) {
+            *minus = 0;
+            AsmSymbol *left = symbol(a, mas_trim(text));
+            AsmSymbol *right = symbol(a, mas_trim(minus + 1));
+            if (!left || !right)
+                return false;
+            AsmDifference difference = {left, right, a->sections.data[a->section].size,
+                                        a->section, width, a->loc};
+            PUSH(a->context, a->differences, difference);
+            mas_emit(a, 0, width);
+            continue;
+        }
         AsmExpr expr;
-        if (!mas_expression(a, args->data[i], &expr))
+        if (!mas_expression(a, text, &expr))
             return false;
         if (expr.symbol) {
             if (width < 4)
@@ -288,27 +396,133 @@ static bool data_directive(Assembler *a, AsmArgs *args, unsigned width)
     return args->len != 0;
 }
 
+static void resolve_differences(Assembler *a)
+{
+    for (size_t i = 0; i < a->differences.len && !a->context->failed; i++) {
+        AsmDifference diff = a->differences.data[i];
+        if (!diff.left->section || diff.left->section != diff.right->section) {
+            error(a->context, diff.loc, "symbol difference requires two definitions in the same section");
+            return;
+        }
+        uint64_t value = (uint64_t)diff.left->offset - (uint64_t)diff.right->offset;
+        unsigned char *out = a->sections.data[diff.section].bytes.data + diff.offset;
+        for (unsigned b = 0; b < diff.width; b++)
+            out[b] = (unsigned char)(value >> (8 * b));
+    }
+}
+
+static bool section_type(const char *name, uint32_t *type)
+{
+    const struct { const char *name; uint32_t type; } types[] = {
+        {"progbits", SHT_PROGBITS}, {"nobits", SHT_NOBITS}, {"note", SHT_NOTE},
+        {"preinit_array", SHT_PREINIT_ARRAY}, {"init_array", SHT_INIT_ARRAY}, {"fini_array", SHT_FINI_ARRAY}
+    };
+    if (*name != '%' && *name != '@')
+        return false;
+    for (size_t i = 0; i < sizeof types / sizeof *types; i++) {
+        if (equal(name + 1, types[i].name)) {
+            *type = types[i].type;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool section_flags(const char *text, uint32_t *flags)
+{
+    if (*text++ != '"')
+        return false;
+    *flags = 0;
+    for (; *text && *text != '"'; text++) {
+        switch (*text) {
+        case 'a': *flags |= SHF_ALLOC; break;
+        case 'w': *flags |= SHF_WRITE; break;
+        case 'x': *flags |= SHF_EXECINSTR; break;
+        case 'T': *flags |= SHF_TLS; break;
+        case 'o': *flags |= SHF_LINK_ORDER; break;
+        default: return false;
+        }
+    }
+    return *text == '"' && !text[1];
+}
+
+static const char *section_name(Assembler *a, const char *text)
+{
+    if (*text != '"')
+        return *text && !strpbrk(text, " \t\"\\") ? text : NULL;
+    char *name = alloc(a->context, strlen(text));
+    size_t len = 0;
+    for (text++; *text && *text != '"'; text++) {
+        if (*text == '\\' && *++text != '\\' && *text != '"')
+            return NULL;
+        name[len++] = *text;
+    }
+    name[len] = 0;
+    return len && *text == '"' && !text[1] ? name : NULL;
+}
+
+static SectionKind section_defaults(const char *name)
+{
+    for (unsigned i = 1; i < SECTION_COUNT; i++)
+        if (elf_section_family(name, elf_sections[i].name))
+            return elf_sections[i];
+    for (size_t i = 0; i < sizeof extra_sections / sizeof *extra_sections; i++)
+        if (elf_section_family(name, extra_sections[i].name))
+            return extra_sections[i];
+    return (SectionKind){name, SHT_PROGBITS, 0};
+}
+
+static bool select_section(Assembler *a, const char *name, AsmArgs *args, bool explicit_section)
+{
+    uint32_t explicit_flags = 0;
+    if (args->len > 4 || (args->len > 1 && !section_flags(args->data[1], &explicit_flags)) ||
+        ((args->len == 4) != ((explicit_flags & SHF_LINK_ORDER) != 0)))
+        return false;
+    AsmSymbol *linked_to = NULL;
+    if (args->len == 4 && !equal(args->data[3], "0")) {
+        if (!symbol_char(args->data[3][0], true))
+            return false;
+        for (const char *p = args->data[3] + 1; *p; p++)
+            if (!symbol_char(*p, false))
+                return false;
+        linked_to = symbol(a, args->data[3]);
+    }
+    size_t index = 1;
+    for (; index < a->sections.len; index++) {
+        const AsmSection *s = &a->sections.data[index];
+        if (equal(name, s->kind.name) && linked_to == s->linked_to &&
+            ((explicit_flags ^ s->kind.flags) & SHF_LINK_ORDER) == 0)
+            break;
+    }
+    bool existing = index < a->sections.len;
+    if (!existing && !explicit_section)
+        return false;
+    SectionKind kind = existing ? a->sections.data[index].kind : section_defaults(name);
+    uint32_t flags = args->len > 1 ? explicit_flags : kind.flags, type = kind.type;
+    if ((args->len >= 3 && !section_type(args->data[2], &type)) ||
+        (existing && (type != kind.type || flags != kind.flags)))
+        return false;
+    if (!existing) {
+        if (index >= SHN_LORESERVE)
+            return false;
+        kind.name = copy(a->context, name, strlen(name));
+        kind.type = type;
+        kind.flags = flags;
+        unsigned alignment = a->machine == EM_AARCH64 && (flags & SHF_EXECINSTR) ? 4 : 1;
+        PUSH(a->context, a->sections, ((AsmSection){.kind = kind, .alignment = alignment,
+                                                   .linked_to = linked_to, .link_location = a->loc}));
+    }
+    a->section = (unsigned)index;
+    return true;
+}
+
 static bool directive(Assembler *a, const char *op, AsmArgs *args)
 {
     bool section = equal(op, ".section");
-    const char *name = section && args->len ? args->data[0] : op;
+    const char *name = section && args->len ? section_name(a, args->data[0]) : op;
+    if (!name || (section && !args->len))
+        return false;
     if (section || args->len == 0) {
-        for (unsigned i = 1; i < ASM_SECTION_COUNT; i++) {
-            const SectionKind *kind = section_kind(i);
-            if (!equal(name, kind->name))
-                continue;
-            const char *flags = i == SECTION_TEXT ? "\"ax\"" : i == SECTION_RODATA ? "\"a\"" :
-                                kind->flags & SHF_TLS ? "\"awT\"" : "\"aw\"";
-            const char *type = kind->type == SHT_NOBITS ? "nobits" :
-                               kind->type == SHT_FINI_ARRAY ? "fini_array" : "progbits";
-            if (args->len > 3 || (args->len > 1 && !equal(args->data[1], flags)) ||
-                (args->len == 3 && ((*args->data[2] != '%' && *args->data[2] != '@') ||
-                                   !equal(args->data[2] + 1, type))))
-                return false;
-            a->section = i;
-            a->sections[i].present = true;
-            return true;
-        }
         if (equal(name, ".note.GNU-stack")) {
             if (args->len > 3 || (args->len > 1 && !equal(args->data[1], "\"\"")) ||
                 (args->len == 3 && !equal(args->data[2], "%progbits") && !equal(args->data[2], "@progbits")))
@@ -316,17 +530,22 @@ static bool directive(Assembler *a, const char *op, AsmArgs *args)
             a->section = SECTION_NONE;
             return true;
         }
+        if (select_section(a, name, args, section))
+            return true;
     }
-    if (equal(op, ".tlsdesccall") && a->machine == EM_AARCH64 && a->section == SECTION_TEXT) {
+    if (equal(op, ".tlsdesccall") && a->machine == EM_AARCH64 &&
+        (a->sections.data[a->section].kind.flags & SHF_EXECINSTR)) {
         AsmExpr target;
         if (args->len != 1 || !mas_expression(a, args->data[0], &target) || !target.symbol || target.value)
             return false;
         mas_relocate(a, R_AARCH64_TLSDESC_CALL, target);
         return true;
     }
-    if (equal(op, ".global") || equal(op, ".globl") || equal(op, ".hidden") ||
-        equal(op, ".type") || equal(op, ".size"))
+    if (equal(op, ".global") || equal(op, ".globl") || equal(op, ".hidden") || equal(op, ".internal") ||
+        equal(op, ".protected") || equal(op, ".weak") || equal(op, ".type") || equal(op, ".size"))
         return symbol_directive(a, op, args);
+    if (equal(op, ".set") || equal(op, ".weakref"))
+        return symbol_alias(a, args, equal(op, ".weakref"));
     if (equal(op, ".byte"))
         return data_directive(a, args, 1);
     if (equal(op, ".short") || equal(op, ".hword") || equal(op, ".value"))
@@ -409,7 +628,7 @@ static void statement(Assembler *a, char *text)
         return;
     }
     bool ok = *text == '.' ? directive(a, text, &args) :
-              a->section != SECTION_TEXT ? false :
+              !(a->sections.data[a->section].kind.flags & SHF_EXECINSTR) ? false :
               a->machine == EM_AARCH64 ? mas_aarch64(a, text, &args) : mas_x86_64(a, text, &args);
     if (!ok && !a->context->failed)
         error(a->context, a->loc, "unsupported or invalid assembly '%s'", text);
@@ -453,32 +672,45 @@ static void put_section(Context *c, Bytes *object, Elf64_Shdr *section, const By
 static bool build_object(Assembler *a, ElfOptions *options)
 {
     Context *c = a->context;
-    Elf64_Shdr sections[2 * ASM_SECTION_COUNT + 4] = {{0}};
-    uint16_t section_index[ASM_SECTION_COUNT] = {0}, count = 1;
-    for (unsigned i = 1; i < ASM_SECTION_COUNT; i++)
-        if (i < SECTION_COUNT || a->sections[i].present)
-            section_index[i] = count++;
-    uint16_t stack_note = count++, symtab = count++, strtab = count++, shstrtab = count++;
+    size_t stack_note = a->sections.len;
+    size_t symtab = stack_note + 1, strtab = symtab + 1, shstrtab = strtab + 1;
+    size_t count = shstrtab + 1, section_count = count;
+    for (size_t i = 1; i < a->sections.len; i++) {
+        const AsmSection *section = &a->sections.data[i];
+        if (section->linked_to && !section->linked_to->section) {
+            error(c, section->link_location, "undefined section link symbol '%s'", section->linked_to->name);
+            return false;
+        }
+        section_count += section->relocations.len != 0;
+    }
+    if (section_count >= SHN_LORESERVE) {
+        error(c, (Loc){0}, "too many ELF sections");
+        return false;
+    }
+    Elf64_Shdr *sections = alloc(c, section_count * sizeof *sections);
     Bytes names = {0}, strings = {0}, symbols = {0}, output = {0};
     bytes_add(c, &names, NULL, 1);
     bytes_add(c, &strings, NULL, 1);
     bytes_add(c, &symbols, NULL, sizeof(Elf64_Sym));
     bytes_add(c, &output, NULL, sizeof(Elf64_Ehdr));
     uint32_t index = 1, first_global = 1;
-    for (unsigned binding = STB_LOCAL; binding <= STB_GLOBAL; binding++) {
+    for (unsigned binding = STB_LOCAL; binding <= STB_WEAK; binding++) {
         if (binding == STB_GLOBAL)
             first_global = index;
         for (size_t i = 0; i < a->symbols.len; i++) {
             AsmSymbol *s = a->symbols.data[i];
+            if (s->weak_reference ||
+                (!s->section && !s->referenced && (s->weak || (s->visibility && !s->global))))
+                continue;
             if (!s->section && !strncmp(s->name, ".L", 2)) {
                 error(c, (Loc){0}, "undefined local symbol '%s'", s->name);
                 return false;
             }
-            unsigned actual = s->global || !s->section ? STB_GLOBAL : STB_LOCAL;
+            unsigned actual = s->weak ? STB_WEAK : (s->global || !s->section ? STB_GLOBAL : STB_LOCAL);
             if (actual != binding)
                 continue;
-            unsigned type = section_kind(s->section)->flags & SHF_TLS ? STT_TLS : s->type;
-            Elf64_Sym entry = {.st_name = bytes_string(c, &strings, s->name), .st_shndx = section_index[s->section],
+            unsigned type = a->sections.data[s->section].kind.flags & SHF_TLS ? STT_TLS : s->type;
+            Elf64_Sym entry = {.st_name = bytes_string(c, &strings, s->name), .st_shndx = (uint16_t)s->section,
                                .st_info = (unsigned char)ELF64_ST_INFO(actual, type),
                                .st_other = (unsigned char)s->visibility,
                                .st_value = s->offset, .st_size = s->size};
@@ -487,15 +719,16 @@ static bool build_object(Assembler *a, ElfOptions *options)
         }
     }
 
-    for (unsigned i = 1; i < ASM_SECTION_COUNT; i++) {
-        if (!section_index[i])
-            continue;
-        const AsmSection *section = &a->sections[i];
-        const SectionKind *kind = section_kind(i);
-        Elf64_Shdr *header = &sections[section_index[i]];
+    for (size_t i = 1; i < a->sections.len; i++) {
+        const AsmSection *section = &a->sections.data[i];
+        const SectionKind *kind = &section->kind;
+        Elf64_Shdr *header = &sections[i];
         *header = (Elf64_Shdr){.sh_name = bytes_string(c, &names, kind->name),
                               .sh_type = kind->type, .sh_flags = kind->flags,
+                              .sh_link = section->linked_to ? section->linked_to->section : 0,
                               .sh_addralign = section->alignment};
+        if (kind->type == SHT_PREINIT_ARRAY || kind->type == SHT_INIT_ARRAY || kind->type == SHT_FINI_ARRAY)
+            header->sh_entsize = sizeof(Elf64_Addr);
         put_section(c, &output, header, &section->bytes);
         header->sh_size = section->size;
     }
@@ -503,7 +736,7 @@ static bool build_object(Assembler *a, ElfOptions *options)
                                        .sh_type = SHT_PROGBITS, .sh_addralign = 1,
                                        .sh_offset = output.len};
     sections[symtab] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, ".symtab"), .sh_type = SHT_SYMTAB,
-                                    .sh_link = strtab, .sh_info = first_global, .sh_addralign = 8,
+                                    .sh_link = (uint32_t)strtab, .sh_info = first_global, .sh_addralign = 8,
                                     .sh_entsize = sizeof(Elf64_Sym)};
     sections[strtab] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, ".strtab"),
                                    .sh_type = SHT_STRTAB, .sh_addralign = 1};
@@ -512,8 +745,8 @@ static bool build_object(Assembler *a, ElfOptions *options)
     put_section(c, &output, &sections[symtab], &symbols);
     put_section(c, &output, &sections[strtab], &strings);
 
-    for (unsigned i = 1; i < ASM_SECTION_COUNT; i++) {
-        const AsmSection *section = &a->sections[i];
+    for (size_t i = 1; i < a->sections.len; i++) {
+        const AsmSection *section = &a->sections.data[i];
         if (!section->relocations.len)
             continue;
         Bytes entries = {0};
@@ -524,9 +757,9 @@ static bool build_object(Assembler *a, ElfOptions *options)
                                 .r_addend = (int64_t)r.expr.value};
             bytes_add(c, &entries, &entry, sizeof entry);
         }
-        const char *name = format(c, ".rela%s", section_kind(i)->name);
+        const char *name = format(c, ".rela%s", section->kind.name);
         sections[count] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, name), .sh_type = SHT_RELA,
-                                      .sh_link = symtab, .sh_info = section_index[i], .sh_addralign = 8,
+                                      .sh_link = (uint32_t)symtab, .sh_info = (uint32_t)i, .sh_addralign = 8,
                                       .sh_entsize = sizeof(Elf64_Rela)};
         put_section(c, &output, &sections[count++], &entries);
     }
@@ -534,8 +767,8 @@ static bool build_object(Assembler *a, ElfOptions *options)
     bytes_align(c, &output, 8);
     Elf64_Ehdr header = elf_header(options->machine, ET_REL);
     header.e_shoff = output.len;
-    header.e_shnum = count;
-    header.e_shstrndx = shstrtab;
+    header.e_shnum = (uint16_t)count;
+    header.e_shstrndx = (uint16_t)shstrtab;
     bytes_add(c, &output, sections, sizeof *sections * count);
     memcpy(output.data, &header, sizeof header);
     return elf_write(c, options, &output, false);
@@ -544,11 +777,14 @@ static bool build_object(Assembler *a, ElfOptions *options)
 bool mas_assemble(Context *c, ElfOptions *options)
 {
     Assembler assembler = {.context = c, .machine = options->machine, .section = SECTION_TEXT};
-    for (unsigned i = 1; i < ASM_SECTION_COUNT; i++)
-        assembler.sections[i].alignment = 1;
+    for (unsigned i = 0; i < SECTION_COUNT; i++)
+        PUSH(c, assembler.sections, ((AsmSection){.kind = elf_sections[i], .alignment = 1}));
     if (options->machine == EM_AARCH64)
-        assembler.sections[SECTION_TEXT].alignment = 4;
+        assembler.sections.data[SECTION_TEXT].alignment = 4;
     for (size_t i = 0; i < options->inputs.len && !c->failed; i++)
         assemble_file(&assembler, options->inputs.data[i]);
+    resolve_aliases(&assembler);
+    resolve_weak_references(&assembler);
+    resolve_differences(&assembler);
     return !c->failed && build_object(&assembler, options);
 }

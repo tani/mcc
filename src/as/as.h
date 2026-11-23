@@ -4,6 +4,7 @@
 #include "elf_tools.h"
 
 typedef struct AsmSymbol AsmSymbol;
+typedef struct AsmDifference AsmDifference;
 typedef struct { AsmSymbol *symbol; uint64_t value; } AsmExpr;
 typedef struct { char *data[32]; size_t len; } AsmArgs;
 typedef struct {
@@ -13,21 +14,22 @@ typedef struct {
 } AsmReloc;
 
 typedef struct {
+    SectionKind kind;
     Bytes bytes;
     VECTOR(AsmReloc) relocations;
     size_t size, alignment;
-    bool present;
+    AsmSymbol *linked_to;
+    Loc link_location;
 } AsmSection;
-
-enum { SECTION_TDATA = SECTION_COUNT, SECTION_TBSS, SECTION_FINI_ARRAY, ASM_SECTION_COUNT };
 
 typedef struct {
     Context *context;
     Loc loc;
     uint16_t machine;
     unsigned section;
-    AsmSection sections[ASM_SECTION_COUNT];
+    VECTOR(AsmSection) sections;
     VECTOR(AsmSymbol *) symbols;
+    VECTOR(AsmDifference) differences;
 } Assembler;
 
 bool mas_assemble(Context *, ElfOptions *);

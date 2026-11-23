@@ -1,16 +1,11 @@
 #include "types.h"
+#include "fp-round.h"
+#include "../quad_bits.h"
 
-/* Binary128 uses the long double ABI on AArch64 and the SSE ABI for
-   _Float128 on x86-64. Keep the arithmetic in the integer representation. */
-typedef struct { uint64_t lo, hi; } Wide;
-
-#if defined(__aarch64__)
-typedef long double QuadValue;
+/* Keep arithmetic in the integer representation and use the native TF calling convention. */
+typedef Integer128 Wide;
+typedef float QuadValue __attribute__((mode(TF)));
 #define QUAD_ABI(name) __ ## name
-#else
-typedef Wide QuadValue;
-#define QUAD_ABI(name) mcc_ ## name
-#endif
 
 QuadValue QUAD_ABI(addtf3)(QuadValue, QuadValue);
 QuadValue QUAD_ABI(subtf3)(QuadValue, QuadValue);
@@ -36,13 +31,10 @@ int64_t QUAD_ABI(fixtfdi)(QuadValue);
 uint64_t QUAD_ABI(fixunstfdi)(QuadValue);
 int32_t QUAD_ABI(fixtfsi)(QuadValue);
 uint32_t QUAD_ABI(fixunstfsi)(QuadValue);
-uint64_t mcc_get_fpcr(void);
-void mcc_raise_fp(unsigned);
 
 typedef struct { Wide significand; int exponent; bool negative; } Quad;
 
 enum { BIAS = 16383, MIN_EXP = 1 - BIAS, MAX_EXP = BIAS, FRACTION = 112, ROUND_BITS = 3 };
-enum { NEAREST, UPWARD, DOWNWARD, TOWARD_ZERO };
 enum { INVALID = 1, DIVISION_BY_ZERO = 2, OVERFLOW = 4, UNDERFLOW = 8, INEXACT = 16 };
 
 #define SIGN (UINT64_C(1) << 63)
@@ -51,24 +43,16 @@ enum { INVALID = 1, DIVISION_BY_ZERO = 2, OVERFLOW = 4, UNDERFLOW = 8, INEXACT =
 
 static Wide representation(QuadValue x)
 {
-#if defined(__aarch64__)
     Wide bits;
     memcpy(&bits, &x, sizeof bits);
     return bits;
-#else
-    return x;
-#endif
 }
 
 static QuadValue value(Wide bits)
 {
-#if defined(__aarch64__)
     QuadValue x;
     memcpy(&x, &bits, sizeof x);
     return x;
-#else
-    return bits;
-#endif
 }
 
 static bool nonzero(Wide x)
@@ -131,19 +115,9 @@ static int top_bit(Wide a)
     return bit;
 }
 
-static unsigned rounding_mode(void)
-{
-#if defined(__aarch64__)
-    return (unsigned)(mcc_get_fpcr() >> 22) & 3;
-#else
-    unsigned mode = (unsigned)(mcc_get_fpcr() >> 13) & 3;
-    return mode == 1 ? DOWNWARD : mode == 2 ? UPWARD : mode;
-#endif
-}
-
 static bool directed_away(unsigned mode, bool negative)
 {
-    return negative ? mode == DOWNWARD : mode == UPWARD;
+    return negative ? mode == FP_DOWNWARD : mode == FP_UPWARD;
 }
 
 static Wide rounded(Wide a, bool negative)
@@ -152,8 +126,8 @@ static Wide rounded(Wide a, bool negative)
     unsigned tail = (unsigned)(a.lo & 7);
     if (!tail)
         return result;
-    unsigned mode = rounding_mode();
-    bool increment = mode == NEAREST ? tail > 4 || (tail == 4 && (result.lo & 1)) : directed_away(mode, negative);
+    unsigned mode = fp_rounding_mode();
+    bool increment = mode == FP_NEAREST ? tail > 4 || (tail == 4 && (result.lo & 1)) : directed_away(mode, negative);
     return increment ? plus(result, (Wide){1, 0}) : result;
 }
 
@@ -204,8 +178,8 @@ static Wide invalid(void)
 static bool overflow_to_infinity(bool negative)
 {
     mcc_raise_fp(OVERFLOW | INEXACT);
-    unsigned mode = rounding_mode();
-    return mode == NEAREST || directed_away(mode, negative);
+    unsigned mode = fp_rounding_mode();
+    return mode == FP_NEAREST || directed_away(mode, negative);
 }
 
 static Quad decode(Wide bits)
@@ -260,7 +234,7 @@ static Wide add(Wide a, Wide b)
         return special(a) ? a : b;
     Quad x = decode(a), y = decode(b);
     if (!nonzero(x.significand) && !nonzero(y.significand))
-        return signed_zero(x.negative == y.negative ? x.negative : rounding_mode() == DOWNWARD);
+        return signed_zero(x.negative == y.negative ? x.negative : fp_rounding_mode() == FP_DOWNWARD);
     if (!nonzero(x.significand) || !nonzero(y.significand))
         return nonzero(x.significand) ? a : b;
     if (x.exponent < y.exponent || (x.exponent == y.exponent && order(x.significand, y.significand) < 0)) {
@@ -271,7 +245,7 @@ static Wide add(Wide a, Wide b)
     Wide u = left(x.significand, ROUND_BITS);
     Wide v = sticky_right(left(y.significand, ROUND_BITS), (unsigned)(x.exponent - y.exponent));
     Wide sum = x.negative == y.negative ? plus(u, v) : minus(u, v);
-    return encode(sum, x.exponent, nonzero(sum) ? x.negative : rounding_mode() == DOWNWARD);
+    return encode(sum, x.exponent, nonzero(sum) ? x.negative : fp_rounding_mode() == FP_DOWNWARD);
 }
 
 static Wide multiply_significands(Wide a, Wide b)
@@ -484,6 +458,33 @@ double QUAD_ABI(trunctfdf2)(QuadValue a)
     return x;
 }
 
+#if defined(__x86_64__)
+QuadValue __extendxftf2(long double);
+long double __trunctfxf2(QuadValue);
+
+QuadValue __extendxftf2(long double a)
+{
+    Wide bits;
+    unsigned flags = 0;
+    memcpy(&bits, &a, sizeof bits);
+    Wide result = quad_from_x87(bits, &flags);
+    if (flags)
+        mcc_raise_fp(flags);
+    return value(result);
+}
+
+long double __trunctfxf2(QuadValue a)
+{
+    unsigned flags = 0;
+    Wide bits = quad_to_x87(representation(a), fp_rounding_mode(), &flags);
+    if (flags)
+        mcc_raise_fp(flags);
+    long double result;
+    memcpy(&result, &bits, sizeof result);
+    return result;
+}
+#endif
+
 QuadValue QUAD_ABI(floatunditf)(uint64_t a) { return value(encode((Wide){a, 0}, FRACTION + ROUND_BITS, false)); }
 
 QuadValue QUAD_ABI(floatditf)(int64_t a)
@@ -495,37 +496,51 @@ QuadValue QUAD_ABI(floatditf)(int64_t a)
 QuadValue QUAD_ABI(floatsitf)(int32_t a) { return QUAD_ABI(floatditf)(a); }
 QuadValue QUAD_ABI(floatunsitf)(uint32_t a) { return QUAD_ABI(floatunditf)(a); }
 
-static uint64_t integer(Quad x, uint64_t limit, int bits)
+static uint64_t integer(Quad x, uint64_t limit)
 {
-    if (!nonzero(x.significand) || x.exponent < 0)
+    if (!nonzero(x.significand))
         return 0;
-    if (x.exponent >= bits)
+    if (x.exponent < 0) {
+        mcc_raise_fp(INEXACT);
+        return 0;
+    }
+    if (x.exponent >= 64) {
+        mcc_raise_fp(INVALID);
         return limit;
-    return right(x.significand, (unsigned)(FRACTION - x.exponent)).lo;
+    }
+    unsigned shift = (unsigned)(FRACTION - x.exponent);
+    Wide magnitude = right(x.significand, shift);
+    if (magnitude.lo > limit) {
+        mcc_raise_fp(INVALID);
+        return limit;
+    }
+    if (order(left(magnitude, shift), x.significand) != 0)
+        mcc_raise_fp(INEXACT);
+    return magnitude.lo;
 }
 
 int64_t QUAD_ABI(fixtfdi)(QuadValue a)
 {
     Quad x = decode(representation(a));
-    uint64_t magnitude = integer(x, x.negative ? SIGN : (uint64_t)INT64_MAX, 63);
+    uint64_t magnitude = integer(x, x.negative ? SIGN : (uint64_t)INT64_MAX);
     return (int64_t)(x.negative ? 0 - magnitude : magnitude);
 }
 
 uint64_t QUAD_ABI(fixunstfdi)(QuadValue a)
 {
     Quad x = decode(representation(a));
-    return x.negative ? 0 : integer(x, UINT64_MAX, 64);
+    return integer(x, x.negative ? 0 : UINT64_MAX);
 }
 
 int32_t QUAD_ABI(fixtfsi)(QuadValue a)
 {
     Quad x = decode(representation(a));
-    uint64_t magnitude = integer(x, x.negative ? UINT64_C(1) << 31 : (uint64_t)INT32_MAX, 31);
+    uint64_t magnitude = integer(x, x.negative ? UINT64_C(1) << 31 : (uint64_t)INT32_MAX);
     return (int32_t)(x.negative ? 0 - magnitude : magnitude);
 }
 
 uint32_t QUAD_ABI(fixunstfsi)(QuadValue a)
 {
     Quad x = decode(representation(a));
-    return x.negative ? 0 : (uint32_t)integer(x, UINT32_MAX, 32);
+    return (uint32_t)integer(x, x.negative ? 0 : UINT32_MAX);
 }

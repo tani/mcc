@@ -9,7 +9,7 @@ typedef struct {
     OperandKind kind;
     Register reg;
     int base, index;
-    unsigned scale;
+    unsigned scale, segment;
     AsmExpr expr;
     uint32_t relocation;
 } Operand;
@@ -74,12 +74,19 @@ static bool operand(Assembler *a, char *text, Operand *out)
         out->kind = OP_IMMEDIATE;
         return mas_expression(a, text + 1, &out->expr);
     }
+    if (!strncmp(text, "%fs:", 4) || !strncmp(text, "%gs:", 4)) {
+        out->segment = text[1] == 'f' ? 0x64 : 0x65;
+        text = mas_trim(text + 4);
+    }
     if (*text == '%') {
         out->kind = OP_REGISTER;
-        return reg(text, &out->reg);
+        return !out->segment && reg(text, &out->reg);
     }
     out->kind = OP_MEMORY;
     char *open = strchr(text, '('), *close = strrchr(text, ')');
+    if (out->segment && !open && !close)
+        return mas_expression(a, text, &out->expr) && !out->expr.symbol &&
+               fits_signed((int64_t)out->expr.value, 32);
     if (!open || !close || close < open || close[1])
         return false;
     *open++ = *close = 0;
@@ -140,6 +147,8 @@ static void encode(Assembler *a, unsigned prefix, unsigned width, uint16_t opcod
                    const Operand *rm, unsigned trailing)
 {
     bool low_byte = prefix == 0x40;
+    if (rm->segment)
+        mas_emit(a, rm->segment, 1);
     if (prefix && !low_byte)
         mas_emit(a, prefix, 1);
     if (width == 2)
@@ -396,6 +405,7 @@ static bool sse(Assembler *a, const char *op, Operand *src, Operand *dst)
     static const struct { const char *name; unsigned prefix; uint16_t load, store; } ops[] = {
         {"movss", 0xf3, 0x0f10, 0x0f11}, {"movsd", 0xf2, 0x0f10, 0x0f11},
         {"movaps", 0, 0x0f28, 0x0f29},
+        {"movups", 0, 0x0f10, 0x0f11},
         {"addss", 0xf3, 0x0f58, 0}, {"addsd", 0xf2, 0x0f58, 0},
         {"subss", 0xf3, 0x0f5c, 0}, {"subsd", 0xf2, 0x0f5c, 0},
         {"mulss", 0xf3, 0x0f59, 0}, {"mulsd", 0xf2, 0x0f59, 0},
@@ -449,6 +459,7 @@ static bool x87(Assembler *a, const char *op, AsmArgs *args)
         {"fildq", 0xdf, 5}, {"fistpq", 0xdf, 7},
         {"fldcw", 0xd9, 5}, {"fnstcw", 0xd9, 7},
         {"faddl", 0xdc, 0}, {"fsubl", 0xdc, 4},
+        {"ldmxcsr", 0x0fae, 2}, {"stmxcsr", 0x0fae, 3},
     };
     for (size_t i = 0; i < sizeof memory_ops / sizeof *memory_ops; i++) {
         if (!equal(op, memory_ops[i].name))
@@ -464,15 +475,18 @@ static bool x87(Assembler *a, const char *op, AsmArgs *args)
 
 static bool simple(Assembler *a, const char *op)
 {
-    static const struct { const char *name; uint16_t opcode; } ops[] = {
+    static const struct { const char *name; uint32_t opcode; } ops[] = {
         {"ret", 0xc3}, {"retq", 0xc3}, {"leave", 0xc9}, {"nop", 0x90}, {"cqto", 0x4899},
         {"hlt", 0xf4}, {"syscall", 0x0f05}, {"ud2", 0x0f0b}, {"int3", 0xcc},
         {"fldz", 0xd9ee}, {"fchs", 0xd9e0}, {"cld", 0xfc}, {"rex64", 0x48},
+        {"lfence", 0x0faee8},
     };
     for (size_t i = 0; i < sizeof ops / sizeof *ops; i++)
         if (equal(op, ops[i].name)) {
+            if (ops[i].opcode > 0xffff)
+                mas_emit(a, ops[i].opcode >> 16, 1);
             if (ops[i].opcode > 0xff)
-                mas_emit(a, ops[i].opcode >> 8, 1);
+                mas_emit(a, (ops[i].opcode >> 8) & 0xff, 1);
             mas_emit(a, ops[i].opcode & 0xff, 1);
             return true;
         }
@@ -532,6 +546,15 @@ bool mas_x86_64(Assembler *a, const char *op, AsmArgs *args)
             return false;
         encode(a, 0, 1, (uint16_t)(0x0f90 + cond), 0, &src, 0);
         return true;
+    }
+    if (args->len == 1 && src.kind == OP_MEMORY && !strncmp(op, "prefetch", 8)) {
+        static const char *const hints[] = {"prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2"};
+        for (unsigned i = 0; i < sizeof hints / sizeof *hints; i++)
+            if (equal(op, hints[i])) {
+                encode(a, 0, 4, 0x0f18, i, &src, 0);
+                return true;
+            }
+        return false;
     }
     if (args->len == 2 && (sse(a, op, &src, &dst) || conversion(a, op, &src, &dst)))
         return true;

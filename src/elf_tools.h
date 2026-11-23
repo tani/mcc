@@ -24,6 +24,8 @@ typedef struct {
 } ElfOptions;
 
 uint16_t elf_machine(const char *target);
+bool elf_section_family(const char *name, const char *base);
+unsigned elf_array_priority(const char *name, const char *array);
 Elf64_Ehdr elf_header(uint16_t machine, uint16_t type);
 void bytes_add(Context *, Bytes *, const void *, size_t);
 void bytes_int(Context *, Bytes *, uint64_t value, unsigned width);

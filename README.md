@@ -4,7 +4,7 @@ mcc is a C11 compiler for x86-64 and little-endian AArch64 Linux. It emits GNU-s
 
 ## Build and use
 
-Build on x86-64 or AArch64 Linux with GCC, GNU Make, Bison, Flex, and glibc development files. The tests also use Python 3 and GNU binutils. The Nix development shell supplies these dependencies and configures the glibc and GCC runtime paths. Enter it with `nix develop path:.` if you use Nix.
+Build on x86-64 or AArch64 Linux with GCC, GNU Make, Bison, Flex, GNU binutils, and glibc development files. The tests also use Python 3. The Nix development shell supplies these dependencies and configures the glibc paths. Enter it with `nix develop path:.` if you use Nix.
 
 ```sh
 make
@@ -17,7 +17,7 @@ printf '#include <stdio.h>\nint main(void) { puts("hello from mcc"); }\n' |
 
 | Option | Result |
 | --- | --- |
-| `-E` | Write preprocessed C to stdout by default. |
+| `-E` | Write preprocessed C to stdout by default. Use `-P` to omit line markers. |
 | `-fsyntax-only` | Check C source without producing an output file. |
 | `-S` | Compile C to GNU-style assembly (`.s`). |
 | `-c` | Compile C or assemble a `.s` file into an ELF64 object (`.o`). |
@@ -29,16 +29,21 @@ Executables are position-independent (PIE) by default. Use `-no-pie`, `-static`,
 
 `mcc`, `mas`, and `mld` default to the architecture they were built for. Select `--target=x86_64-linux-gnu` or `--target=aarch64-linux-gnu` to build for either architecture. `mcc` uses the target's glibc headers. Both `mcc` and `mld` link with the target's glibc startup objects and libraries.
 
+Use `-isystem DIR` to add a system header search directory or `-idirafter DIR`
+to search a directory after the standard headers. `-Wsystem-headers` enables
+warnings from system headers.
+
 | Environment variable | Purpose |
 | --- | --- |
 | `MCC_SYSROOT` | Root for target header and library searches. |
 | `MCC_SYSTEM_INCLUDE` | Override the glibc header directory. |
 | `MCC_SYSTEM_LIB` | Override the glibc library and startup object directory. |
 | `MCC_STATIC_LIB` | Add a search directory for static glibc archives. |
-| `MCC_RUNTIME_LIB` | Override the directory for GCC runtime objects and archives such as `libgcc.a`. |
 | `MCC_COMPILER_INCLUDE` | Override the path to mcc's bundled headers, which defaults to `include/` in the source checkout used to build it. |
 
 Cross-compilation parses and folds `long double` constants using the compiler host's `long double` format before encoding them for the target.
+
+`mcc` and `mld` embed their startup objects and `libmccrt.a` for both targets. The bundled runtime supplies binary128 arithmetic and conversions, the AArch64 out-of-line atomic ABI, and the C unwinding routines used by static glibc. The linker adds these objects and glibc without looking up `libgcc` or GCC startup files. Static linking uses the `_dl_find_object` interface from glibc 2.35 or later. A dynamically linked glibc can load its configured unwinder when the program uses backtraces or thread cancellation.
 
 ## Assembling and linking ELF objects
 
@@ -95,11 +100,12 @@ All profiles use the same native GCC and glibc toolchain. The runtime profiles r
 
 - [`src/cc/`](src/cc/) contains the driver, Flex scanner, preprocessor, Bison parser, type checking, intermediate representation, and assembly backends.
 - [`src/as/`](src/as/) contains the assembler and the instruction encoders for AArch64 and x86-64.
-- [`src/ld/`](src/ld/) contains the linker, ELF and archive input handling, relocations, and glibc startup and library selection.
+- [`src/ld/`](src/ld/) contains the linker, ELF and archive input handling, relocations, and startup and library selection.
+- [`src/rt/`](src/rt/) contains the runtime and startup objects built into the compiler and linker.
 - [`include/`](include/) contains the compiler's bundled headers. [`tests/`](tests/) and [`c-testsuite-extended/`](c-testsuite-extended/) contain the local validation scripts and cases.
 
 ## Compatibility
 
 The implementation covers integer and floating-point expressions, pointers, declarators, aggregates, aggregate calls and returns, scalar and aggregate variadic arguments, thread-local objects, generic selections, and one-dimensional automatic variable-length arrays. GNU support includes statement expressions, omitted conditional operands, case ranges, several preprocessor extensions, and selected attributes.
 
-Full ISO C11 and GCC extension conformance are still in progress. Outstanding areas include C11 atomics, complex arithmetic, broader variably modified types, static bit-field initialization, extended assembly, and AArch64 intrinsics. OpenMP and OpenACC are outside the project scope. The [GNU extension index](docs/extensions.md) describes GCC's features.
+Full ISO C11 and GCC extension conformance are still in progress. Outstanding areas include broader variably modified types, additional numeric types, target-specific asm constraints, and AArch64 intrinsics. OpenMP and OpenACC are outside the project scope. The [GNU extension index](docs/extensions.md) tracks current support and its limitations.

@@ -106,6 +106,8 @@ def check(profile, compiler, build, jobs):
         # Bison's table-driven stack relocation and empty reduction confuse GCC's analyzer.
         make.append("PARSER_WARN=-Wno-unused-but-set-variable "
                     "-Wno-error=analyzer-use-of-uninitialized-value -fdiagnostics-path-format=none")
+        # Flex's generated buffer and DFA state are initialized before any scanner action.
+        make.append("SCANNER_WARN=-Wno-error=analyzer-null-dereference -fdiagnostics-path-format=none")
     print(f"GCC check: {profile}", flush=True)
     subprocess.run([*make, "all"], cwd=ROOT, env=env, check=True)
     if profile == "analyzer":

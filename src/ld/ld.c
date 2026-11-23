@@ -1,6 +1,7 @@
 #include "ld.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -33,7 +34,7 @@ static const SectionKind link_sections[] = {
     [OUT_EH_FRAME_HDR - SECTION_COUNT] = {".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC},
 };
 
-typedef struct { unsigned output; size_t offset; } Placement;
+typedef struct { unsigned output; size_t offset, size; } Placement;
 typedef struct {
     const char *path;
     Bytes file;
@@ -44,6 +45,21 @@ typedef struct {
     size_t section_names;
     size_t symbol_section, symbol_count;
 } Object;
+
+typedef struct {
+    Object *object;
+    size_t section, order;
+    unsigned output, priority;
+} ArrayInput;
+typedef VECTOR(ArrayInput) ArrayInputs;
+
+typedef struct {
+    Object *object;
+    size_t section, order, target_rank;
+    unsigned output;
+    Placement target;
+} OrderedInput;
+typedef VECTOR(OrderedInput) OrderedInputs;
 
 typedef struct { const char *name; uint32_t hash; uint16_t index; } Version;
 typedef VECTOR(Version) Versions;
@@ -59,11 +75,19 @@ struct Global {
     Version version;
     size_t bss_offset;
     uint32_t dynamic_index;
-    bool referenced, shared_reference, copy;
+    unsigned visibility;
+    unsigned boundary_section;
+    bool referenced, undefined, shared_reference, copy, boundary_end;
 };
 
 typedef struct { Object *object; Global *global; Elf64_Sym symbol; size_t index; const char *name; } LinkSymbol;
-typedef struct { Bytes contents; size_t size, alignment, offset; uint64_t address; } OutputSection;
+typedef struct {
+    Bytes contents;
+    size_t size, alignment, offset;
+    uint64_t address;
+    unsigned linked_output;
+} OutputSection;
+typedef struct { SectionKind kind; OutputSection output; } OrphanSection;
 typedef enum { GOT_ADDRESS, GOT_TLS_INDEX, GOT_TLS_OFFSET, GOT_TLS_DESC } SlotKind;
 typedef struct { LinkSymbol symbol; SlotKind kind; size_t offset, stub; } Slot;
 
@@ -74,6 +98,7 @@ struct Linker {
     uint64_t base;
     bool dynamic, text_relocations, static_tls;
     OutputSection sections[OUT_COUNT];
+    VECTOR(OrphanSection) orphans;
     VECTOR(Object *) objects;
     VECTOR(Global *) globals;
     VECTOR(Global *) dynamic_symbols;
@@ -85,15 +110,28 @@ struct Linker {
     Global **buckets;
     size_t bucket_count;
     size_t load_end, memory_end;
+    size_t tls_end, code_end, data_end;
     size_t tls_resolver;
     uint32_t version_libraries;
 };
 
 enum { PAGE = 65536, BASE_ADDRESS = 0x400000 };
 
-static const SectionKind *section_kind(unsigned id)
+static const SectionKind *section_kind(Linker *l, unsigned id)
 {
+    if (id >= OUT_COUNT)
+        return &l->orphans.data[id - OUT_COUNT].kind;
     return id < SECTION_COUNT ? &elf_sections[id] : &link_sections[id - SECTION_COUNT];
+}
+
+static OutputSection *output_section(Linker *l, unsigned id)
+{
+    return id < OUT_COUNT ? &l->sections[id] : &l->orphans.data[id - OUT_COUNT].output;
+}
+
+static unsigned section_count(Linker *l)
+{
+    return OUT_COUNT + (unsigned)l->orphans.len;
 }
 
 static bool within(size_t size, uint64_t offset, uint64_t length)
@@ -219,7 +257,7 @@ static Global *global_symbol(Linker *l, const char *name, bool create)
 bool ld_needs(Linker *l, const char *name)
 {
     Global *g = global_symbol(l, name, false);
-    return g && g->referenced && !g->object && !g->library;
+    return g && g->referenced && !g->object && (!g->library || g->visibility != STV_DEFAULT);
 }
 
 static void discard_comdats(Linker *l, Object *obj)
@@ -277,7 +315,12 @@ static void collect_definitions(Linker *l, Object *obj)
         if (s.st_shndx < obj->header.e_shnum && obj->discarded[s.st_shndx])
             continue;
         Global *g = global_symbol(l, name, true);
+        unsigned visibility = ELF64_ST_VISIBILITY(s.st_other);
+        /* The ELF order of increasing restriction is default, protected, hidden, internal. */
+        if (visibility != STV_DEFAULT && (g->visibility == STV_DEFAULT || visibility < g->visibility))
+            g->visibility = visibility;
         if (s.st_shndx == SHN_UNDEF) {
+            g->undefined = true;
             g->referenced |= binding == STB_GLOBAL;
         } else if (s.st_shndx == SHN_COMMON && g->object && g->symbol.st_shndx == SHN_COMMON) {
             if (s.st_size > g->symbol.st_size)
@@ -297,6 +340,21 @@ static void collect_definitions(Linker *l, Object *obj)
     }
 }
 
+static void discard_linked_sections(Linker *l, Object *obj)
+{
+    for (size_t i = 1; i < obj->header.e_shnum; i++) {
+        const Elf64_Shdr *s = &obj->sections[i];
+        if (!(s->sh_flags & SHF_LINK_ORDER) || !s->sh_link)
+            continue;
+        if (s->sh_link >= obj->header.e_shnum ||
+            (obj->sections[s->sh_link].sh_flags & SHF_LINK_ORDER)) {
+            error(l->context, (Loc){0}, "%s: invalid or unsupported linked section %zu", obj->path, i);
+            return;
+        }
+        obj->discarded[i] |= obj->discarded[s->sh_link];
+    }
+}
+
 void ld_take_object(Linker *l, const char *path, Bytes file)
 {
     Context *c = l->context;
@@ -308,6 +366,8 @@ void ld_take_object(Linker *l, const char *path, Bytes file)
     obj->locations = alloc(c, (size_t)obj->header.e_shnum * sizeof *obj->locations);
     obj->discarded = alloc(c, (size_t)obj->header.e_shnum * sizeof *obj->discarded);
     discard_comdats(l, obj);
+    if (!c->failed)
+        discard_linked_sections(l, obj);
     collect_definitions(l, obj);
     PUSH(c, l->objects, obj);
 }
@@ -409,6 +469,9 @@ void ld_take_shared(Linker *l, const char *path, const char *link_name, Bytes fi
         }
         if (version & 0x8000)
             continue;
+        /* The main executable can preempt default-visible definitions in this DSO. */
+        if (visibility == STV_DEFAULT)
+            PUSH(c, lib->references, symbol);
         Global *g = global_symbol(l, symbol, true);
         if (!g->library) {
             g->library = lib;
@@ -433,24 +496,81 @@ static size_t frame_records(const unsigned char *data, size_t size)
     while (size - offset >= 4) {
         uint32_t length;
         memcpy(&length, data + offset, sizeof length);
-        if (!length)
+        if (!length) {
+            for (size_t i = offset + 4; i < size; i++)
+                if (data[i])
+                    return SIZE_MAX;
             return offset;
+        }
         unsigned header = 4;
         uint64_t content = length;
         if (length == UINT32_MAX) {
             header = 12;
             if (size - offset < header)
-                break;
+                return SIZE_MAX;
             memcpy(&content, data + offset + 4, sizeof content);
         }
         if (content > size - offset - header)
-            break;
+            return SIZE_MAX;
         offset += header + (size_t)content;
     }
-    return size;
+    return offset == size ? size : SIZE_MAX;
 }
 
-static void place_sections(Linker *l, Object *obj)
+static void place_section(Linker *l, Object *obj, size_t index, unsigned id)
+{
+    const Elf64_Shdr *s = &obj->sections[index];
+    OutputSection *out = output_section(l, id);
+    uint64_t alignment = s->sh_addralign ? s->sh_addralign : 1;
+    if (alignment > PAGE || (alignment & (alignment - 1)) || out->size > (size_t)PTRDIFF_MAX - PAGE ||
+        s->sh_size > (uint64_t)PTRDIFF_MAX - PAGE - out->size) {
+        error(l->context, (Loc){0}, "%s: unsupported section size or alignment", obj->path);
+        return;
+    }
+    size_t offset = id == OUT_EH_FRAME ? out->size : align_to(out->size, (size_t)alignment);
+    size_t size = (size_t)s->sh_size;
+    if (s->sh_type != SHT_NOBITS) {
+        const unsigned char *data = obj->file.data + s->sh_offset;
+        if (id == OUT_EH_FRAME) {
+            /* The combined table has one terminator and no inter-object padding. */
+            size = frame_records(data, size);
+            if (size == SIZE_MAX) {
+                error(l->context, (Loc){0}, "%s: malformed .eh_frame records", obj->path);
+                return;
+            }
+        } else {
+            bytes_align(l->context, &out->contents, (size_t)alignment);
+        }
+        bytes_add(l->context, &out->contents, data, size);
+    }
+    out->size = offset + size;
+    if (alignment > out->alignment)
+        out->alignment = (size_t)alignment;
+    obj->locations[index] = (Placement){id, offset, size};
+}
+
+static unsigned orphan_section(Linker *l, const char *name, const Elf64_Shdr *s)
+{
+    uint32_t flags = (uint32_t)(s->sh_flags & (SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR | SHF_TLS));
+    for (size_t i = 0; i < l->orphans.len; i++) {
+        SectionKind *kind = &l->orphans.data[i].kind;
+        if (kind->type == s->sh_type && !((kind->flags ^ flags) & ~(uint32_t)SHF_WRITE) &&
+            equal(kind->name, name)) {
+            kind->flags |= flags;
+            return OUT_COUNT + (unsigned)i;
+        }
+    }
+    unsigned id = section_count(l);
+    if (id + 4 >= SHN_LORESERVE) {
+        error(l->context, (Loc){0}, "too many output ELF sections");
+        return 0;
+    }
+    OrphanSection orphan = {.kind = {name, s->sh_type, flags}, .output = {.alignment = 1}};
+    PUSH(l->context, l->orphans, orphan);
+    return id;
+}
+
+static void place_sections(Linker *l, Object *obj, ArrayInputs *arrays, OrderedInputs *ordered)
 {
     for (size_t i = 1; i < obj->header.e_shnum && !l->context->failed; i++) {
         const Elf64_Shdr *s = &obj->sections[i];
@@ -489,27 +609,64 @@ static void place_sections(Linker *l, Object *obj)
             id = OUT_FINI;
         else if (equal(name, ".eh_frame"))
             id = OUT_EH_FRAME;
-        OutputSection *out = &l->sections[id];
-        uint64_t alignment = s->sh_addralign ? s->sh_addralign : 1;
-        if (alignment > PAGE || (alignment & (alignment - 1)) || out->size > (size_t)PTRDIFF_MAX - PAGE ||
-            s->sh_size > (uint64_t)PTRDIFF_MAX - PAGE - out->size) {
-            error(l->context, (Loc){0}, "%s: unsupported section size or alignment", obj->path);
-            return;
+        if (*name && (s->sh_type == SHT_NOBITS || s->sh_type == SHT_PROGBITS) &&
+            id != OUT_INIT && id != OUT_FINI && id != OUT_EH_FRAME &&
+            !elf_section_family(name, section_kind(l, id)->name)) {
+            id = orphan_section(l, name, s);
+            if (!id)
+                return;
         }
-        size_t offset = id == OUT_EH_FRAME ? out->size : align_to(out->size, (size_t)alignment);
-        size_t size = (size_t)s->sh_size;
-        if (s->sh_type != SHT_NOBITS) {
-            const unsigned char *data = obj->file.data + s->sh_offset;
-            if (id == OUT_EH_FRAME)
-                size = frame_records(data, size);
-            else
-                bytes_align(l->context, &out->contents, (size_t)alignment);
-            bytes_add(l->context, &out->contents, data, size);
+        if ((s->sh_flags & SHF_LINK_ORDER) && s->sh_link) {
+            OrderedInput input = {.object = obj, .section = i, .order = ordered->len, .output = id};
+            PUSH(l->context, *ordered, input);
+        } else if (id == OUT_INIT_ARRAY || id == OUT_FINI_ARRAY) {
+            unsigned priority = elf_array_priority(name, section_kind(l, id)->name);
+            ArrayInput input = {obj, i, arrays->len, id, priority};
+            PUSH(l->context, *arrays, input);
+        } else {
+            place_section(l, obj, i, id);
         }
-        out->size = offset + size;
-        if (alignment > out->alignment)
-            out->alignment = (size_t)alignment;
-        obj->locations[i] = (Placement){id, offset};
+    }
+}
+
+static int compare_array_inputs(const void *left, const void *right)
+{
+    const ArrayInput *a = left, *b = right;
+    if (a->priority != b->priority)
+        return a->priority < b->priority ? -1 : 1;
+    return (a->order > b->order) - (a->order < b->order);
+}
+
+static bool identifier_section(const char *name)
+{
+    if (!*name || !strchr("_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", *name))
+        return false;
+    return name[strspn(name, "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")] == 0;
+}
+
+static void define_section_boundaries(Linker *l)
+{
+    for (size_t i = 0; i < l->globals.len; i++) {
+        Global *g = l->globals.data[i];
+        if (g->object || !g->undefined)
+            continue;
+        bool start = !strncmp(g->name, "__start_", 8);
+        bool stop = !strncmp(g->name, "__stop_", 7);
+        if (!start && !stop)
+            continue;
+        const char *name = g->name + (start ? 8 : 7);
+        if (!identifier_section(name))
+            continue;
+        for (size_t j = 0; j < l->orphans.len; j++) {
+            OrphanSection *orphan = &l->orphans.data[j];
+            if (!(orphan->kind.flags & SHF_TLS) && equal(orphan->kind.name, name)) {
+                g->boundary_section = OUT_COUNT + (unsigned)j;
+                g->boundary_end = stop;
+                if (g->visibility == STV_DEFAULT)
+                    g->visibility = STV_PROTECTED;
+                break;
+            }
+        }
     }
 }
 
@@ -520,12 +677,12 @@ static bool symbol_address(Linker *l, Object *obj, Elf64_Sym s, const char *name
         return true;
     }
     if (s.st_shndx >= obj->header.e_shnum ||
-        !obj->locations[s.st_shndx].output || s.st_value > obj->sections[s.st_shndx].sh_size) {
+        !obj->locations[s.st_shndx].output || s.st_value > obj->locations[s.st_shndx].size) {
         error(l->context, (Loc){0}, "%s: symbol '%s' is outside allocated sections", obj->path, name);
         return false;
     }
     Placement p = obj->locations[s.st_shndx];
-    *value = l->sections[p.output].address + p.offset + s.st_value;
+    *value = output_section(l, p.output)->address + p.offset + s.st_value;
     return true;
 }
 
@@ -544,6 +701,8 @@ static bool lookup(Linker *l, Object *obj, size_t index, LinkSymbol *result)
         obj = g->object;
         s = g->symbol;
     }
+    if (g)
+        s.st_other = (unsigned char)((s.st_other & ~3u) | g->visibility);
     *result = (LinkSymbol){.object = obj, .global = g, .symbol = s, .index = index, .name = name};
     return true;
 }
@@ -554,6 +713,18 @@ static bool synthetic(Linker *l, const char *name, uint64_t *value)
         return false;
     if (equal(name, "__ehdr_start")) {
         *value = l->base;
+        return true;
+    }
+    if (!strncmp(name, "__start_", 8) || !strncmp(name, "__stop_", 7)) {
+        Global *g = global_symbol(l, name, false);
+        if (g && g->boundary_section) {
+            OutputSection *s = output_section(l, g->boundary_section);
+            *value = s->address + (g->boundary_end ? s->size : 0);
+            return true;
+        }
+    }
+    if (equal(name, "_edata") || equal(name, "edata") || equal(name, "_etext") || equal(name, "etext")) {
+        *value = l->base + (equal(name, "_edata") || equal(name, "edata") ? l->data_end : l->code_end);
         return true;
     }
     if (equal(name, "__tls_get_addr") && l->tls_resolver && !l->dynamic && l->machine == EM_X86_64) {
@@ -567,8 +738,6 @@ static bool synthetic(Linker *l, const char *name, uint64_t *value)
         {"__fini_array_start", OUT_FINI_ARRAY, false}, {"__fini_array_end", OUT_FINI_ARRAY, true},
         {"__rela_iplt_start", OUT_IPLT_RELA, false}, {"__rela_iplt_end", OUT_IPLT_RELA, true},
         {"__bss_start", SECTION_BSS, false}, {"_end", SECTION_BSS, true}, {"end", SECTION_BSS, true},
-        {"_edata", SECTION_DATA, true}, {"edata", SECTION_DATA, true},
-        {"_etext", OUT_PLT, true}, {"etext", OUT_PLT, true},
     };
     for (size_t i = 0; i < sizeof symbols / sizeof *symbols; i++) {
         if (equal(name, symbols[i].name)) {
@@ -695,6 +864,10 @@ static void allocate_bss(Linker *l, Global *g, uint64_t size, uint64_t alignment
 static void reserve_copy(Linker *l, LinkSymbol s)
 {
     Global *g = s.global;
+    if (ELF64_ST_VISIBILITY(g->imported.st_other) == STV_PROTECTED) {
+        error(l->context, (Loc){0}, "cannot create copy relocation for protected symbol '%s'", s.name);
+        return;
+    }
     uint64_t address = g->imported.st_value;
     uint64_t alignment = address & (0 - address);
     if (alignment > PAGE)
@@ -765,6 +938,7 @@ static void prepare_relocations(Linker *l, Object *obj)
                 return;
             if (l->dynamic && !l->options->shared && direct_data_relocation(l->machine, type) &&
                 imported(l, symbol) && symbol.global->library &&
+                (symbol.global->referenced || symbol.global->library->needed) &&
                 ELF64_ST_TYPE(symbol.global->imported.st_info) == STT_OBJECT) {
                 reserve_copy(l, symbol);
             }
@@ -795,7 +969,7 @@ static uint32_t dynamic_symbol(Linker *l, LinkSymbol s)
         PUSH(l->context, l->dynamic_symbols, g);
         g->dynamic_index = (uint32_t)l->dynamic_symbols.len;
     }
-    if (!g->object && g->library)
+    if (!g->object && g->library && g->referenced && g->visibility == STV_DEFAULT)
         g->library->needed = true;
     return g->dynamic_index;
 }
@@ -805,21 +979,14 @@ static void dynamic_relocation(Linker *l, uint64_t address, unsigned type, unsig
     PUSH(l->context, l->relas, ((Elf64_Rela){address, ELF64_R_INFO(symbol, type), (int64_t)addend}));
 }
 
-static size_t tls_alignment(Linker *l)
-{
-    size_t initialized = l->sections[OUT_TDATA].alignment, zero = l->sections[OUT_TBSS].alignment;
-    return initialized > zero ? initialized : zero;
-}
-
 static size_t tls_size(Linker *l)
 {
-    OutputSection *data = &l->sections[OUT_TDATA], *bss = &l->sections[OUT_TBSS];
-    return bss->offset + bss->size - data->offset;
+    return l->tls_end - l->sections[OUT_TDATA].offset;
 }
 
 static uint64_t thread_offset(Linker *l, uint64_t module_offset)
 {
-    size_t alignment = tls_alignment(l);
+    size_t alignment = l->sections[OUT_TDATA].alignment;
     uint64_t adjustment = l->machine == EM_AARCH64 ? align_to(16, alignment) : 0 - align_to(tls_size(l), alignment);
     return module_offset + adjustment;
 }
@@ -932,15 +1099,15 @@ static void apply_relocations(Linker *l, Object *obj)
         Placement p = obj->locations[s->sh_info];
         if (!p.output)
             continue;
-        OutputSection *target = &l->sections[p.output];
-        uint64_t section_size = obj->sections[s->sh_info].sh_size;
+        OutputSection *target = output_section(l, p.output);
+        size_t section_size = p.size;
         for (size_t offset = 0; offset < s->sh_size; offset += sizeof(Elf64_Rela)) {
             Elf64_Rela rel;
             memcpy(&rel, obj->file.data + s->sh_offset + offset, sizeof rel);
             uint32_t type = (uint32_t)ELF64_R_TYPE(rel.r_info);
             if (!type || (l->machine == EM_AARCH64 && type >= R_AARCH64_TLSDESC_LDR && type <= R_AARCH64_TLSDESC_CALL))
                 continue;
-            if (p.output == SECTION_BSS || p.output == OUT_TBSS || rel.r_offset >= section_size) {
+            if (section_kind(l, p.output)->type == SHT_NOBITS || rel.r_offset >= section_size) {
                 error(l->context, (Loc){0}, "%s: relocation offset is outside initialized sections", obj->path);
                 return;
             }
@@ -968,7 +1135,7 @@ static void apply_relocations(Linker *l, Object *obj)
                 symbol = l->sections[OUT_PLT].address + slot->stub - 1;
             } else if (type == abs64 && available >= 8 && preemptible(l, sref)) {
                 dynamic_relocation(l, place, abs64, dynamic_symbol(l, sref), (uint64_t)rel.r_addend);
-                l->text_relocations |= !(section_kind(p.output)->flags & SHF_WRITE);
+                l->text_relocations |= !(section_kind(l, p.output)->flags & SHF_WRITE);
                 continue;
             } else if (!resolve(l, sref, &symbol)) {
                 return;
@@ -976,7 +1143,7 @@ static void apply_relocations(Linker *l, Object *obj)
             uint64_t value = symbol + (uint64_t)rel.r_addend;
             if (type == abs64 && available >= 8 && load_relative(l, sref)) {
                 dynamic_relocation(l, place, reloc_type(l, R_AARCH64_RELATIVE, R_X86_64_RELATIVE), 0, value);
-                l->text_relocations |= !(section_kind(p.output)->flags & SHF_WRITE);
+                l->text_relocations |= !(section_kind(l, p.output)->flags & SHF_WRITE);
             }
             if (l->machine == EM_X86_64) {
                 if (type == R_X86_64_TPOFF32 || type == R_X86_64_TPOFF64) {
@@ -1023,69 +1190,174 @@ enum { MAX_PROGRAM_HEADERS = 12 };
 
 static size_t place_output(Linker *l, unsigned id, size_t offset, uint64_t bias)
 {
-    OutputSection *s = &l->sections[id];
+    OutputSection *s = output_section(l, id);
     s->offset = align_to(offset, s->alignment);
     s->address = bias + s->offset;
     return s->offset + s->size;
 }
 
+typedef enum { ORPHAN_CODE, ORPHAN_RO, ORPHAN_DATA, ORPHAN_TLS_DATA, ORPHAN_TLS_BSS, ORPHAN_BSS } OrphanGroup;
+
+static OrphanGroup orphan_group(const SectionKind *kind)
+{
+    if (kind->flags & SHF_TLS)
+        return kind->type == SHT_NOBITS ? ORPHAN_TLS_BSS : ORPHAN_TLS_DATA;
+    if (kind->type == SHT_NOBITS)
+        return ORPHAN_BSS;
+    return kind->flags & SHF_EXECINSTR ? ORPHAN_CODE : kind->flags & SHF_WRITE ? ORPHAN_DATA : ORPHAN_RO;
+}
+
+static const unsigned code_sections[] = {OUT_INTERP, OUT_INIT, SECTION_TEXT, OUT_FINI, OUT_PLT};
+static const unsigned ro_sections[] = {SECTION_RODATA, OUT_EH_FRAME, OUT_EH_FRAME_HDR, OUT_IPLT_RELA};
+static const unsigned rw_sections[] = {OUT_DYNAMIC, OUT_GOT, OUT_PREINIT_ARRAY, OUT_INIT_ARRAY,
+                                       OUT_FINI_ARRAY, SECTION_DATA};
+
+static void rank_orphans(Linker *l, unsigned *ranks, unsigned *next, OrphanGroup group)
+{
+    for (size_t i = 0; i < l->orphans.len; i++)
+        if (orphan_group(&l->orphans.data[i].kind) == group)
+            ranks[OUT_COUNT + i] = ++*next;
+}
+
+static int compare_ordered_inputs(const void *left, const void *right)
+{
+    const OrderedInput *a = left, *b = right;
+    if (a->target_rank != b->target_rank)
+        return a->target_rank < b->target_rank ? -1 : 1;
+    if (a->target.offset != b->target.offset)
+        return a->target.offset < b->target.offset ? -1 : 1;
+    return (a->order > b->order) - (a->order < b->order);
+}
+
+static void place_ordered_sections(Linker *l, OrderedInputs *ordered)
+{
+    if (!ordered->len || l->context->failed)
+        return;
+    unsigned *ranks = alloc(l->context, section_count(l) * sizeof *ranks);
+    unsigned next = 0;
+    for (size_t i = 0; i < sizeof code_sections / sizeof *code_sections; i++)
+        ranks[code_sections[i]] = ++next;
+    rank_orphans(l, ranks, &next, ORPHAN_CODE);
+    for (size_t i = 0; i < sizeof ro_sections / sizeof *ro_sections; i++)
+        ranks[ro_sections[i]] = ++next;
+    rank_orphans(l, ranks, &next, ORPHAN_RO);
+    for (size_t i = 0; i < sizeof rw_sections / sizeof *rw_sections; i++)
+        ranks[rw_sections[i]] = ++next;
+    rank_orphans(l, ranks, &next, ORPHAN_DATA);
+    ranks[OUT_TDATA] = ++next;
+    rank_orphans(l, ranks, &next, ORPHAN_TLS_DATA);
+    ranks[OUT_TBSS] = ++next;
+    rank_orphans(l, ranks, &next, ORPHAN_TLS_BSS);
+    rank_orphans(l, ranks, &next, ORPHAN_BSS);
+    ranks[SECTION_BSS] = ++next;
+    for (size_t i = 0; i < ordered->len; i++) {
+        OrderedInput *input = &ordered->data[i];
+        Object *obj = input->object;
+        input->target = obj->locations[obj->sections[input->section].sh_link];
+        input->target_rank = ranks[input->target.output];
+        if (!input->target_rank) {
+            error(l->context, (Loc){0}, "%s: section %zu has an unallocated link target", obj->path, input->section);
+            return;
+        }
+    }
+    if (ordered->len > 1)
+        qsort(ordered->data, ordered->len, sizeof *ordered->data, compare_ordered_inputs);
+    for (size_t i = 0; i < ordered->len && !l->context->failed; i++) {
+        const OrderedInput *input = &ordered->data[i];
+        OutputSection *output = output_section(l, input->output);
+        if (!output->linked_output)
+            output->linked_output = input->target.output;
+        place_section(l, input->object, input->section, input->output);
+    }
+}
+
+static size_t place_orphans(Linker *l, OrphanGroup group, size_t offset)
+{
+    for (size_t i = 0; i < l->orphans.len; i++)
+        if (orphan_group(&l->orphans.data[i].kind) == group)
+            offset = place_output(l, OUT_COUNT + (unsigned)i, offset, l->base);
+    return offset;
+}
+
 static bool layout(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint16_t *count)
 {
-    const unsigned code[] = {OUT_INTERP, OUT_INIT, SECTION_TEXT, OUT_FINI, OUT_PLT};
-    const unsigned read_only[] = {SECTION_RODATA, OUT_EH_FRAME, OUT_EH_FRAME_HDR, OUT_IPLT_RELA};
-    const unsigned writeable[] = {OUT_DYNAMIC, OUT_GOT, OUT_PREINIT_ARRAY, OUT_INIT_ARRAY,
-                                  OUT_FINI_ARRAY, SECTION_DATA, OUT_TDATA, OUT_TBSS, SECTION_BSS};
     bool ro = false, rw = false;
-    for (size_t i = 0; i < sizeof read_only / sizeof *read_only; i++)
-        ro |= l->sections[read_only[i]].size != 0;
-    for (size_t i = 0; i < sizeof writeable / sizeof *writeable; i++)
-        rw |= l->sections[writeable[i]].size != 0;
+    for (size_t i = 0; i < sizeof ro_sections / sizeof *ro_sections; i++)
+        ro |= l->sections[ro_sections[i]].size != 0;
+    for (size_t i = 0; i < sizeof rw_sections / sizeof *rw_sections; i++)
+        rw |= l->sections[rw_sections[i]].size != 0;
     bool tls = l->sections[OUT_TDATA].size || l->sections[OUT_TBSS].size;
+    rw |= tls || l->sections[SECTION_BSS].size != 0;
+    size_t tls_align = l->sections[OUT_TBSS].alignment;
+    for (size_t i = 0; i < l->orphans.len; i++) {
+        const OrphanSection *orphan = &l->orphans.data[i];
+        OrphanGroup group = orphan_group(&orphan->kind);
+        ro |= group == ORPHAN_RO && orphan->output.size != 0;
+        rw |= group >= ORPHAN_DATA && orphan->output.size != 0;
+        if (group == ORPHAN_TLS_DATA || group == ORPHAN_TLS_BSS) {
+            tls |= orphan->output.size != 0;
+            if (orphan->output.alignment > tls_align)
+                tls_align = orphan->output.alignment;
+        }
+    }
     bool interp = l->options->interpreter != NULL;
     bool unwind = l->sections[OUT_EH_FRAME_HDR].size != 0;
     *count = (uint16_t)(3 + ro + rw + tls + interp + unwind + l->dynamic * 3);
 
     size_t sizes = 8 * PAGE;
-    for (size_t i = 1; i < OUT_COUNT; i++) {
-        if (l->sections[i].size > (size_t)PTRDIFF_MAX - sizes) {
+    for (unsigned i = 1; i < section_count(l); i++) {
+        OutputSection *s = output_section(l, i);
+        size_t padding = s->alignment - 1;
+        if (padding > (size_t)PTRDIFF_MAX - sizes || s->size > (size_t)PTRDIFF_MAX - sizes - padding) {
             error(l->context, (Loc){0}, "linked ELF image is too large");
             return false;
         }
-        sizes += l->sections[i].size;
+        sizes += s->size + padding;
     }
     size_t phdr_size = *count * sizeof(Elf64_Phdr);
     unsigned i = 0;
     programs[i++] = segment(PT_PHDR, sizeof(Elf64_Ehdr), l->base + sizeof(Elf64_Ehdr),
                             phdr_size, phdr_size, PF_R, 8);
     size_t end = sizeof(Elf64_Ehdr) + phdr_size;
-    for (size_t j = 0; j < sizeof code / sizeof *code; j++)
-        end = place_output(l, code[j], end, l->base);
+    for (size_t j = 0; j < sizeof code_sections / sizeof *code_sections; j++)
+        end = place_output(l, code_sections[j], end, l->base);
+    l->code_end = end = place_orphans(l, ORPHAN_CODE, end);
     if (interp)
         programs[i++] = section_segment(l, PT_INTERP, OUT_INTERP, l->sections[OUT_INTERP].size, PF_R);
     programs[i++] = segment(PT_LOAD, 0, l->base, end, end, PF_R | PF_X, PAGE);
     size_t start = align_to(end, PAGE), next = start;
-    for (size_t j = 0; j < sizeof read_only / sizeof *read_only; j++)
-        next = place_output(l, read_only[j], next, l->base);
+    for (size_t j = 0; j < sizeof ro_sections / sizeof *ro_sections; j++)
+        next = place_output(l, ro_sections[j], next, l->base);
+    next = place_orphans(l, ORPHAN_RO, next);
     if (ro) {
         programs[i++] = segment(PT_LOAD, start, l->base + start, next - start, next - start, PF_R, PAGE);
         end = next;
     }
     start = next = align_to(end, PAGE);
-    l->sections[OUT_TDATA].alignment = tls_alignment(l);
-    for (size_t j = 0; j < sizeof writeable / sizeof *writeable; j++) {
-        if (l->dynamic && writeable[j] == SECTION_DATA)
+    if (l->sections[OUT_TDATA].alignment < tls_align)
+        l->sections[OUT_TDATA].alignment = tls_align;
+    for (size_t j = 0; j < sizeof rw_sections / sizeof *rw_sections; j++) {
+        if (l->dynamic && rw_sections[j] == SECTION_DATA)
             next = align_to(next, PAGE);
-        next = place_output(l, writeable[j], next, l->base);
+        next = place_output(l, rw_sections[j], next, l->base);
     }
+    l->data_end = next = place_orphans(l, ORPHAN_DATA, next);
+    next = place_output(l, OUT_TDATA, next, l->base);
+    size_t files = next = place_orphans(l, ORPHAN_TLS_DATA, next);
+    next = place_output(l, OUT_TBSS, next, l->base);
+    l->tls_end = next = place_orphans(l, ORPHAN_TLS_BSS, next);
+    next = place_orphans(l, ORPHAN_BSS, next);
+    next = place_output(l, SECTION_BSS, next, l->base);
     l->load_end = l->memory_end = end;
     if (rw) {
-        size_t files = l->sections[OUT_TDATA].offset + l->sections[OUT_TDATA].size;
         programs[i++] = segment(PT_LOAD, start, l->base + start, files - start, next - start, PF_R | PF_W, PAGE);
         l->load_end = files;
         l->memory_end = next;
     }
     if (tls) {
-        programs[i++] = section_segment(l, PT_TLS, OUT_TDATA, tls_size(l), PF_R);
+        OutputSection *data = &l->sections[OUT_TDATA];
+        programs[i++] = segment(PT_TLS, data->offset, data->address, files - data->offset,
+                                tls_size(l), PF_R, data->alignment);
     }
     if (unwind) {
         OutputSection *hdr = &l->sections[OUT_EH_FRAME_HDR];
@@ -1104,7 +1376,16 @@ static bool layout(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint16_t
 
 static bool output_symbol(Linker *l, Global *g, Elf64_Sym *symbol)
 {
+    if (g->boundary_section) {
+        OutputSection *s = output_section(l, g->boundary_section);
+        *symbol = (Elf64_Sym){.st_value = s->address + (g->boundary_end ? s->size : 0),
+                              .st_info = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE),
+                              .st_other = (unsigned char)g->visibility,
+                              .st_shndx = (uint16_t)g->boundary_section};
+        return true;
+    }
     *symbol = g->copy ? g->imported : g->symbol;
+    symbol->st_other = (unsigned char)((symbol->st_other & ~3u) | g->visibility);
     if (g->copy || symbol->st_shndx == SHN_COMMON) {
         symbol->st_value = l->sections[SECTION_BSS].address + g->bss_offset;
         symbol->st_shndx = SECTION_BSS;
@@ -1121,7 +1402,7 @@ static bool output_symbol(Linker *l, Global *g, Elf64_Sym *symbol)
 
 static bool has_output_symbol(Global *g)
 {
-    if (g->copy)
+    if (g->copy || g->boundary_section)
         return true;
     unsigned section = g->symbol.st_shndx;
     return g->object && (section == SHN_ABS || section == SHN_COMMON || g->object->locations[section].output);
@@ -1175,7 +1456,7 @@ static void dynamic_versions(Linker *l, Bytes *strings)
     for (size_t i = 0; i < l->dynamic_symbols.len && !c->failed; i++) {
         Global *g = l->dynamic_symbols.data[i];
         uint16_t index = VER_NDX_GLOBAL;
-        if (!g->object && g->version.name) {
+        if (!g->object && g->version.name && g->library->needed) {
             Versions *versions = &g->library->versions;
             size_t j = 0;
             while (j < versions->len && !equal(versions->data[j].name, g->version.name))
@@ -1239,8 +1520,7 @@ static bool dynamic_image(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], u
         Global *g = l->globals.data[i];
         if (!(l->options->shared || l->options->export_all || g->shared_reference) || !has_output_symbol(g))
             continue;
-        unsigned visibility = ELF64_ST_VISIBILITY(g->symbol.st_other);
-        if (visibility == STV_DEFAULT || visibility == STV_PROTECTED)
+        if (g->visibility == STV_DEFAULT || g->visibility == STV_PROTECTED)
             dynamic_symbol(l, (LinkSymbol){.global = g});
     }
     size_t count_symbols = l->dynamic_symbols.len + 1;
@@ -1249,7 +1529,7 @@ static bool dynamic_image(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], u
     uint32_t *chains = table + buckets;
     for (size_t i = 1; i < count_symbols && !c->failed; i++) {
         Global *g = l->dynamic_symbols.data[i - 1];
-        unsigned type = ELF64_ST_TYPE(g->imported.st_info);
+        unsigned type = g->library && g->library->needed ? ELF64_ST_TYPE(g->imported.st_info) : STT_NOTYPE;
         if (type == STT_GNU_IFUNC)
             type = STT_FUNC;
         Elf64_Sym s = {.st_info = (unsigned char)ELF64_ST_INFO(g->referenced ? (unsigned)STB_GLOBAL : (unsigned)STB_WEAK, type)};
@@ -1318,7 +1598,7 @@ static bool executable(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint
         const char *name = l->options->entry;
         Global *entry = global_symbol(l, name, false);
         if (!entry || !entry->object || entry->symbol.st_shndx >= entry->object->header.e_shnum ||
-            !(section_kind(entry->object->locations[entry->symbol.st_shndx].output)->flags & SHF_EXECINSTR) ||
+            !(section_kind(l, entry->object->locations[entry->symbol.st_shndx].output)->flags & SHF_EXECINSTR) ||
             entry->symbol.st_value >= entry->object->sections[entry->symbol.st_shndx].sh_size) {
             error(c, (Loc){0}, "entry symbol '%s' must be defined in executable code", name);
             return false;
@@ -1335,16 +1615,21 @@ static bool executable(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint
     bytes_add(c, &out, NULL, sizeof h);
     bytes_add(c, &out, programs, sizeof *programs * count);
     bytes_add(c, &names, NULL, 1);
-    enum { EXEC_SYMTAB = OUT_COUNT, EXEC_STRTAB, EXEC_SHSTRTAB, EXEC_SECTION_COUNT };
-    Elf64_Shdr sections[EXEC_SECTION_COUNT] = {{0}};
+    unsigned symtab = section_count(l), strtab = symtab + 1, shstrtab = strtab + 1;
+    unsigned header_count = shstrtab + 1;
+    Elf64_Shdr *sections = alloc(c, header_count * sizeof *sections);
     size_t file_size = out.len;
-    for (unsigned i = 1; i < OUT_COUNT; i++) {
-        OutputSection *s = &l->sections[i];
-        const SectionKind *kind = section_kind(i);
+    for (unsigned i = 1; i < symtab; i++) {
+        OutputSection *s = output_section(l, i);
+        const SectionKind *kind = section_kind(l, i);
         sections[i] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, kind->name),
                                    .sh_type = kind->type, .sh_flags = kind->flags,
                                    .sh_size = s->size, .sh_addralign = s->alignment,
                                    .sh_offset = s->offset, .sh_addr = s->address};
+        if (s->linked_output) {
+            sections[i].sh_flags |= SHF_LINK_ORDER;
+            sections[i].sh_link = s->linked_output;
+        }
         if (s->contents.len && s->offset + s->contents.len > file_size)
             file_size = s->offset + s->contents.len;
     }
@@ -1362,47 +1647,58 @@ static bool executable(Linker *l, Elf64_Phdr programs[MAX_PROGRAM_HEADERS], uint
     sections[OUT_VERNEED].sh_link = OUT_DYNSTR;
     sections[OUT_VERNEED].sh_info = l->version_libraries;
     sections[OUT_IPLT_RELA].sh_entsize = sizeof(Elf64_Rela);
+    sections[OUT_PREINIT_ARRAY].sh_entsize = sizeof(Elf64_Addr);
+    sections[OUT_INIT_ARRAY].sh_entsize = sizeof(Elf64_Addr);
+    sections[OUT_FINI_ARRAY].sh_entsize = sizeof(Elf64_Addr);
     bytes_add(c, &out, NULL, file_size - out.len);
     if (c->failed)
         return false;
-    for (unsigned i = 1; i < OUT_COUNT; i++) {
-        OutputSection *s = &l->sections[i];
+    for (unsigned i = 1; i < symtab; i++) {
+        OutputSection *s = output_section(l, i);
         if (s->contents.len)
             memcpy(out.data + s->offset, s->contents.data, s->contents.len);
     }
     bytes_add(c, &symbols, NULL, sizeof(Elf64_Sym));
     bytes_add(c, &strings, NULL, 1);
-    for (size_t i = 0; i < l->globals.len; i++) {
-        Global *g = l->globals.data[i];
-        if (!has_output_symbol(g))
-            continue;
-        Elf64_Sym s;
-        if (!output_symbol(l, g, &s))
-            return false;
-        s.st_name = bytes_string(c, &strings, g->name);
-        bytes_add(c, &symbols, &s, sizeof s);
+    uint32_t first_global = 1;
+    for (unsigned pass = 0; pass < 2; pass++) {
+        if (pass == 1)
+            first_global = (uint32_t)(symbols.len / sizeof(Elf64_Sym));
+        for (size_t i = 0; i < l->globals.len; i++) {
+            Global *g = l->globals.data[i];
+            bool local = g->visibility == STV_HIDDEN || g->visibility == STV_INTERNAL;
+            if (local != (pass == 0) || !has_output_symbol(g))
+                continue;
+            Elf64_Sym s;
+            if (!output_symbol(l, g, &s))
+                return false;
+            if (local)
+                s.st_info = (unsigned char)ELF64_ST_INFO(STB_LOCAL, ELF64_ST_TYPE(s.st_info));
+            s.st_name = bytes_string(c, &strings, g->name);
+            bytes_add(c, &symbols, &s, sizeof s);
+        }
     }
     bytes_align(c, &out, 8);
-    sections[EXEC_SYMTAB] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, ".symtab"),
+    sections[symtab] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, ".symtab"),
                                          .sh_type = SHT_SYMTAB, .sh_offset = out.len,
                                          .sh_size = symbols.len, .sh_addralign = 8,
-                                         .sh_entsize = sizeof(Elf64_Sym), .sh_link = EXEC_STRTAB,
-                                         .sh_info = 1};
+                                         .sh_entsize = sizeof(Elf64_Sym), .sh_link = strtab,
+                                         .sh_info = first_global};
     bytes_add(c, &out, symbols.data, symbols.len);
-    sections[EXEC_STRTAB] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, ".strtab"),
+    sections[strtab] = (Elf64_Shdr){.sh_name = bytes_string(c, &names, ".strtab"),
                                          .sh_type = SHT_STRTAB, .sh_offset = out.len,
                                          .sh_size = strings.len, .sh_addralign = 1};
     bytes_add(c, &out, strings.data, strings.len);
     uint32_t names_offset = bytes_string(c, &names, ".shstrtab");
-    sections[EXEC_SHSTRTAB] = (Elf64_Shdr){.sh_name = names_offset, .sh_type = SHT_STRTAB,
+    sections[shstrtab] = (Elf64_Shdr){.sh_name = names_offset, .sh_type = SHT_STRTAB,
                                            .sh_offset = out.len, .sh_size = names.len,
                                            .sh_addralign = 1};
     bytes_add(c, &out, names.data, names.len);
     bytes_align(c, &out, 8);
     h.e_shoff = out.len;
-    h.e_shnum = EXEC_SECTION_COUNT;
-    h.e_shstrndx = EXEC_SHSTRTAB;
-    bytes_add(c, &out, sections, sizeof sections);
+    h.e_shnum = (uint16_t)header_count;
+    h.e_shstrndx = (uint16_t)shstrtab;
+    bytes_add(c, &out, sections, header_count * sizeof *sections);
     memcpy(out.data, &h, sizeof h);
     return elf_write(c, &l->options->elf, &out, true);
 }
@@ -1417,8 +1713,18 @@ bool link_elf(Context *c, LinkOptions *options)
         l.sections[i].alignment = 1;
     if (!ld_inputs(c, &l, options))
         return false;
+    ArrayInputs arrays = {0};
+    OrderedInputs ordered = {0};
     for (size_t i = 0; i < l.objects.len && !c->failed; i++)
-        place_sections(&l, l.objects.data[i]);
+        place_sections(&l, l.objects.data[i], &arrays, &ordered);
+    if (arrays.len > 1)
+        qsort(arrays.data, arrays.len, sizeof *arrays.data, compare_array_inputs);
+    for (size_t i = 0; i < arrays.len && !c->failed; i++) {
+        const ArrayInput *input = &arrays.data[i];
+        place_section(&l, input->object, input->section, input->output);
+    }
+    place_ordered_sections(&l, &ordered);
+    define_section_boundaries(&l);
     for (size_t i = 0; i < l.globals.len && !c->failed; i++) {
         Global *g = l.globals.data[i];
         if (g->object && g->symbol.st_shndx == SHN_COMMON)

@@ -1,5 +1,6 @@
 #include "compiler.h"
 #include "parser.h"
+#include "inline_asm.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -10,8 +11,8 @@ const Target x86_64_linux = {
     .long_long_size = 8, .pointer_size = 8, .long_double_size = 16
 };
 
-typedef enum { ABI_NONE, ABI_GP, ABI_SSE, ABI_X87, ABI_X87_UP, ABI_MEMORY } AbiClass;
-typedef struct { AbiClass part[2]; unsigned gp, sse; bool memory; } Abi;
+typedef enum { ABI_NONE, ABI_GP, ABI_SSE, ABI_SSE_UP, ABI_X87, ABI_X87_UP, ABI_COMPLEX_X87, ABI_MEMORY } AbiClass;
+typedef struct { AbiClass part[2]; unsigned gp, sse; bool memory, complex_bfloat; } Abi;
 
 static AbiClass merge_class(AbiClass a, AbiClass b)
 {
@@ -30,8 +31,22 @@ static AbiClass merge_class(AbiClass a, AbiClass b)
 
 static bool classify_parts(Type *t, size_t offset, Abi *abi)
 {
-    if (offset % t->align || offset + t->size > 16)
+    if (offset % abi_alignment(t) || offset + t->size > 16)
         return false;
+    if (t->kind == TY_VECTOR) {
+        bool float16_pair = narrow_float(t->base) && t->size == 4;
+        if (t->base->kind == TY_FLOAT && ((t->size < 8 && !float16_pair) || t->base->size == 16))
+            return false;
+        size_t part = offset / 8;
+        abi->part[part] = merge_class(abi->part[part], t->size < 8 && !float16_pair ? ABI_GP : ABI_SSE);
+        if (t->size == 16)
+            abi->part[part + 1] = merge_class(abi->part[part + 1], ABI_SSE_UP);
+        return true;
+    }
+    if (t->kind == TY_COMPLEX) {
+        return classify_parts(t->base, offset, abi) &&
+               classify_parts(t->base, offset + t->base->size, abi);
+    }
     if (t->kind == TY_ARRAY) {
         for (size_t i = 0; i < t->length; i++)
             if (!classify_parts(t->base, offset + i * t->base->size, abi))
@@ -40,9 +55,11 @@ static bool classify_parts(Type *t, size_t offset, Abi *abi)
         for (size_t i = 0; i < t->members.len; i++) {
             Member m = t->members.data[i];
             if (m.bit_field) {
-                if (m.width) {
+                /* A zero-width union member contributes to its first eightbyte. */
+                if (m.width || (t->kind == TY_UNION && t->size)) {
                     size_t bit = (offset + m.offset) * 8 + m.bit;
-                    for (size_t n = bit / 64; n <= (bit + m.width - 1) / 64; n++)
+                    size_t last = m.width ? bit + m.width - 1 : bit;
+                    for (size_t n = bit / 64; n <= last / 64; n++)
                         abi->part[n] = merge_class(abi->part[n], ABI_GP);
                 }
             } else if (!classify_parts(m.type, offset + m.offset, abi)) {
@@ -51,20 +68,49 @@ static bool classify_parts(Type *t, size_t offset, Abi *abi)
         }
     } else if (t->kind != TY_VOID) {
         size_t part = offset / 8;
-        AbiClass kind = t->kind != TY_FLOAT ? ABI_GP : t->size == 16 ? ABI_X87 : ABI_SSE;
+        bool decimal = t->kind == TY_DECIMAL;
+        bool quad = binary128(&x86_64_linux, t) || (decimal && t->size == 16);
+        AbiClass kind = decimal ? ABI_SSE :
+                        t->kind != TY_FLOAT ? ABI_GP : t->size == 16 && !quad ? ABI_X87 : ABI_SSE;
         abi->part[part] = merge_class(abi->part[part], kind);
-        if (kind == ABI_X87)
+        if (quad)
+            abi->part[part + 1] = merge_class(abi->part[part + 1], ABI_SSE_UP);
+        else if (kind == ABI_X87)
             abi->part[part + 1] = merge_class(abi->part[part + 1], ABI_X87_UP);
+        else if (integer128(t))
+            abi->part[part + 1] = merge_class(abi->part[part + 1], ABI_GP);
     }
     return true;
 }
 
+static bool single_bfloat_complex(Type *t)
+{
+    if (t->size != 4)
+        return false;
+    if (t->kind == TY_COMPLEX)
+        return t->base->bfloat;
+    if (t->kind == TY_ARRAY)
+        return t->length == 1 && single_bfloat_complex(t->base);
+    return aggregate(t) && t->members.len == 1 && !t->members.data[0].offset &&
+           single_bfloat_complex(t->members.data[0].type);
+}
+
 static Abi classify(Type *t)
 {
+    if (t->variable_size)
+        return (Abi){.memory = true};
+    if (t->kind == TY_COMPLEX && t->base->kind == TY_FLOAT && t->base->size == 16 &&
+        !binary128(&x86_64_linux, t->base))
+        return (Abi){.part = {ABI_COMPLEX_X87, ABI_NONE}};
+    /* GNU's complex BF mode transports each component in a separate XMM register. */
+    if (single_bfloat_complex(t))
+        return (Abi){.sse = 2, .complex_bfloat = true};
     Abi abi = {0};
     if (!classify_parts(t, 0, &abi) || abi.part[0] == ABI_MEMORY || abi.part[1] == ABI_MEMORY ||
         (abi.part[1] == ABI_X87_UP && abi.part[0] != ABI_X87))
         return (Abi){.memory = true};
+    if (abi.part[1] == ABI_SSE_UP && abi.part[0] != ABI_SSE)
+        abi.part[1] = ABI_SSE;
     for (size_t i = 0; i < 2; i++) {
         abi.gp += abi.part[i] == ABI_GP;
         abi.sse += abi.part[i] == ABI_SSE;
@@ -75,14 +121,21 @@ static Abi classify(Type *t)
 enum { GP_COUNT = 6, SSE_COUNT = 8, GP_SAVE_SIZE = 8 * GP_COUNT,
        REGISTER_SAVE_SIZE = GP_SAVE_SIZE + 16 * SSE_COUNT };
 
-typedef struct { unsigned gp, sse; size_t stack; } ArgumentState;
+typedef struct { unsigned gp, sse, stack_alignment; size_t stack; } ArgumentState;
 typedef struct { Abi abi; unsigned gp, sse; size_t offset; bool stack; } Argument;
+
+static unsigned stack_alignment(Type *t)
+{
+    if (t->kind == TY_VECTOR && (t->size == 32 || t->size == 64))
+        return t->size;
+    return abi_alignment(t);
+}
 
 static Argument argument(ArgumentState *state, Type *t)
 {
     Abi abi = classify(t);
     Argument a = {.abi = abi};
-    if (!abi.memory && abi.part[0] != ABI_X87 &&
+    if (!abi.memory && abi.part[0] != ABI_X87 && abi.part[0] != ABI_COMPLEX_X87 &&
         abi.gp <= GP_COUNT - state->gp && abi.sse <= SSE_COUNT - state->sse) {
         a.gp = state->gp;
         a.sse = state->sse;
@@ -90,30 +143,75 @@ static Argument argument(ArgumentState *state, Type *t)
         state->sse += abi.sse;
     } else {
         a.stack = true;
-        a.offset = align_to(state->stack, t->align > 8 ? t->align : 8);
+        unsigned alignment = stack_alignment(t);
+        if (alignment < 8)
+            alignment = 8;
+        a.offset = align_to(state->stack, alignment);
         state->stack = a.offset + align_to(t->size, 8);
+        if (alignment > state->stack_alignment)
+            state->stack_alignment = alignment;
     }
     return a;
 }
 
-typedef struct { const char *q, *l, *w, *b; } Reg;
+typedef struct { const char *q, *l, *w, *b; unsigned id; } Reg;
 static const Reg argument_regs[] = {
-    {"%rdi", "%edi", "%di", "%dil"}, {"%rsi", "%esi", "%si", "%sil"},
-    {"%rdx", "%edx", "%dx", "%dl"}, {"%rcx", "%ecx", "%cx", "%cl"},
-    {"%r8", "%r8d", "%r8w", "%r8b"}, {"%r9", "%r9d", "%r9w", "%r9b"}
+    {"%rdi", "%edi", "%di", "%dil", 7}, {"%rsi", "%esi", "%si", "%sil", 6},
+    {"%rdx", "%edx", "%dx", "%dl", 2}, {"%rcx", "%ecx", "%cx", "%cl", 1},
+    {"%r8", "%r8d", "%r8w", "%r8b", 8}, {"%r9", "%r9d", "%r9w", "%r9b", 9}
 };
 static const Reg result_regs[] = {
-    {"%rax", "%eax", "%ax", "%al"}, {"%rdx", "%edx", "%dx", "%dl"}
+    {"%rax", "%eax", "%ax", "%al", 0}, {"%rdx", "%edx", "%dx", "%dl", 2}
 };
 
 typedef struct {
     Context *context;
     FILE *out;
+    Symbol *function;
+    FunctionIR *ir;
     size_t *offsets;
+    size_t register_spills[64];
+    uint64_t jump_registers;
+    bool stack_checkpoint_pin;
     unsigned function_id, next_label;
     size_t indirect_result, registers, scratch;
     ArgumentState named;
 } Emitter;
+
+static uint64_t abi_register_mask(const Reg *regs, unsigned gp, unsigned sse)
+{
+    uint64_t mask = ((UINT64_C(1) << sse) - 1) << 32;
+    for (unsigned i = 0; i < gp; i++)
+        mask |= UINT64_C(1) << regs[i].id;
+    return mask;
+}
+
+static void sync_registers(Emitter *e, uint64_t registers, bool reload)
+{
+    if (!registers)
+        return;
+    for (unsigned reg = 0; reg < 64; reg++) {
+        if (!(registers & (UINT64_C(1) << reg)))
+            continue;
+        size_t offset = e->register_spills[reg];
+        if (reg < 32) {
+            const char *name = x86_asm_register(reg, 8);
+            if (reload)
+                fprintf(e->out, "\tmovq -%zu(%%rbp), %%%s\n", offset, name);
+            else
+                fprintf(e->out, "\tmovq %%%s, -%zu(%%rbp)\n", name, offset);
+        } else if (reload) {
+            fprintf(e->out, "\tmovaps -%zu(%%rbp), %%xmm%u\n", offset, reg - 32);
+        } else {
+            fprintf(e->out, "\tmovaps %%xmm%u, -%zu(%%rbp)\n", reg - 32, offset);
+        }
+    }
+}
+
+static void sync_register_spills(Emitter *e, uint64_t skip, bool reload)
+{
+    sync_registers(e, e->context->global_register_spills & ~skip, reload);
+}
 
 static void number(FILE *out, uint64_t value, const char *reg)
 {
@@ -130,9 +228,53 @@ static void slot_store(Emitter *e, size_t id, const char *reg)
     fprintf(e->out, "\tmovq %s, -%zu(%%rbp)\n", reg, e->offsets[id]);
 }
 
+static void align_address(Emitter *e, const char *reg, unsigned alignment)
+{
+    if (alignment > 16)
+        fprintf(e->out, "\tandq $-%u, %s\n", alignment, reg);
+}
+
+static void slot_address(Emitter *e, size_t id, const char *reg)
+{
+    fprintf(e->out, "\tleaq -%zu(%%rbp), %s\n", e->offsets[id], reg);
+    align_address(e, reg, e->ir->slots.data[id - 1].alignment);
+}
+
+static const char *asm_simd_move(unsigned size)
+{
+    return size == 16 ? "movaps" : size <= 4 ? "movd" : "movq";
+}
+
+static void write_register_slot(Emitter *e, unsigned reg, size_t source, unsigned width)
+{
+    size_t spill = e->register_spills[reg];
+    FILE *out = e->out;
+    if (reg >= 32) {
+        fprintf(out, "\t%s -%zu(%%rbp), %%xmm%u\n",
+                asm_simd_move(width), e->offsets[source], spill ? 0 : reg - 32);
+        if (spill)
+            fprintf(out, "\tmovaps %%xmm0, -%zu(%%rbp)\n", spill);
+    } else if (spill) {
+        slot_load(e, source, "%rax");
+        fprintf(out, "\tmovq %%rax, -%zu(%%rbp)\n", spill);
+    } else {
+        fprintf(out, "\tmovq -%zu(%%rbp), %%%s\n", e->offsets[source], x86_asm_register(reg, 8));
+    }
+}
+
+static void slot_high_store(Emitter *e, size_t id, const char *reg)
+{
+    fprintf(e->out, "\tmovq %s, -%zu(%%rbp)\n", reg, e->offsets[id] - 8);
+}
+
 static bool extended(Type *t)
 {
-    return t->kind == TY_FLOAT && t->size == 16;
+    return t->kind == TY_FLOAT && t->size == 16 && !binary128(&x86_64_linux, t);
+}
+
+static bool wide_scalar(Type *t)
+{
+    return t->size == 16 && (t->kind == TY_FLOAT || t->kind == TY_DECIMAL || integer128(t));
 }
 
 static char fp_suffix(Type *t)
@@ -227,11 +369,50 @@ static unsigned chunk_size(Type *t, unsigned part)
     return remaining < 8 ? remaining : 8;
 }
 
+static void sse_chunk(FILE *out, unsigned sse, const char *base, ptrdiff_t offset, unsigned size, bool load)
+{
+    char width = size <= 4 ? 'd' : 'q';
+    if (size != 4 && size != 8) {
+        Reg temporary = {"%r11", "%r11d", "%r11w", "%r11b", 11};
+        const char *reg = size <= 4 ? temporary.l : temporary.q;
+        if (load) {
+            load_chunk(out, temporary, base, offset, size);
+            fprintf(out, "\tmov%c %s, %%xmm%u\n", width, reg, sse);
+        } else {
+            fprintf(out, "\tmov%c %%xmm%u, %s\n", width, sse, reg);
+            store_chunk(out, temporary, base, offset, size);
+        }
+    } else if (load) {
+        fprintf(out, "\tmov%c %td(%s), %%xmm%u\n", width, offset, base, sse);
+    } else {
+        fprintf(out, "\tmov%c %%xmm%u, %td(%s)\n", width, sse, offset, base);
+    }
+}
+
 static void register_value(FILE *out, Type *t, Abi abi, const Reg *gp, unsigned sse,
                            const char *base, ptrdiff_t offset, bool load)
 {
+    if (abi.complex_bfloat) {
+        sse_chunk(out, sse, base, offset, 2, load);
+        sse_chunk(out, sse + 1, base, offset + 2, 2, load);
+        return;
+    }
+    if (abi.part[1] == ABI_SSE_UP) {
+        if (load)
+            fprintf(out, "\tmovups %td(%s), %%xmm%u\n", offset, base, sse);
+        else
+            fprintf(out, "\tmovups %%xmm%u, %td(%s)\n", sse, offset, base);
+        return;
+    }
     if (abi.part[0] == ABI_X87) {
         fprintf(out, "\t%s %td(%s)\n", load ? "fldt" : "fstpt", offset, base);
+        return;
+    }
+    if (abi.part[0] == ABI_COMPLEX_X87) {
+        if (load)
+            fprintf(out, "\tfldt %td(%s)\n\tfldt %td(%s)\n", offset + 16, base, offset, base);
+        else
+            fprintf(out, "\tfstpt %td(%s)\n\tfstpt %td(%s)\n", offset, base, offset + 16, base);
         return;
     }
     for (unsigned i = 0; i < 2; i++, offset += 8) {
@@ -239,12 +420,7 @@ static void register_value(FILE *out, Type *t, Abi abi, const Reg *gp, unsigned 
             continue;
         unsigned size = chunk_size(t, i);
         if (abi.part[i] == ABI_SSE) {
-            char width = size == 4 ? 'd' : 'q';
-            if (load)
-                fprintf(out, "\tmov%c %td(%s), %%xmm%u\n", width, offset, base, sse);
-            else
-                fprintf(out, "\tmov%c %%xmm%u, %td(%s)\n", width, sse, offset, base);
-            sse++;
+            sse_chunk(out, sse++, base, offset, size, load);
         } else {
             if (load)
                 load_chunk(out, *gp, base, offset, size);
@@ -261,16 +437,35 @@ static void copy_bytes(FILE *out, size_t size)
     fputs("\trep movsb\n", out);
 }
 
+static void enclosing_frame(Emitter *e, Symbol *owner, const char *reg)
+{
+    fprintf(e->out, "\tmovq %%rbp, %s\n", reg);
+    for (Symbol *fn = e->function; fn != owner; fn = fn->owner)
+        fprintf(e->out, "\tmovq -%zu(%s), %s\n", fn->static_chain->frame_offset, reg, reg);
+}
+
 static void object_address(Emitter *e, Symbol *s)
 {
     FILE *out = e->out;
     if (s->local) {
-        fprintf(out, "\tleaq -%zu(%%rbp), %%rax\n", e->offsets[s->slot]);
+        if (s->owner == e->function) {
+            slot_address(e, s->slot, "%rax");
+        } else {
+            enclosing_frame(e, s->owner, "%rax");
+            fprintf(out, "\tleaq -%zu(%%rax), %%rax\n", s->frame_offset);
+            if (!s->type->variable_size)
+                align_address(e, "%rax", symbol_alignment(s));
+        }
     } else if (s->thread_local_storage) {
         /* The GNU TLSGD sequence also lets the linker relax executable-local TLS. */
-        fprintf(out, "\tdata16 leaq %s@tlsgd(%%rip), %%rdi\n"
-                     "\t.value 0x6666\n\trex64\n\tcall __tls_get_addr@PLT\n", s->assembly);
-    } else if (s->internal) {
+        sync_register_spills(e, abi_register_mask(argument_regs, 1, 0), true);
+        fprintf(out, "\tdata16 leaq %s@tlsgd(%%rip), %%rdi\n", s->assembly);
+        if (e->context->no_plt)
+            fputs("\t.byte 0x66\n\trex64\n\tcall *__tls_get_addr@GOTPCREL(%rip)\n", out);
+        else
+            fputs("\t.value 0x6666\n\trex64\n\tcall __tls_get_addr@PLT\n", out);
+        sync_register_spills(e, 0, false);
+    } else if (s->internal && !s->weak_reference) {
         fprintf(out, "\tleaq %s(%%rip), %%rax\n", s->assembly);
     } else {
         fprintf(out, "\tmovq %s@GOTPCREL(%%rip), %%rax\n", s->assembly);
@@ -414,7 +609,27 @@ static void cast_instruction(Emitter *e, Inst *in)
 {
     Type *from = in->source_type, *to = in->type;
     FILE *out = e->out;
-    if (from->kind == TY_FLOAT) {
+    if (integer128(from) || integer128(to)) {
+        if (from->kind == TY_FLOAT || to->kind == TY_FLOAT) {
+            error(e->context, in->loc, "128-bit integer and floating point conversion is unsupported");
+            return;
+        }
+        slot_load(e, in->a, "%rax");
+        if (integer128(to)) {
+            if (integer128(from))
+                fprintf(out, "\tmovq -%zu(%%rbp), %%rdx\n", e->offsets[in->a] - 8);
+            else if (from->uns)
+                fputs("\txorl %edx, %edx\n", out);
+            else
+                fputs("\tmovq %rax, %rdx\n\tsarq $63, %rdx\n", out);
+            slot_high_store(e, in->dest, "%rdx");
+        } else {
+            if (to->kind == TY_BOOL)
+                fprintf(out, "\torq -%zu(%%rbp), %%rax\n", e->offsets[in->a] - 8);
+            normalize(out, to);
+        }
+        slot_store(e, in->dest, "%rax");
+    } else if (from->kind == TY_FLOAT) {
         if (to->kind == TY_FLOAT) {
             x87_load(e, from, in->a);
             x87_store(e, to, in->dest);
@@ -513,6 +728,7 @@ static void save_arguments(Emitter *e)
 static void parameters(Emitter *e, Symbol *s)
 {
     FILE *out = e->out;
+    Type reference = {.kind = TY_PTR, .size = 8, .align = 8};
     ArgumentState state = {.gp = e->indirect_result ? 1u : 0u};
     if (e->indirect_result)
         fprintf(out, "\tmovq %%rdi, -%zu(%%rbp)\n", e->indirect_result);
@@ -521,20 +737,29 @@ static void parameters(Emitter *e, Symbol *s)
     /* Stack copies use argument registers as scratch, so save register arguments first. */
     for (size_t i = 0; i < s->params.len; i++) {
         Symbol *p = s->params.data[i];
-        Argument a = argument(&state, p->type);
-        if (!a.stack)
-            register_value(out, p->type, a.abi, argument_regs + a.gp, a.sse,
-                           "%rbp", -(ptrdiff_t)e->offsets[p->slot], false);
+        Type *type = p->type->variable_size ? &reference : parameter_abi_type(p->type);
+        Argument a = argument(&state, type);
+        if (!a.stack) {
+            if (!p->type->variable_size && symbol_alignment(p) > 16) {
+                slot_address(e, p->slot, "%r10");
+                register_value(out, type, a.abi, argument_regs + a.gp, a.sse,
+                               "%r10", 0, false);
+            } else {
+                register_value(out, type, a.abi, argument_regs + a.gp, a.sse,
+                               "%rbp", -(ptrdiff_t)e->offsets[p->slot], false);
+            }
+        }
     }
     e->named = state;
     state = (ArgumentState){.gp = e->indirect_result ? 1u : 0u};
     for (size_t i = 0; i < s->params.len; i++) {
         Symbol *p = s->params.data[i];
-        Argument a = argument(&state, p->type);
+        Type *type = p->type->variable_size ? &reference : parameter_abi_type(p->type);
+        Argument a = argument(&state, type);
         if (a.stack) {
-            fprintf(out, "\tleaq %zu(%%rbp), %%rsi\n\tleaq -%zu(%%rbp), %%rdi\n",
-                    a.offset + 16, e->offsets[p->slot]);
-            copy_bytes(out, p->type->size);
+            fprintf(out, "\tleaq %zu(%%rbp), %%rsi\n", a.offset + 16);
+            slot_address(e, p->slot, "%rdi");
+            copy_bytes(out, type->size);
         }
     }
 }
@@ -546,10 +771,15 @@ static void call_instruction(Emitter *e, Inst *in)
     ArgumentState initial = {.gp = result.memory ? 1u : 0u}, state = initial;
     for (size_t i = 0; i < in->args.len; i++)
         argument(&state, in->arg_types.data[i]);
-    size_t stack = align_to(state.stack, 16);
+    unsigned alignment = state.stack_alignment > 16 ? state.stack_alignment : 16;
+    size_t stack = align_to(state.stack, alignment);
     if (stack > INT32_MAX) {
         error(e->context, in->loc, "outgoing x86-64 arguments are too large");
         return;
+    }
+    if (alignment > 16) {
+        fprintf(out, "\tmovq %%rsp, -%zu(%%rbp)\n", e->scratch);
+        align_address(e, "%rsp", alignment);
     }
     if (stack)
         fprintf(out, "\tsubq $%zu, %%rsp\n", stack);
@@ -561,8 +791,8 @@ static void call_instruction(Emitter *e, Inst *in)
         if (!a.stack)
             continue;
         size_t slot = in->args.data[i];
-        if (aggregate(t) || extended(t)) {
-            if (aggregate(t))
+        if (address_value(t) || wide_scalar(t)) {
+            if (address_value(t))
                 slot_load(e, slot, "%rsi");
             else
                 fprintf(out, "\tleaq -%zu(%%rbp), %%rsi\n", e->offsets[slot]);
@@ -580,7 +810,7 @@ static void call_instruction(Emitter *e, Inst *in)
         if (a.stack)
             continue;
         size_t slot = in->args.data[i];
-        if (aggregate(t)) {
+        if (address_value(t)) {
             slot_load(e, slot, "%r10");
             register_value(out, t, a.abi, argument_regs + a.gp, a.sse, "%r10", 0, true);
         } else {
@@ -590,21 +820,44 @@ static void call_instruction(Emitter *e, Inst *in)
     }
     if (result.memory)
         slot_load(e, in->dest, "%rdi");
-    fprintf(out, "\tmovl $%u, %%eax\n", state.sse);
-    if (in->symbol) {
-        fprintf(out, "\tcall %s%s\n", in->symbol->assembly, in->symbol->internal ? "" : "@PLT");
-    } else {
+    uint64_t occupied = abi_register_mask(argument_regs, state.gp, state.sse);
+    Type *function_type = in->source_type;
+    if (function_type && (!function_type->prototype || function_type->variadic)) {
+        fprintf(out, "\tmovl $%u, %%eax\n", state.sse);
+        occupied |= UINT64_C(1); /* %al holds the variadic SSE count. */
+    }
+    if (in->b) {
+        slot_load(e, in->b, "%r10");
+        occupied |= UINT64_C(1) << 10;
+    } else if (in->symbol && in->symbol->owner) {
+        enclosing_frame(e, in->symbol->owner, "%r10");
+        occupied |= UINT64_C(1) << 10;
+    }
+    if (!in->symbol) {
         slot_load(e, in->a, "%r11");
+        occupied |= UINT64_C(1) << 11;
+    }
+    sync_register_spills(e, occupied, true);
+    if (call_through_got(e->context, in->symbol)) {
+        fprintf(out, "\tcall *%s@GOTPCREL(%%rip)\n", in->symbol->assembly);
+    } else if (in->symbol) {
+        Symbol *symbol = in->symbol;
+        fprintf(out, "\tcall %s%s\n", symbol->assembly,
+                symbol_may_be_preempted(symbol) ? "@PLT" : "");
+    } else {
         fputs("\tcall *%r11\n", out);
     }
-    if (stack)
+    sync_register_spills(e, 0, false);
+    if (alignment > 16)
+        fprintf(out, "\tmovq -%zu(%%rbp), %%rsp\n", e->scratch);
+    else if (stack)
         fprintf(out, "\taddq $%zu, %%rsp\n", stack);
     if (!in->dest || result.memory)
         return;
-    if (aggregate(in->type)) {
+    if (address_value(in->type)) {
         slot_load(e, in->dest, "%r10");
         register_value(out, in->type, result, result_regs, 0, "%r10", 0, false);
-    } else if (in->type->kind == TY_FLOAT) {
+    } else if (in->type->kind == TY_FLOAT || in->type->kind == TY_DECIMAL || integer128(in->type)) {
         register_value(out, in->type, result, result_regs, 0,
                        "%rbp", -(ptrdiff_t)e->offsets[in->dest], false);
     } else {
@@ -622,11 +875,16 @@ static void return_value(Emitter *e, Inst *in, Type *t)
         if (e->indirect_result) {
             slot_load(e, in->a, "%rsi");
             fprintf(out, "\tmovq -%zu(%%rbp), %%rdi\n\tmovq %%rdi, %%rax\n", e->indirect_result);
-            copy_bytes(out, t->size);
-        } else if (aggregate(t)) {
+            if (in->b) {
+                slot_load(e, in->b, "%rcx");
+                fputs("\trep movsb\n", out);
+            } else {
+                copy_bytes(out, t->size);
+            }
+        } else if (address_value(t)) {
             slot_load(e, in->a, "%r10");
             register_value(out, t, classify(t), result_regs, 0, "%r10", 0, true);
-        } else if (t->kind == TY_FLOAT) {
+        } else if (t->kind == TY_FLOAT || t->kind == TY_DECIMAL || integer128(t)) {
             register_value(out, t, classify(t), result_regs, 0,
                            "%rbp", -(ptrdiff_t)e->offsets[in->a], true);
         } else {
@@ -649,12 +907,16 @@ static void read_vararg(Emitter *e, Inst *in, const char *source)
 {
     Type *t = in->type;
     FILE *out = e->out;
-    if (aggregate(t)) {
+    if (address_value(t)) {
         slot_load(e, in->dest, "%rdi");
         copy_bytes(out, t->size);
     } else if (extended(t)) {
         fprintf(out, "\tfldt (%s)\n", source);
         x87_store(e, t, in->dest);
+    } else if (wide_scalar(t)) {
+        fprintf(out, "\tmovq (%s), %%rax\n\tmovq 8(%s), %%rdx\n", source, source);
+        slot_store(e, in->dest, "%rax");
+        slot_high_store(e, in->dest, "%rdx");
     } else {
         object_load(out, t, source);
         slot_store(e, in->dest, "%rax");
@@ -668,7 +930,7 @@ static void va_arg_instruction(Emitter *e, Inst *in)
     FILE *out = e->out;
     unsigned label = e->next_label++;
     slot_load(e, in->a, "%r10");
-    if (!abi.memory && abi.part[0] != ABI_X87) {
+    if (!abi.memory && abi.part[0] != ABI_X87 && abi.part[0] != ABI_COMPLEX_X87) {
         if (abi.gp)
             fprintf(out, "\tmovl (%%r10), %%r8d\n\tcmpl $%u, %%r8d\n\tja .Lvstack%u_%u\n",
                     GP_SAVE_SIZE - 8 * abi.gp, e->function_id, label);
@@ -680,7 +942,14 @@ static void va_arg_instruction(Emitter *e, Inst *in)
         if (abi.sse)
             fprintf(out, "\taddl $%u, 4(%%r10)\n", 16 * abi.sse);
         fputs("\tmovq 16(%r10), %rsi\n", out);
-        if (aggregate(t)) {
+        if (abi.complex_bfloat) {
+            slot_load(e, in->dest, "%rdi");
+            fputs("\tmovzwl (%rsi,%r9), %eax\n\tmovw %ax, (%rdi)\n"
+                  "\tmovzwl 16(%rsi,%r9), %eax\n\tmovw %ax, 2(%rdi)\n", out);
+        } else if (abi.part[1] == ABI_SSE_UP) {
+            fputs("\tleaq (%rsi,%r9), %rsi\n", out);
+            read_vararg(e, in, "%rsi");
+        } else if (address_value(t)) {
             slot_load(e, in->dest, "%rdi");
             for (unsigned i = 0; i < 2; i++) {
                 if (abi.part[i] == ABI_NONE)
@@ -701,8 +970,9 @@ static void va_arg_instruction(Emitter *e, Inst *in)
                 e->function_id, label, e->function_id, label);
     }
     fputs("\tmovq 8(%r10), %rsi\n", out);
-    if (t->align > 8)
-        fputs("\taddq $15, %rsi\n\tandq $-16, %rsi\n", out);
+    unsigned alignment = stack_alignment(t);
+    if (alignment > 8)
+        fprintf(out, "\taddq $%u, %%rsi\n\tandq $-%u, %%rsi\n", alignment - 1, alignment);
     fprintf(out, "\tleaq %zu(%%rsi), %%rax\n\tmovq %%rax, 8(%%r10)\n", align_to(t->size, 8));
     read_vararg(e, in, "%rsi");
     fprintf(out, ".Lvcomplete%u_%u:\n", e->function_id, label);
@@ -715,22 +985,114 @@ static void copy_extended(FILE *out, const char *source, const char *destination
             source, destination, source, destination);
 }
 
-static void slot_address(Emitter *e, size_t id, const char *reg)
+static void preserve_asm_registers(Emitter *e, const AsmPlan *plan, bool restore)
 {
-    fprintf(e->out, "\tleaq -%zu(%%rbp), %s\n", e->offsets[id], reg);
+    for (unsigned i = 0; i < 16; i++) {
+        size_t id = plan->save_slots[i];
+        if (!id)
+            continue;
+        const char *reg = x86_asm_register(i, 8);
+        if (restore)
+            fprintf(e->out, "\tmovq -%zu(%%rbp), %%%s\n", e->offsets[id], reg);
+        else
+            fprintf(e->out, "\tmovq %%%s, -%zu(%%rbp)\n", reg, e->offsets[id]);
+    }
+}
+
+static void prepare_asm(Emitter *e, const AsmPlan *plan)
+{
+    preserve_asm_registers(e, plan, false);
+    /* Stage spilled tied inputs before filling the ordinary asm operands. */
+    for (int staged = 1; staged >= 0; staged--) {
+        for (size_t i = 0; i < plan->assembly->operands.len; i++) {
+            const AsmBinding *binding = &plan->bindings[i];
+            if (binding->load && (e->register_spills[binding->reg] != 0) == staged)
+                write_register_slot(e, binding->reg, binding->load, binding->width);
+        }
+    }
+    sync_register_spills(e, 0, true);
+    emit_asm_template(e->context, e->out, plan, e->function_id);
+}
+
+static void finish_asm(Emitter *e, const AsmPlan *plan)
+{
+    sync_register_spills(e, 0, false);
+    for (size_t i = 0; i < plan->assembly->outputs; i++) {
+        const AsmBinding *binding = &plan->bindings[i];
+        if (binding->location != ASM_REGISTER || !binding->result)
+            continue;
+        size_t offset = e->offsets[binding->result];
+        if (binding->reg >= 32)
+            fprintf(e->out, "\t%s %%xmm%u, -%zu(%%rbp)\n",
+                    asm_simd_move(binding->width), binding->reg - 32, offset);
+        else
+            fprintf(e->out, "\tmovq %%%s, -%zu(%%rbp)\n", x86_asm_register(binding->reg, 8), offset);
+    }
+    for (size_t i = 0; i < plan->assembly->outputs; i++) {
+        const AsmBinding *binding = &plan->bindings[i];
+        if (binding->location == ASM_FLAGS) {
+            fprintf(e->out, "\tset%s %%al\n\tmovzbl %%al, %%eax\n", binding->condition);
+            slot_store(e, binding->result, "%rax");
+        }
+    }
+    preserve_asm_registers(e, plan, true);
+}
+
+static void stack_pin_checkpoint(Emitter *e, size_t pin, bool restoring)
+{
+    if (!pin)
+        return;
+    if (restoring) {
+        fputs("\tmovq (%rsp), %rdx\n", e->out);
+        slot_store(e, pin, "%rdx");
+    } else {
+        slot_load(e, pin, "%rdx");
+        fputs("\tmovq %rdx, (%rsp)\n", e->out);
+    }
+}
+
+static void setjmp_instruction(Emitter *e, Inst *in)
+{
+    FILE *out = e->out;
+    unsigned label = ++e->next_label;
+    slot_load(e, in->a, "%rax");
+    /* The GNU buffer starts with the frame pointer, continuation and stack pointer. */
+    fprintf(out, "\tleaq .Lsetjmp%u_%u(%%rip), %%rdx\n", e->function_id, label);
+    fputs("\tmovq %rbp, (%rax)\n\tmovq %rdx, 8(%rax)\n\tmovq %rsp, 16(%rax)\n", out);
+    stack_pin_checkpoint(e, in->b, false);
+    fprintf(out, "\txorl %%eax, %%eax\n\tjmp .Lsetjmp_done%u_%u\n.Lsetjmp%u_%u:\n",
+            e->function_id, label, e->function_id, label);
+    fputs("\t.byte 0xf3, 0x0f, 0x1e, 0xfa # endbr64\n", out);
+    sync_registers(e, e->jump_registers, true);
+    stack_pin_checkpoint(e, in->b, true);
+    fputs("\tmovl $1, %eax\n", out);
+    fprintf(out, ".Lsetjmp_done%u_%u:\n", e->function_id, label);
+    slot_store(e, in->dest, "%rax");
 }
 
 static void instruction(Emitter *e, Inst *in, Type *result)
 {
     FILE *out = e->out;
     switch (in->code) {
+    case I_FLOW_STATEMENT: case I_FALLTHROUGH: case I_CASE_BOUNDARY: case I_NOP:
+    case I_NONNULL_COMPARE: case I_NONNULL_WRITE:
+        break;
     case I_IMMEDIATE:
         number(out, in->immediate, "%rax");
         normalize(out, in->type);
         slot_store(e, in->dest, "%rax");
+        if (wide_scalar(in->type)) {
+            number(out, in->immediate_high, "%rax");
+            slot_high_store(e, in->dest, "%rax");
+        }
         break;
     case I_REAL:
-        if (extended(in->type)) {
+        if (binary128(e->context->target, in->type)) {
+            number(out, in->immediate, "%rax");
+            slot_store(e, in->dest, "%rax");
+            number(out, in->immediate_high, "%rax");
+            slot_high_store(e, in->dest, "%rax");
+        } else if (extended(in->type)) {
             uint64_t bits[2];
             if (extended_float_bits(e->context, in->real, bits, in->loc)) {
                 number(out, bits[0], "%rax");
@@ -739,7 +1101,7 @@ static void instruction(Emitter *e, Inst *in, Type *result)
                 fprintf(out, "\tmovq %%rax, -%zu(%%rbp)\n", e->offsets[in->dest] - 8);
             }
         } else {
-            number(out, float_bits(in->real, in->type->size), "%rax");
+            number(out, float_bits(in->real, floating_format(e->context->target, in->type)), "%rax");
             slot_store(e, in->dest, "%rax");
         }
         break;
@@ -750,9 +1112,54 @@ static void instruction(Emitter *e, Inst *in, Type *result)
             slot_address(e, in->a, "%rax");
         slot_store(e, in->dest, "%rax");
         break;
+    case I_SYSTEM_REGISTER:
+        if (in->op == SYSREG_THREAD_POINTER) {
+            fputs("\tmovq %fs:0, %rax\n", out);
+            slot_store(e, in->dest, "%rax");
+        } else if (in->a) {
+            fprintf(out, "\tldmxcsr -%zu(%%rbp)\n", e->offsets[in->a]);
+        } else {
+            size_t at = e->offsets[in->dest];
+            fprintf(out, "\tstmxcsr -%zu(%%rbp)\n\tmovl -%zu(%%rbp), %%eax\n", at, at);
+            slot_store(e, in->dest, "%rax");
+        }
+        break;
+    case I_FRAME:
+        enclosing_frame(e, in->symbol, "%rax");
+        slot_store(e, in->dest, "%rax");
+        break;
+    case I_FRAME_RETURN:
+        slot_load(e, in->a, "%rax");
+        fputs("\tmovq 8(%rax), %rax\n", out);
+        slot_store(e, in->dest, "%rax");
+        break;
+    case I_REGISTER_READ: {
+        unsigned reg = in->symbol->register_binding - 1;
+        size_t spill = e->register_spills[reg];
+        if (in->type->size == 16) {
+            fprintf(out, "\tmovaps -%zu(%%rbp), %%xmm0\n\tmovaps %%xmm0, -%zu(%%rbp)\n",
+                    spill, e->offsets[in->dest]);
+            break;
+        }
+        if (spill) {
+            fprintf(out, "\tmovq -%zu(%%rbp), %%rax\n", spill);
+            if (in->type->kind == TY_BOOL)
+                fputs("\tmovzbl %al, %eax\n", out);
+        } else if (in->type->kind == TY_BOOL) {
+            fprintf(out, "\tmovzbl %%%s, %%eax\n", x86_asm_register(reg, 1));
+        } else {
+            fprintf(out, "\tmovq %%%s, %%rax\n", x86_asm_register(reg, 8));
+        }
+        normalize(out, in->type);
+        slot_store(e, in->dest, "%rax");
+        break;
+    }
+    case I_REGISTER_WRITE:
+        write_register_slot(e, in->symbol->register_binding - 1, in->a, in->type->size);
+        break;
     case I_LOAD:
         slot_load(e, in->a, "%r10");
-        if (extended(in->type)) {
+        if (wide_scalar(in->type)) {
             slot_address(e, in->dest, "%r11");
             copy_extended(out, "%r10", "%r11");
         } else {
@@ -761,13 +1168,13 @@ static void instruction(Emitter *e, Inst *in, Type *result)
         }
         break;
     case I_STORE:
-        if (aggregate(in->type)) {
+        if (address_value(in->type)) {
             slot_load(e, in->a, "%rdi");
             slot_load(e, in->b, "%rsi");
             copy_bytes(out, in->type->size);
         } else {
             slot_load(e, in->a, "%r10");
-            if (extended(in->type)) {
+            if (wide_scalar(in->type)) {
                 slot_address(e, in->b, "%r11");
                 copy_extended(out, "%r11", "%r10");
             } else {
@@ -777,7 +1184,7 @@ static void instruction(Emitter *e, Inst *in, Type *result)
         }
         break;
     case I_COPY:
-        if (extended(in->type)) {
+        if (wide_scalar(in->type)) {
             slot_address(e, in->a, "%r10");
             slot_address(e, in->dest, "%r11");
             copy_extended(out, "%r10", "%r11");
@@ -796,10 +1203,31 @@ static void instruction(Emitter *e, Inst *in, Type *result)
         break;
     case I_LABEL:
         fprintf(out, ".L%u_%zu:\n", e->function_id, in->label);
+        if (in->symbol && in->symbol->label_address_taken)
+            fprintf(out, "%s:\n", in->symbol->assembly);
         break;
+    case I_INDIRECT_JUMP:
+        slot_load(e, in->a, "%rax");
+        fputs("\tjmp *%rax\n", out);
+        break;
+    case I_TRAP: fputs("\tud2\n", out); break;
+    case I_SPECULATION_BARRIER: fputs("\tlfence\n", out); break;
+    case I_SETJMP: setjmp_instruction(e, in); break;
+    case I_LONGJMP:
+        slot_load(e, in->a, "%rax");
+        fputs("\tmovq 8(%rax), %rdx\n\tmovq (%rax), %rbp\n"
+              "\tmovq 16(%rax), %rsp\n\tjmp *%rdx\n", out);
+        break;
+    case I_PREFETCH: {
+        static const char *const locality[] = {"prefetchnta", "prefetcht2", "prefetcht1", "prefetcht0"};
+        slot_load(e, in->a, "%rax");
+        fprintf(out, "\t%s (%%rax)\n", locality[in->immediate]);
+        break;
+    }
+    case I_ASM: fprintf(out, "\t%s\n", in->asm_text); break;
+    case I_EXTENDED_ASM: prepare_asm(e, in->asm_plan); break;
+    case I_ASM_OUTPUT: finish_asm(e, in->asm_plan); break;
     case I_JUMP:
-        if (in->a)
-            slot_load(e, in->a, "%rsp");
         fprintf(out, "\tjmp .L%u_%zu\n", e->function_id, in->label);
         break;
     case I_ZERO:
@@ -822,14 +1250,23 @@ static void instruction(Emitter *e, Inst *in, Type *result)
     case I_VA_ARG: va_arg_instruction(e, in); break;
     case I_BITLOAD: bit_load(e, in); break;
     case I_BITSTORE: bit_store(e, in); break;
-    case I_STACK_ALLOC:
-        slot_store(e, in->b, "%rsp");
-        slot_load(e, in->a, "%rax");
-        fputs("\taddq $15, %rax\n\tandq $-16, %rax\n\tsubq %rax, %rsp\n", out);
+    case I_STACK_SAVE:
+        stack_pin_checkpoint(e, in->b, false);
         slot_store(e, in->dest, "%rsp");
         break;
+    case I_STACK_ALLOC: {
+        slot_load(e, in->a, "%rax");
+        unsigned align = in->immediate > 16 ? (unsigned)in->immediate : 16;
+        fprintf(out, "\tmovq %%rsp, %%rcx\n\tsubq %%rax, %%rcx\n\tandq $-%u, %%rcx\n\tmovq %%rcx, %%rsp\n", align);
+        /* Leave a word at each restorable stack position for the saved alloca pin. */
+        if (e->stack_checkpoint_pin)
+            fputs("\tsubq $16, %rsp\n", out);
+        slot_store(e, in->dest, "%rcx");
+        break;
+    }
     case I_STACK_RESTORE:
         slot_load(e, in->a, "%rsp");
+        stack_pin_checkpoint(e, in->b, true);
         break;
     }
 }
@@ -839,50 +1276,63 @@ static void emit_function(Context *c, FILE *out, Symbol *s, unsigned id)
     FunctionIR ir;
     if (!lower(c, s, &ir))
         return;
-    Emitter e = {.context = c, .out = out, .function_id = id};
+    Emitter e = {.context = c, .out = out, .function = s, .ir = &ir, .function_id = id};
     e.offsets = alloc(c, (ir.slots.len + 1) * sizeof *e.offsets);
-    size_t frame = 0;
-    for (size_t i = 0; i < ir.slots.len; i++) {
-        Type *t = ir.slots.data[i];
-        size_t width = t->size < 8 ? 8 : t->size;
-        size_t alignment = t->align < 8 ? 8 : t->align;
-        frame = align_to(frame + width, alignment);
-        e.offsets[i + 1] = frame;
-    }
+    if (s->has_builtin_setjmp)
+        e.jump_registers = asm_call_saved_registers(c) & ~c->global_registers;
+    e.stack_checkpoint_pin = has_stack_checkpoints(s) && s->has_stack_alloca;
+    uint64_t saved_registers = c->global_register_spills | e.jump_registers;
+    size_t frame = asm_register_spill_layout(saved_registers, e.register_spills);
+    for (size_t i = 0; i < ir.slots.len; i++)
+        e.offsets[i + 1] = layout_frame_slot(&frame, ir.slots.data[i]);
+    for (size_t i = 0; i < s->locals.len; i++)
+        s->locals.data[i]->frame_offset = e.offsets[s->locals.data[i]->slot];
     e.scratch = frame = align_to(frame, 8) + 8;
     Type *result = s->type->base;
     if (classify(result).memory)
         e.indirect_result = frame += 8;
     if (s->type->variadic)
         e.registers = frame = align_to(frame, 16) + REGISTER_SAVE_SIZE;
+    if (e.stack_checkpoint_pin)
+        frame += 16;
     frame = align_to(frame, 16);
     if (frame > INT32_MAX) {
         error(c, s->loc, "x86-64 stack frame is too large");
         return;
     }
 
-    fputs("\t.text\n\t.p2align 4\n", out);
-    if (!s->internal)
-        fprintf(out, "\t.globl %s\n", s->assembly);
-    fprintf(out, "\t.type %s, @function\n%s:\n"
-                 "\tpushq %%rbp\n\tmovq %%rsp, %%rbp\n\tsubq $%zu, %%rsp\n",
-            s->assembly, s->assembly, frame);
+    emit_function_entry(c, out, s, id);
+    fprintf(out, "\tpushq %%rbp\n\tmovq %%rsp, %%rbp\n\tsubq $%zu, %%rsp\n", frame);
+    sync_registers(&e, saved_registers, false);
+    if (s->static_chain)
+        slot_store(&e, s->static_chain->slot, "%r10");
     parameters(&e, s);
     for (size_t i = 0; i < ir.instructions.len && !c->failed; i++)
         instruction(&e, &ir.instructions.data[i], result);
-    fprintf(out, ".Lreturn%u:\n\tleave\n\tret\n\t.size %s, .-%s\n",
-            id, s->assembly, s->assembly);
+    fprintf(out, ".Lreturn%u:\n", id);
+    Abi result_abi = classify(result);
+    sync_register_spills(&e, abi_register_mask(result_regs, result_abi.memory ? 1 : result_abi.gp,
+                                              result_abi.sse), true);
+    fprintf(out, "\tleave\n\tret\n\t.size %s, .-%s\n", s->assembly, s->assembly);
 }
 
 bool emit_x86_64(Context *c, FILE *out)
 {
     for (size_t i = 0; i < c->globals.len && !c->failed; i++) {
         Symbol *s = c->globals.data[i];
-        if (s->type->kind == TY_FUNC && s->body)
+        emit_symbol_linkage(out, s);
+        if (s->alias)
+            continue;
+        if (s->asm_plan)
+            emit_asm_template(c, out, s->asm_plan, 0);
+        else if (s->asm_text)
+            fprintf(out, "%s\n", s->asm_text);
+        else if (s->type->kind == TY_FUNC && s->body)
             emit_function(c, out, s, (unsigned)i);
-        else if (s->type->kind != TY_FUNC && (s->defined || s->tentative))
+        else if (s->type->kind != TY_FUNC && !global_register(s) && (s->defined || s->tentative))
             emit_static_data(c, out, s);
     }
+    emit_lifecycle_functions(c, out);
     fputs("\t.section .rodata\n\t.p2align 3\n"
           ".Ltwo63:\n\t.quad 0x43e0000000000000\n"
           ".Ltwo64:\n\t.quad 0x43f0000000000000\n"

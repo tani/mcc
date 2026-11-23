@@ -10,7 +10,7 @@ __dso_handle:
 .text
 .Lmcc_finalize:
     leaq __dso_handle(%rip), %rdi
-    jmp __cxa_finalize
+    jmp __cxa_finalize@PLT
 
 .section .fini_array,"aw",@fini_array
 .p2align 3

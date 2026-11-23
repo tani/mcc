@@ -84,6 +84,40 @@ int main(void) { return call(); }
 """)
     command(dynamic, status=42)
 
+    # The bundled shared-library startup object finalizes only its own DSO.
+    plugin = root / "libcleanup.so"
+    command(mcc, "-shared", "-", "-o", plugin, source=b"""
+extern void *__dso_handle;
+extern int __cxa_atexit(void (*)(void *), void *, void *);
+static void cleanup(void *p) { ++*(int *)p; }
+int install_cleanup(int *count) { return __cxa_atexit(cleanup, count, __dso_handle); }
+""")
+    command(mcc, "-", "-o", dynamic, source=b"""
+#include <dlfcn.h>
+int main(int argc, char **argv) {
+    int count = 0;
+    void *module = argc == 2 ? dlopen(argv[1], RTLD_NOW) : 0;
+    if (!module) return 1;
+    union { void *address; int (*install)(int *); } symbol;
+    symbol.address = dlsym(module, "install_cleanup");
+    if (!symbol.address || symbol.install(&count) || count != 0 || dlclose(module)) return 2;
+    return count != 1;
+}
+""")
+    command(dynamic, plugin)
+
+
+def check_runtime(mld, directory):
+    source = Path(__file__).with_name("runtime.c")
+    compiler = os.environ.get("MCC_TOOLCHAIN") or "gcc"
+    obj = directory / "runtime.o"
+    # GCC supplies an independent binary128 ABI caller and DWARF unwind data.
+    subprocess.run([compiler, "-std=gnu11", "-O2", "-frounding-math", "-fexceptions",
+                    "-funwind-tables", "-c", source, "-o", obj], check=True)
+    output = directory / "runtime"
+    command(mld, "-static", "-pthread", "-o", output, obj, "-lm")
+    command(output)
+
 
 def check(mcc, mas, mld, directory):
     # Test the compiler in a directory containing only its own executable.
@@ -134,6 +168,7 @@ def check(mcc, mas, mld, directory):
     assert b"truncated ELF" in failed.stderr
     assert not (directory / "mixed").exists() and not (directory / "broken").exists()
     check_libraries(mcc, mld, directory / "libraries")
+    check_runtime(mld, directory)
     print("mas and mld ELF tests passed")
 
 

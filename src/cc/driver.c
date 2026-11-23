@@ -13,16 +13,22 @@ typedef enum { LINK, ASSEMBLE, ASSEMBLY, PREPROCESS, CHECK } Mode;
 typedef struct {
     Context options;
     Mode mode;
-    Strings inputs, link_args, scratch;
+    Strings inputs, link_args, scratch, after_includes;
     const char *output, *directory;
-    bool stopped;
+    bool stopped, strip_line_markers;
     unsigned serial;
 } Driver;
 
 static void usage(FILE *out)
 {
-    fputs("Usage: mcc [-std=c11|-std=gnu11] [-E|-fsyntax-only|-S|-c] [-o FILE] INPUT...\n"
-          "       -I DIR, -isystem DIR, -D MACRO[=VALUE], -U MACRO\n"
+    fputs("Usage: mcc [-std=DIALECT] [-E|-fsyntax-only|-S|-c] [-o FILE] INPUT...\n"
+          "       -I DIR, -isystem DIR, -idirafter DIR, -D MACRO[=VALUE], -U MACRO\n"
+          "       -P to omit line markers in -E output\n"
+          "       -w, -Werror[=NAME], -Wno-error[=NAME], -Wsystem-headers\n"
+          "       -fgnu89-inline, -fno-gnu89-inline, -fshort-enums, -fno-short-enums\n"
+          "       -fpack-struct[=N], -fno-pack-struct, -fvisibility=MODE\n"
+          "       -ffreestanding, -fhosted, -fno-builtin, -fno-builtin-NAME\n"
+          "       -fplt, -fno-plt, -fpatchable-function-entry=N[,M]\n"
           "       -static, -shared, -L DIR, -l LIBRARY, -pthread, -Wl,OPTIONS\n"
           "       --target=aarch64-linux-gnu or --target=x86_64-linux-gnu\n"
           "       Includes mas and mld. Hosted links use the target's glibc.\n", out);
@@ -48,6 +54,25 @@ static bool suffix(const char *path, const char *ending)
     return len >= tail && equal(path + len - tail, ending);
 }
 
+static void patchable_entry_option(Context *c, const char *arg)
+{
+    const char *value = arg + sizeof "-fpatchable-function-entry=" - 1;
+    char *end;
+    unsigned long count = strtoul(value, &end, 10), before = 0;
+    bool valid = *value >= '0' && *value <= '9';
+    if (*end == ',') {
+        value = end + 1;
+        valid &= *value >= '0' && *value <= '9';
+        before = strtoul(value, &end, 10);
+    }
+    if (!valid || *end || count > MAX_PATCHABLE_ENTRY || before > count) {
+        error(c, (Loc){0}, "invalid option '%s': expected N[,M] with 0 <= M <= N <= %u",
+              arg, (unsigned)MAX_PATCHABLE_ENTRY);
+        return;
+    }
+    c->patchable_entry = (PatchableEntry){.count = (unsigned)count, .before = (unsigned)before};
+}
+
 static const char *operand(Driver *d, int argc, char **argv, int *i, size_t prefix)
 {
     const char *arg = argv[*i];
@@ -59,10 +84,28 @@ static const char *operand(Driver *d, int argc, char **argv, int *i, size_t pref
     return "";
 }
 
+static void dialect_option(Context *c, const char *name)
+{
+    bool gnu = starts(name, "gnu");
+    const char *version = gnu ? name + 3 : *name == 'c' ? name + 1 : "";
+    static const struct { const char *name; CStandard standard; } versions[] = {
+        {"89", C90}, {"90", C90}, {"9x", C99}, {"99", C99}, {"1x", C11},
+        {"11", C11}, {"17", C17}, {"18", C17}, {"2x", C23}, {"23", C23}, {"2y", C2Y},
+    };
+    for (size_t i = 0; i < sizeof versions / sizeof *versions; i++) {
+        if (equal(version, versions[i].name)) {
+            c->dialect.standard = versions[i].standard;
+            c->dialect.gnu = gnu;
+            return;
+        }
+    }
+    error(c, (Loc){0}, "unknown C dialect '%s'", name);
+}
+
 static void parse_options(Driver *d, int argc, char **argv)
 {
     Context *c = &d->options;
-    bool options = true;
+    bool options = true, force_c99_inline = false;
     for (int i = 1; i < argc && !c->failed; i++) {
         const char *arg = argv[i];
         if (options && equal(arg, "--")) {
@@ -86,10 +129,70 @@ static void parse_options(Driver *d, int argc, char **argv)
                 c->target = &x86_64_linux;
             else
                 error(c, (Loc){0}, "unsupported target '%s'", triple);
-        } else if (equal(arg, "-std=c11") || equal(arg, "-std=gnu11")) {
-            c->gnu = equal(arg, "-std=gnu11");
+        } else if (starts(arg, "-std=")) {
+            dialect_option(c, arg + 5);
+        } else if (equal(arg, "-ffreestanding") || equal(arg, "-fno-hosted")) {
+            c->freestanding = c->no_builtin = true;
+        } else if (equal(arg, "-fhosted") || equal(arg, "-fno-freestanding")) {
+            c->freestanding = c->no_builtin = false;
+        } else if (equal(arg, "-fdelete-null-pointer-checks") || equal(arg, "-fno-delete-null-pointer-checks")) {
+            c->no_delete_null_pointer_checks = equal(arg, "-fno-delete-null-pointer-checks");
+        } else if (equal(arg, "-fplt") || equal(arg, "-fno-plt")) {
+            c->no_plt = equal(arg, "-fno-plt");
+        } else if (starts(arg, "-fpatchable-function-entry=")) {
+            patchable_entry_option(c, arg);
+        } else if (equal(arg, "-fno-builtin") || equal(arg, "-fbuiltin")) {
+            c->no_builtin = equal(arg, "-fno-builtin");
+        } else if (starts(arg, "-fno-builtin-")) {
+            const char *name = arg + sizeof "-fno-builtin-" - 1;
+            if (!*name)
+                error(c, (Loc){0}, "'-fno-builtin-' requires a function name");
+            else if (starts(name, "__builtin_"))
+                error(c, (Loc){0}, "cannot disable built-in function '%s'", name);
+            else
+                PUSH(c, c->disabled_builtins, name);
+        } else if (equal(arg, "-fshort-enums") || equal(arg, "-fno-short-enums")) {
+            c->dialect.short_enums = equal(arg, "-fshort-enums");
+        } else if (equal(arg, "-fexcess-precision=16") || equal(arg, "-fexcess-precision=standard") ||
+                   equal(arg, "-fexcess-precision=fast")) {
+            c->dialect.round_float16_ops = equal(arg, "-fexcess-precision=16");
+        } else if (equal(arg, "-fpack-struct") || equal(arg, "-fno-pack-struct")) {
+            c->force_pack = equal(arg, "-fpack-struct");
+            c->default_pack_alignment = c->force_pack;
+        } else if (starts(arg, "-fpack-struct=")) {
+            const char *setting = arg + strlen("-fpack-struct=");
+            char *end;
+            unsigned long long alignment = strtoull(setting, &end, 10);
+            if (*setting < '0' || *setting > '9' || *end || !alignment ||
+                !valid_pack_alignment(alignment)) {
+                error(c, (Loc){0}, "invalid structure packing alignment '%s'", setting);
+            } else {
+                c->force_pack = false;
+                c->default_pack_alignment = (unsigned char)alignment;
+            }
+        } else if (starts(arg, "-fvisibility=")) {
+            const char *setting = arg + strlen("-fvisibility=");
+            c->default_visibility = visibility_kind(setting);
+            if (!c->default_visibility)
+                error(c, (Loc){0}, "invalid symbol visibility '%s'", setting);
+        } else if (equal(arg, "-fgnu89-inline") || equal(arg, "-fno-gnu89-inline")) {
+            c->dialect.gnu_inline = equal(arg, "-fgnu89-inline");
+            force_c99_inline = !c->dialect.gnu_inline;
         } else if (equal(arg, "-pedantic-errors")) {
-            c->pedantic = true;
+            c->dialect.pedantic = PEDANTIC_ERROR;
+        } else if (equal(arg, "-pedantic") || equal(arg, "-Wpedantic")) {
+            if (c->dialect.pedantic != PEDANTIC_ERROR)
+                c->dialect.pedantic = PEDANTIC_WARN;
+        } else if (equal(arg, "-Wno-pedantic")) {
+            c->dialect.pedantic = PEDANTIC_OFF;
+        } else if (equal(arg, "-Wsystem-headers") || equal(arg, "-Wno-system-headers")) {
+            c->warn_system_headers = equal(arg, "-Wsystem-headers");
+        } else if (warning_argument(c, arg)) {
+            continue;
+        } else if (equal(arg, "-P")) {
+            d->strip_line_markers = true;
+        } else if (equal(arg, "-ftrampoline-impl=stack")) {
+            error(c, (Loc){0}, "stack trampolines require an executable stack");
         } else if (equal(arg, "-E") || equal(arg, "-S") || equal(arg, "-c") ||
                    equal(arg, "-fsyntax-only")) {
             d->mode = equal(arg, "-E") ? PREPROCESS : equal(arg, "-S") ? ASSEMBLY :
@@ -98,13 +201,16 @@ static void parse_options(Driver *d, int argc, char **argv)
             d->output = operand(d, argc, argv, &i, 2);
         } else if (starts(arg, "-isystem")) {
             PUSH(c, c->system_includes, operand(d, argc, argv, &i, 8));
+        } else if (starts(arg, "-idirafter")) {
+            PUSH(c, d->after_includes, operand(d, argc, argv, &i, 10));
         } else if (starts(arg, "-I")) {
             PUSH(c, c->includes, operand(d, argc, argv, &i, 2));
         } else if (starts(arg, "-D") || starts(arg, "-U")) {
             const char *value = operand(d, argc, argv, &i, 2);
             PUSH(c, c->macro_options, format(c, "%c%s", arg[1], value));
-        } else if (equal(arg, "-O0") || equal(arg, "-fPIC") || equal(arg, "-fpic")) {
-            /* Code is unoptimized and position-independent. */
+        } else if (equal(arg, "-O0") || equal(arg, "-fPIC") || equal(arg, "-fpic") ||
+                   equal(arg, "-ftrampoline-impl=heap")) {
+            /* Code is unoptimized, position-independent, and uses heap trampolines. */
         } else if (equal(arg, "-static") || equal(arg, "-shared") ||
                    equal(arg, "-pthread") || equal(arg, "-pie") || equal(arg, "-no-pie") ||
                    starts(arg, "-Wl,")) {
@@ -115,6 +221,11 @@ static void parse_options(Driver *d, int argc, char **argv)
         } else {
             error(c, (Loc){0}, "unknown option '%s'", arg);
         }
+    }
+    if (c->dialect.standard == C90) {
+        if (force_c99_inline)
+            error(c, (Loc){0}, "-fno-gnu89-inline requires C99 or later");
+        c->dialect.gnu_inline = true;
     }
     if (!c->failed && !d->inputs.len)
         error(c, (Loc){0}, "no input files");
@@ -167,10 +278,26 @@ static void system_headers(Context *c)
 static bool compile_source(Driver *d, const char *path, FILE *out)
 {
     Context c = {
-        .target = d->options.target, .gnu = d->options.gnu, .pedantic = d->options.pedantic,
+        .target = d->options.target, .dialect = d->options.dialect,
         .includes = d->options.includes, .system_includes = d->options.system_includes,
+        .warn_system_headers = d->options.warn_system_headers,
+        .warnings_as_errors = d->options.warnings_as_errors,
+        .warn_all = d->options.warn_all,
+        .warn_extra = d->options.warn_extra,
+        .no_delete_null_pointer_checks = d->options.no_delete_null_pointer_checks,
+        .no_plt = d->options.no_plt,
+        .patchable_entry = d->options.patchable_entry,
+        .fallthrough_level = d->options.fallthrough_level,
+        .syntax_only = d->mode == CHECK,
+        .ignored_attributes = d->options.ignored_attributes,
+        .suppress_warnings = d->options.suppress_warnings,
+        .force_pack = d->options.force_pack, .default_pack_alignment = d->options.default_pack_alignment,
+        .default_visibility = d->options.default_visibility,
+        .freestanding = d->options.freestanding, .no_builtin = d->options.no_builtin,
+        .disabled_builtins = d->options.disabled_builtins,
         .macro_options = d->options.macro_options, .input = equal(path, "-") ? "<stdin>" : path
     };
+    memcpy(c.warnings, d->options.warnings, sizeof c.warnings);
     FILE *input = equal(path, "-") ? stdin : fopen(path, "rb");
     if (!input) {
         error(&d->options, (Loc){0}, "%s: %s", path, strerror(errno));
@@ -182,7 +309,7 @@ static bool compile_source(Driver *d, const char *path, FILE *out)
         fclose(input);
     if (ok) {
         if (d->mode == PREPROCESS)
-            write_tokens(out, tokens);
+            write_tokens(&c, out, tokens, !d->strip_line_markers);
         else
             ok = parse(&c, tokens) && c.target->emit(&c, out);
     }
@@ -391,9 +518,11 @@ static bool run_driver(Driver *d)
 
 int main(int argc, char **argv)
 {
-    Driver d = {.options = {.target = native_target()}};
+    Driver d = {.options = {.target = native_target(), .dialect = {.standard = C11}}};
     parse_options(&d, argc, argv);
     system_headers(&d.options);
+    for (size_t i = 0; i < d.after_includes.len; i++)
+        PUSH(&d.options, d.options.system_includes, d.after_includes.data[i]);
     bool ok = !d.options.failed && (d.stopped || run_driver(&d));
     for (size_t i = 0; i < d.scratch.len; i++)
         unlink(d.scratch.data[i]);

@@ -2,6 +2,7 @@
 #include "elf_tools.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -30,6 +31,27 @@ uint16_t elf_machine(const char *target)
 #else
     return EM_NONE;
 #endif
+}
+
+bool elf_section_family(const char *name, const char *base)
+{
+    size_t length = strlen(base);
+    return !strncmp(name, base, length) && (!name[length] || name[length] == '.');
+}
+
+unsigned elf_array_priority(const char *name, const char *array)
+{
+    size_t length = strlen(array);
+    if (strncmp(name, array, length) || name[length] != '.' ||
+        name[length + 1] < '0' || name[length + 1] > '9')
+        return UINT_MAX;
+    unsigned priority = 0;
+    for (const char *digit = name + length + 1; *digit; digit++) {
+        if (*digit < '0' || *digit > '9' || priority > (UINT_MAX - (unsigned)(*digit - '0')) / 10)
+            return UINT_MAX;
+        priority = priority * 10 + (unsigned)(*digit - '0');
+    }
+    return priority;
 }
 
 Elf64_Ehdr elf_header(uint16_t machine, uint16_t type)
